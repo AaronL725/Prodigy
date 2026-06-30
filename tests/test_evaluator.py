@@ -1,9 +1,18 @@
 import pandas as pd
+import pytest
 
 from prodigy.research.evaluator import (
     bucket_returns,
     forward_returns,
     rank_ic_by_timestamp,
+)
+
+# The rank_ic test fixture has two symbols with identical forward_return at one
+# timestamp, so spearman is undefined there and scipy emits a benign
+# ConstantInputWarning (the NaN result is correct). Suppress only that warning so
+# test output stays pristine.
+pytestmark = pytest.mark.filterwarnings(
+    "ignore:An input array is constant:scipy.stats._warnings_errors.ConstantInputWarning"
 )
 
 
