@@ -1,0 +1,3 @@
+[workspace]
+members = ["crates/executor"]
+resolver = "2"
