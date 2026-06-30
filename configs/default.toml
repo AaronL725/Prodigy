@@ -1,0 +1,32 @@
+[trading]
+mode = "demo"
+enabled_symbols = ["ETH/USDT:USDT"]
+leverage = 5
+
+[risk]
+total_notional_cap_x_equity = 5.0
+per_order_cap_fraction_of_total = 0.10
+trading_suspension_unrealized_loss_x_equity = 0.10
+stop_loss_position_notional_fraction = 0.08
+trailing_start_position_notional_fraction = 0.10
+
+[execution]
+sqlite_poll_interval_ms = 250
+open_maker_timeout_seconds = 15
+close_maker_timeout_seconds = 8
+stale_market_data_seconds = 3
+
+[fees]
+maker_rate = 0.0002
+taker_rate = 0.0006
+rebate_fraction = 0.59
+
+[model]
+active_model_version = "dry-run"
+score_long_threshold = 0.60
+score_short_threshold = -0.60
+score_exit_threshold = 0.10
+
+[telegram]
+enabled = false
+allowed_user_ids = []
