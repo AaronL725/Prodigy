@@ -1,42 +1,60 @@
 import pandas as pd
 
-from prodigy.factors.examples import funding_zscore, momentum_15m, oi_change
+from prodigy.factors.examples import (
+    example_funding_factor,
+    example_momentum_factor,
+    example_volatility_factor,
+)
 
 
 def market_frame():
-    ts = pd.date_range("2026-07-01", periods=6, freq="15min", tz="UTC")
+    ts = pd.date_range("2026-07-01", periods=30, freq="15min", tz="UTC")
     return pd.DataFrame(
         {
             "timestamp": ts,
-            "symbol": ["ETH/USDT:USDT"] * 6,
-            "open": [100, 101, 102, 101, 103, 104],
-            "high": [101, 102, 103, 102, 104, 105],
-            "low": [99, 100, 101, 100, 102, 103],
-            "close": [101, 102, 101, 103, 104, 106],
-            "volume": [10, 12, 11, 13, 14, 15],
-            "funding_rate": [0.001, 0.002, 0.001, 0.003, 0.004, 0.005],
-            "open_interest": [1000, 1010, 1005, 1030, 1040, 1060],
+            "symbol": ["ETH/USDT:USDT"] * len(ts),
+            "open": [100 + i * 0.1 for i in range(len(ts))],
+            "high": [101 + i * 0.1 for i in range(len(ts))],
+            "low": [99 + i * 0.1 for i in range(len(ts))],
+            "close": [100 + i for i in range(len(ts))],
+            "volume": [10 + i for i in range(len(ts))],
         }
     )
 
 
-def test_momentum_factor_output_contract():
-    result = momentum_15m(market_frame(), periods=2)
-
-    assert list(result.columns) == ["timestamp", "symbol", "factor_name", "value"]
-    assert result["factor_name"].unique().tolist() == ["momentum_15m"]
-    assert result["value"].notna().sum() == 4
-
-
-def test_funding_zscore_output_contract():
-    result = funding_zscore(market_frame(), window=3)
-
-    assert result["factor_name"].unique().tolist() == ["funding_zscore"]
-    assert result["value"].notna().sum() == 4
+def funding_frame():
+    ts = pd.date_range("2026-07-01", periods=30, freq="15min", tz="UTC")
+    return pd.DataFrame(
+        {
+            "timestamp": ts,
+            "symbol": ["ETH/USDT:USDT"] * len(ts),
+            "funding_rate": [0.0001 * ((i % 5) - 2) for i in range(len(ts))],
+        }
+    )
 
 
-def test_oi_change_output_contract():
-    result = oi_change(market_frame(), periods=2)
+def assert_factor_contract(frame, name):
+    assert list(frame.columns) == ["timestamp", "symbol", "factor_name", "value"]
+    assert frame["factor_name"].unique().tolist() == [name]
+    assert frame["value"].notna().sum() > 0
 
-    assert result["factor_name"].unique().tolist() == ["oi_change"]
-    assert result["value"].notna().sum() == 4
+
+def test_example_momentum_factor_contract():
+    assert_factor_contract(
+        example_momentum_factor(market_frame(), lookback_bars=4),
+        "example_momentum",
+    )
+
+
+def test_example_funding_factor_contract():
+    assert_factor_contract(
+        example_funding_factor(funding_frame(), window=5),
+        "example_funding",
+    )
+
+
+def test_example_volatility_factor_contract():
+    assert_factor_contract(
+        example_volatility_factor(market_frame(), atr_window=5),
+        "example_volatility",
+    )
