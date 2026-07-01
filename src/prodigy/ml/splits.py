@@ -39,8 +39,6 @@ def purged_walk_forward_splits(
     end_time = ts[n - 1]
     final_holdout_start = end_time - pd.Timedelta(days=final_holdout_days) + pd.Timedelta(minutes=15)
 
-    purge_gap = pd.Timedelta(minutes=15) * purge_gap_bars
-
     folds: list[WalkForwardFold] = []
 
     # First validation window starts right after the minimum expanding-train span.
