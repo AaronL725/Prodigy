@@ -26,6 +26,24 @@ def _timeframe_ms(timeframe: str) -> int:
     return int(pd.Timedelta(timeframe) / pd.Timedelta(1, "ms"))
 
 
+def _build_ccxt_bitget(proxy_url: str | None):
+    # spec: "Try direct connection first. If direct connection fails, retry
+    # with proxy." Probe with load_markets; on connection error, fall back to
+    # the proxy. Keeps the direct-default path working when no proxy is running.
+    import ccxt
+
+    direct = ccxt.bitget()
+    try:
+        direct.load_markets()
+        return direct
+    except (OSError, ccxt.NetworkError):
+        if not proxy_url:
+            raise
+        proxied = ccxt.bitget({"proxies": {"http": proxy_url, "https": proxy_url}})
+        proxied.load_markets()
+        return proxied
+
+
 @dataclass
 class BackfillResult:
     symbol: str
@@ -65,9 +83,7 @@ def run_backfill(
     # ponytail: build real Bitget/CCXT clients only when not injected so tests
     # never touch the network or import ccxt. No factory, just a branch.
     if exchange is None:
-        import ccxt
-
-        exchange = ccxt.bitget({"proxies": {"http": proxy_url, "https": proxy_url}})
+        exchange = _build_ccxt_bitget(proxy_url)
     if funding_client is None:
         funding_client = BitgetRestClient(proxy_url=proxy_url)
 

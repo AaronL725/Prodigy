@@ -38,3 +38,7 @@ def main(argv: list[str] | None = None) -> int:
         print("Funding quality:")
         print(json.dumps(result.funding_quality, indent=2, sort_keys=True))
     return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

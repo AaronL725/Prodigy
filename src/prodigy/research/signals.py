@@ -26,6 +26,7 @@ def score_to_lot_signals(scores: pd.DataFrame, params: SignalParams) -> pd.DataF
     lot_counter = 0
     open_lots: dict[str, dict] = {}  # lot_id -> lot state (side, notional, ...)
     last_open: dict[str, dict] = {}  # direction -> {"bar": idx, "score": float}
+    open_notional = 0.0  # sum of notional across currently-open lots
 
     for bar, frame in scores.reset_index(drop=True).iterrows():
         symbol = frame["symbol"]
@@ -42,6 +43,7 @@ def score_to_lot_signals(scores: pd.DataFrame, params: SignalParams) -> pd.DataF
         ]
         for lot_id in to_close:
             lot = open_lots.pop(lot_id)
+            open_notional -= lot["notional"]
             rows.append(
                 {
                     "timestamp": ts,
@@ -61,16 +63,18 @@ def score_to_lot_signals(scores: pd.DataFrame, params: SignalParams) -> pd.DataF
             prev = last_open.get(side)
             # Same-direction add allowed after cooldown, or when the signal is
             # strictly stronger than the last opened signal (immediate reinforcement).
-            allowed = (
+            cooldown_ok = (
                 prev is None
                 or (bar - prev["bar"]) >= params.add_cooldown_bars
                 or abs(score) > abs(prev["score"])
             )
-            if allowed:
+            notional = _notional(score, params) if cooldown_ok else 0.0
+            # spec: "Total notional cannot exceed total_notional_cap".
+            if cooldown_ok and open_notional + notional <= params.total_notional_cap + 1e-9:
                 lot_counter += 1
                 lot_id = f"lot-{lot_counter:06d}"
-                notional = _notional(score, params)
                 open_lots[lot_id] = {"side": side, "notional": notional}
+                open_notional += notional
                 last_open[side] = {"bar": bar, "score": score}
                 rows.append(
                     {

@@ -35,3 +35,16 @@ def test_opposite_score_closes_lots():
 
     assert signals.iloc[-1]["action"] == "close"
     assert signals.iloc[-1]["side"] == "long"
+
+
+def test_total_open_notional_cannot_exceed_cap():
+    # spec: "Total notional cannot exceed total_notional_cap". A long run of
+    # max-strength scores must stop opening once cumulative open notional hits
+    # the cap, even though cooldown/strength rules would keep permitting adds.
+    params = SignalParams(total_notional_cap=10_000.0, add_cooldown_bars=4)
+    signals = score_to_lot_signals(score_frame([1.0] * 50), params)
+
+    opens = signals[signals["action"] == "open"]
+    assert opens["notional"].sum() <= 10_000.0 + 1e-9
+    # each max-strength open is 1000 (10% of 10000), so exactly 10 fit
+    assert len(opens) == 10

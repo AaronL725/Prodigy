@@ -51,6 +51,15 @@ def _directional_accuracy(pred: pd.Series, actual: pd.Series) -> float:
     return float((aligned.iloc[:, 0].transform("sign") == aligned.iloc[:, 1].transform("sign")).mean())
 
 
+def _long_short_return(pred: pd.Series, actual: pd.Series) -> float:
+    # ponytail: simple long-short validation return — go long when pred>0,
+    # short when pred<0, earn pred_sign * forward_return; 0.0 on empty.
+    aligned = pd.concat([pred, actual], axis=1).dropna()
+    if aligned.empty:
+        return 0.0
+    return float((aligned.iloc[:, 0].transform("sign") * aligned.iloc[:, 1]).mean())
+
+
 def _new_model() -> lgb.LGBMRegressor:
     return lgb.LGBMRegressor(
         n_estimators=20,
@@ -109,39 +118,68 @@ def train_example_model(
                 "validation_rows": int(len(valid_rows)),
                 "validation_prediction_ic": _prediction_ic(predictions, actual),
                 "validation_directional_accuracy": _directional_accuracy(predictions, actual),
+                "validation_long_short_return": _long_short_return(predictions, actual),
             }
         )
         total_train_rows += len(train_rows)
         total_valid_rows += len(valid_rows)
 
-    # ponytail: holdout model is the saved artifact; train on everything before holdout.
+    # ponytail: holdout model is the saved artifact. Train on rows BEFORE the
+    # holdout, but also drop the last `label_bars` rows whose forward label
+    # would reach into the holdout — otherwise the final-model training labels
+    # reference holdout prices (label leakage).
+    bar = pd.Timedelta(minutes=15)
+    label_bars = horizon_to_bars(horizon)
+    holdout_train_cutoff = splits.final_holdout_start - label_bars * bar
     holdout_mask = timestamp >= splits.final_holdout_start
-    train_before_holdout_mask = timestamp < splits.final_holdout_start
+    train_before_holdout_mask = timestamp < holdout_train_cutoff
     train_rows = labeled.loc[train_before_holdout_mask, _FEATURES + [target]].dropna()
     holdout_rows = labeled.loc[holdout_mask, _FEATURES + [target]].dropna()
 
-    holdout_prediction_ic = 0.0
-    holdout_directional_accuracy = 0.0
-    holdout_row_count = int(len(holdout_rows))
+    if train_rows.empty:
+        # No usable training data: refuse to emit a half-baked artifact/metadata
+        # rather than crash on an unfitted booster.
+        raise ValueError(
+            "not enough pre-holdout training rows to fit the example model; "
+            "need more history before the final holdout window"
+        )
 
     holdout_model = _new_model()
-    if not train_rows.empty:
-        holdout_model.fit(train_rows[_FEATURES], train_rows[target])
-        if not holdout_rows.empty:
-            predictions = pd.Series(
-                holdout_model.predict(holdout_rows[_FEATURES]),
-                index=holdout_rows.index,
-                name="pred",
-            )
-            actual = holdout_rows[target].rename("actual")
-            holdout_prediction_ic = _prediction_ic(predictions, actual)
-            holdout_directional_accuracy = _directional_accuracy(predictions, actual)
+    holdout_model.fit(train_rows[_FEATURES], train_rows[target])
+
+    holdout_prediction_ic = 0.0
+    holdout_directional_accuracy = 0.0
+    holdout_long_short_return = 0.0
+    holdout_row_count = int(len(holdout_rows))
+    feature_importance: dict[str, float] = {}
+
+    if not holdout_rows.empty:
+        predictions = pd.Series(
+            holdout_model.predict(holdout_rows[_FEATURES]),
+            index=holdout_rows.index,
+            name="pred",
+        )
+        actual = holdout_rows[target].rename("actual")
+        holdout_prediction_ic = _prediction_ic(predictions, actual)
+        holdout_directional_accuracy = _directional_accuracy(predictions, actual)
+        holdout_long_short_return = _long_short_return(predictions, actual)
+
+    importances = holdout_model.booster_.feature_importance(importance_type="gain")
+    feature_importance = {
+        name: float(imp) for name, imp in zip(_FEATURES, importances)
+    }
 
     artifact_dir = Path(model_root) / "example_lgbm"
     artifact_dir.mkdir(parents=True, exist_ok=True)
     artifact_path = artifact_dir / f"{model_version}.txt"
     holdout_model.booster_.save_model(artifact_path)
     artifact_hash = hashlib.sha256(artifact_path.read_bytes()).hexdigest()
+
+    validation_long_short_return = (
+        float(sum(f["validation_long_short_return"] for f in fold_details) / len(fold_details))
+        if fold_details
+        else 0.0
+    )
 
     metrics = {
         "fold_count": len(fold_details),
@@ -150,6 +188,9 @@ def train_example_model(
         "holdout_rows": holdout_row_count,
         "holdout_prediction_ic": holdout_prediction_ic,
         "holdout_directional_accuracy": holdout_directional_accuracy,
+        "holdout_long_short_return": holdout_long_short_return,
+        "validation_long_short_return": validation_long_short_return,
+        "feature_importance": feature_importance,
         "folds": fold_details,
         "train_start": str(splits.folds[0].train_start) if splits.folds else None,
         "validation_end": str(splits.folds[-1].valid_end) if splits.folds else None,
