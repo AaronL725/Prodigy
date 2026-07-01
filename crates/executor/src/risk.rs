@@ -144,4 +144,27 @@ mod tests {
 
         assert!(decision.is_ok());
     }
+
+    #[test]
+    fn blocks_open_when_total_notional_cap_is_exhausted() {
+        // gross_notional already at the equity*cap_x ceiling → remaining cap 0 →
+        // a new open is blocked even though margin/equity/market are healthy.
+        let account = AccountRiskSnapshot {
+            equity: 1_000.0,
+            available_margin: 1_000.0,
+            unrealized_pnl_24h: 0.0,
+            gross_notional: 5_000.0, // == equity 1000 * cap_x 5 → remaining 0
+            market_is_fresh: true,
+            private_state_is_ready: true,
+        };
+
+        let err = check_intent(
+            &intent("open", 100.0, 100.0),
+            &account,
+            &RiskParams::default(),
+        )
+        .unwrap_err();
+
+        assert!(err.contains("notional cap reached"));
+    }
 }
