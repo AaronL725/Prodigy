@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import pandas as pd
 
@@ -9,12 +10,19 @@ from prodigy.research.evaluator import (
     forward_returns,
     rank_ic_by_timestamp,
 )
+from prodigy.research.simulator import BacktestParams, simulate_lots
+
+if TYPE_CHECKING:
+    from matplotlib.figure import Figure
 
 
 @dataclass
 class Backtester:
     prices: pd.DataFrame
     factors: pd.DataFrame
+    funding: pd.DataFrame | None = None
+    signals: pd.DataFrame | None = None
+    params: BacktestParams | None = None
 
     def factor_distribution(self) -> dict[str, float]:
         values = self.factors["value"].dropna()
@@ -83,3 +91,50 @@ class Backtester:
             "bucket_returns": self.bucket_returns(horizon, buckets, returns),
             "performance": self.performance_summary(horizon, returns),
         }
+
+    # ------------------------------------------------------------------
+    # Notebook-style facade (capitalized, factor_liang-style). These delegate
+    # to the lower-case methods above and the simulator. They never call
+    # plt.show() so they are safe under headless test/CI. Plot methods return
+    # the computed value or a matplotlib Figure (rendered lazily by the
+    # caller); non-plot methods return Series/dict/DataFrame.
+    # ------------------------------------------------------------------
+
+    def PlotAutocorrelation(self) -> float:
+        return self.autocorrelation()
+
+    def PlotRankIcCumsum(self, horizon: int = 4) -> pd.Series:
+        # ponytail: cumsum of per-timestamp rank IC over a forward-return horizon.
+        returns = forward_returns(self.prices, periods=horizon)
+        ic = rank_ic_by_timestamp(self.factors, returns).dropna()
+        return ic.cumsum()
+
+    def PlotSignalDistribution(self) -> pd.Series:
+        # ponytail: use lot signal scores when present, else fall back to factor values.
+        if self.signals is not None and not self.signals.empty and "score" in self.signals.columns:
+            values = self.signals["score"]
+        else:
+            values = self.factors["value"]
+        return values.dropna().describe()
+
+    def PlotEquityCurve(self) -> pd.DataFrame:
+        return self._simulate().equity_curve
+
+    def PlotDrawdown(self) -> pd.Series:
+        equity = self._simulate().equity_curve["equity"]
+        running_max = equity.cummax()
+        return equity / running_max - 1.0
+
+    def GetPerformanceSummary(self) -> dict[str, object]:
+        return self._simulate().summary
+
+    def GetTradeSummary(self) -> pd.DataFrame:
+        return self._simulate().trades
+
+    def _simulate(self):
+        # ponytail: lazy default params so the simulator is usable without the
+        # caller constructing a BacktestParams explicitly.
+        params = self.params if self.params is not None else BacktestParams()
+        funding = self.funding if self.funding is not None else pd.DataFrame()
+        signals = self.signals if self.signals is not None else pd.DataFrame()
+        return simulate_lots(self.prices, funding, signals, params)
