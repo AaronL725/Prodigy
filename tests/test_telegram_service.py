@@ -53,3 +53,14 @@ def test_resume_rejects_unknown_user(tmp_path):
         message = service.resume(user_id="999", now="2026-07-01T00:00:00Z")
 
     assert message == "unauthorized"
+
+
+def test_int_user_ids_match_int_or_str_whitelist(tmp_path):
+    # Real Telegram user IDs arrive as ints; config may carry ints or strings.
+    db_path = tmp_path / "prodigy.sqlite"
+    with connect(db_path) as conn:
+        init_db(conn)
+        service = TelegramCommandService(conn, allowed_user_ids={123})
+        message = service.stop(user_id=123, now="2026-07-01T00:00:00Z")
+
+    assert message == "stop command queued"

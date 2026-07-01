@@ -7,12 +7,18 @@ use rusqlite::Connection;
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let db_path = match args.next().as_deref() {
-        Some("--db") => args.next().unwrap_or_else(|| "var/prodigy.sqlite".to_string()),
+        Some("--db") => args
+            .next()
+            .unwrap_or_else(|| "var/prodigy.sqlite".to_string()),
         Some(other) => bail!("unknown argument: {other}"),
         None => "var/prodigy.sqlite".to_string(),
     };
 
     let conn = Connection::open(db_path)?;
+    // ponytail: match Python's busy_timeout (5s) so the executor and the Python
+    // writer can share this WAL file; rusqlite retries on SQLITE_BUSY up to the
+    // limit instead of failing on first contention. Raise if the poll loop contends.
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
     let intents = db::pending_intents(&conn)?;
     for intent in intents {
         db::reject_intent(

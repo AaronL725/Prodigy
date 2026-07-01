@@ -8,7 +8,7 @@ pub fn pending_intents(conn: &Connection) -> Result<Vec<TradeIntent>> {
         "select intent_id, symbol, side, action, target_notional, max_order_notional
          from trade_intents
          where status = 'pending'
-         order by created_at asc"
+         order by created_at asc",
     )?;
     let rows = stmt.query_map([], |row| {
         Ok(TradeIntent {
