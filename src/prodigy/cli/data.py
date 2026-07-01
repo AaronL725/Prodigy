@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 
 from prodigy.data.backfill import run_backfill
 
@@ -32,4 +33,8 @@ def main(argv: list[str] | None = None) -> int:
             proxy_url=args.proxy_url,
         )
         print(result)
+        print("OHLCV quality:")
+        print(json.dumps(result.ohlcv_quality, indent=2, sort_keys=True))
+        print("Funding quality:")
+        print(json.dumps(result.funding_quality, indent=2, sort_keys=True))
     return 0
