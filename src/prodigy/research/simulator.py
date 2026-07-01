@@ -262,7 +262,8 @@ def _close_lot(
     gross = (exit_price - lot["entry_price"]) * lot["qty"] * lot["sign"]
     exit_fee = lot["qty"] * exit_price * net_fee
     funding_pnl = _funding_pnl(funding_df, lot["symbol"], lot["entry_ts"], exit_ts)
-    funding_cost = -lot["sign"] * funding_pnl * lot["notional"]
+    # ponytail: long (sign +1) pays positive funding -> positive cost; short mirrors.
+    funding_cost = lot["sign"] * funding_pnl * lot["notional"]
     lot["exit_price"] = exit_price
     lot["exit_ts"] = exit_ts
     lot["exit_fee"] = exit_fee
@@ -367,9 +368,12 @@ def _evaluate_exits(
                     ):
                         confirming = True
                         break
-        if confirming and not lot["extended"]:
+        if confirming:
             lot["extended"] = True
-            lot["open_bar"] = i  # reset the review clock for the extension
+            # ponytail: extend the review deadline by extension_hours (1h = 4 bars
+            # @15m), NOT another full max_holding window. Shifting open_bar forward
+            # so the next review lands at i + extension_hours*BARS_PER_HOUR.
+            lot["open_bar"] = i - max_holding_bars + params.extension_hours * BARS_PER_HOUR
         else:
             _close_lot(lot, close, params.slippage, net_fee, ts, "holding", funding_df)
             return lot
