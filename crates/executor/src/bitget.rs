@@ -132,6 +132,28 @@ impl BitgetRestClient {
             .await?;
         parse_bitget_response(response).await
     }
+
+    pub async fn cancel_order(&self, request: &CancelOrderRequest) -> Result<Value> {
+        self.post_json("/api/v2/mix/order/cancel-order", request)
+            .await
+    }
+
+    pub async fn cancel_all_orders(&self) -> Result<Value> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct CancelAll<'a> {
+            product_type: &'a str,
+            margin_coin: &'a str,
+        }
+        self.post_json(
+            "/api/v2/mix/order/cancel-all-order",
+            &CancelAll {
+                product_type: &self.cfg.product_type,
+                margin_coin: &self.cfg.margin_coin,
+            },
+        )
+        .await
+    }
 }
 
 async fn parse_bitget_response(response: reqwest::Response) -> Result<Value> {
