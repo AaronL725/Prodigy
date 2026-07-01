@@ -31,6 +31,26 @@ def test_add_forward_return_labels():
     assert labeled["target_1h"].notna().sum() == 6
 
 
+def test_add_forward_return_labels_handles_unsorted_input():
+    # A research-grade labeler must not silently produce wrong labels when the
+    # input frame is out of timestamp order. Shuffle the rows; labels must match
+    # the sorted version (forward return is per-symbol, time-ordered).
+    sorted_frame = frame().head(20)
+    shuffled = sorted_frame.sample(frac=1, random_state=1).reset_index(drop=True)
+
+    labeled_shuffled = add_forward_return_labels(shuffled, horizons=["1h"])
+    labeled_sorted = add_forward_return_labels(sorted_frame, horizons=["1h"])
+
+    # Align by (symbol, timestamp) and compare the label column. NaN==NaN rows
+    # (last `horizon` bars) are expected on both sides; compare via fillna.
+    merged = labeled_shuffled.merge(
+        labeled_sorted, on=["timestamp", "symbol"], suffixes=("_shuf", "_sort")
+    )
+    assert merged["target_1h_shuf"].fillna(-99).round(10).tolist() == merged[
+        "target_1h_sort"
+    ].fillna(-99).round(10).tolist()
+
+
 def test_purged_walk_forward_excludes_final_holdout_and_gap():
     splits = purged_walk_forward_splits(
         frame(),

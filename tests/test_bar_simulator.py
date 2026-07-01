@@ -210,3 +210,47 @@ def test_holding_review_extends_by_one_hour_with_confirming_score():
     ].iloc[0]
     assert lot1_no["exit_reason"] == "holding"
     assert ts.get_loc(pd.Timestamp(lot1_no["exit_ts"])) == 96
+
+
+def test_open_lot_at_end_of_data_is_marked_to_market():
+    # A lot still open at the last bar must be force-closed (reason "end_of_data")
+    # so its unrealized PnL is reflected in final_equity, not silently dropped.
+    prices_df = _rising_prices(5)  # closes 100..104, long profits
+    open_ts = prices_df["timestamp"].iloc[0]
+    signals = pd.DataFrame(
+        [
+            {
+                "timestamp": open_ts,
+                "symbol": "ETH/USDT:USDT",
+                "action": "open",
+                "side": "long",
+                "score": 0.8,
+                "notional": 1000.0,
+                "lot_id": "lot-000001",
+                "reason": "open_threshold",
+            }
+        ],
+        columns=[
+            "timestamp",
+            "symbol",
+            "action",
+            "side",
+            "score",
+            "notional",
+            "lot_id",
+            "reason",
+        ],
+    )
+    params = BacktestParams(
+        initial_equity=1000,
+        stop_loss_position_notional_fraction=1.0,
+        trailing_start_position_notional_fraction=1.0,
+    )
+    result = simulate_lots(prices_df, pd.DataFrame(), signals, params)
+
+    assert len(result.trades) == 1
+    assert result.trades.iloc[0]["exit_reason"] == "end_of_data"
+    # Rising closes 100->104: long entry 100, mark-to-market exit 104 -> profit,
+    # so final_equity must be ABOVE the initial 1000 (unrealized counted).
+    assert result.summary["final_equity"] > 1000.0
+    assert result.summary["unrealized_pnl_at_end"] > 0.0

@@ -179,6 +179,23 @@ def simulate_lots(
         equity = params.initial_equity + realized_pnl
         equity_rows.append({"timestamp": ts, "symbol": symbol, "equity": equity})
 
+    # Force-close any lots still open at the last bar (mark-to-market) so their
+    # unrealized PnL is reflected in the final equity / drawdown instead of
+    # silently dropped. Uses the last bar's close +/- slippage like any exit.
+    unrealized_at_end = 0.0
+    if open_lots and len(prices) > 0:
+        last = prices.iloc[-1]
+        last_close = float(last["close"])
+        last_ts = last["timestamp"]
+        for lot in open_lots:
+            _close_lot(lot, last_close, params.slippage, net_fee, last_ts, "end_of_data", funding_df)
+            realized_pnl += lot["pnl"]
+            unrealized_at_end += lot["pnl"]
+            trades.append(_trade_row(lot))
+        open_lots = []
+        # Rewrite the final equity row with the marked-to-market equity.
+        equity_rows[-1]["equity"] = params.initial_equity + realized_pnl
+
     trades_df = pd.DataFrame(trades)
     equity_df = pd.DataFrame(equity_rows)
     final_equity = (
@@ -190,6 +207,7 @@ def simulate_lots(
         "initial_equity": params.initial_equity,
         "num_trades": int(len(trades_df)),
         "realized_pnl": float(realized_pnl),
+        "unrealized_pnl_at_end": float(unrealized_at_end),
         "return_pct": float((final_equity - params.initial_equity) / params.initial_equity)
         if params.initial_equity
         else 0.0,

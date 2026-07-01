@@ -21,6 +21,20 @@ def test_open_size_maps_from_five_to_ten_percent():
     assert opens["notional"].round(6).tolist() == [500.0, 1000.0]
 
 
+def test_open_size_fractions_are_configurable():
+    # The 5%..10% mapping is configurable on SignalParams, not hardcoded.
+    params = SignalParams(
+        total_notional_cap=10_000.0,
+        min_size_fraction=0.02,
+        max_size_fraction=0.20,
+    )
+    signals = score_to_lot_signals(score_frame([0.6, 1.0]), params)
+
+    opens = signals[signals["action"] == "open"]
+    # 0.6 -> 2% = 200, 1.0 -> 20% = 2000
+    assert opens["notional"].round(6).tolist() == [200.0, 2000.0]
+
+
 def test_add_cooldown_blocks_dense_same_direction_opens():
     params = SignalParams(total_notional_cap=10_000.0, add_cooldown_bars=4)
     signals = score_to_lot_signals(score_frame([0.8, 0.8, 0.8, 0.8, 0.8]), params)

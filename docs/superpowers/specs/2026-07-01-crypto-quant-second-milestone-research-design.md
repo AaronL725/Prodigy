@@ -222,7 +222,8 @@ Notebook style follows `temp/factor_liang`:
 - read parquet from the shared data area;
 - define factor classes or compute functions directly in notebook cells;
 - call `Backtester` diagnostics from the notebook;
-- keep output charts in the notebook;
+- produce output charts when executed (run the notebooks after a backfill; outputs
+  are populated by execution, not committed as static artifacts in this milestone);
 - do not save each research factor series as a long-lived parquet asset.
 
 The three example factors exist only to test research, backtest, and ML aggregation flow:
@@ -470,7 +471,10 @@ Research:
 - all five notebooks exist under `research/notebooks/`;
 - notebooks read the shared parquet data;
 - each example factor notebook creates a factor value series and calls `Backtester`;
-- notebook outputs are preserved.
+- notebook code paths are covered by `tests/test_research_notebooks.py`; notebook
+  outputs are populated by executing the notebooks (e.g.
+  `jupyter nbconvert --execute --inplace`) after a `prodigy-data backfill`, and
+  are not committed as static artifacts in this milestone.
 
 Backtest:
 

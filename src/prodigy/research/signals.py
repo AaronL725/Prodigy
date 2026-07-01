@@ -11,12 +11,19 @@ class SignalParams:
     open_threshold: float = 0.6
     close_threshold: float = 0.2
     add_cooldown_bars: int = 4
+    # spec defaults: abs(score)=0.6 -> 5% of cap, abs(score)=1.0 -> 10%.
+    min_size_fraction: float = 0.05
+    max_size_fraction: float = 0.10
 
 
 def _notional(score: float, params: SignalParams) -> float:
-    # ponytail: linear map, abs(score)=0.6 -> 5% of cap, abs(score)=1.0 -> 10%.
+    # Linear map from min_size_fraction (at open_threshold) to max_size_fraction
+    # (at |score|=1.0). Configurable so backtests can sweep position sizing.
     mag = min(max(abs(score), params.open_threshold), 1.0)
-    fraction = 0.05 + 0.05 * (mag - params.open_threshold) / 0.4
+    span = 1.0 - params.open_threshold
+    fraction = params.min_size_fraction + (
+        params.max_size_fraction - params.min_size_fraction
+    ) * ((mag - params.open_threshold) / span if span else 0.0)
     return params.total_notional_cap * fraction
 
 
