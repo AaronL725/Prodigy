@@ -73,6 +73,42 @@ async fn ensure_one_way_mode(rest: &BitgetRestClient, cfg: &ExecutorConfig) {
         .await;
 }
 
+// ponytail: a market open returns 00000 before Bitget's position store reflects
+// the fill, so an immediate reduceOnly close races and hits 22002 "no position".
+// Poll all-position until a non-zero size for the symbol appears (cap ~5s) rather
+// than a blind sleep. Returns the observed size (0.0 if it never appears).
+async fn wait_for_position(rest: &BitgetRestClient, cfg: &ExecutorConfig) -> f64 {
+    for _ in 0..25 {
+        let positions = rest
+            .get(
+                "/api/v2/mix/position/all-position",
+                &[
+                    ("productType", cfg.product_type.clone()),
+                    ("marginCoin", cfg.margin_coin.clone()),
+                ],
+            )
+            .await
+            .unwrap();
+        let size = positions
+            .get("data")
+            .and_then(|d| d.as_array())
+            .and_then(|rows| {
+                rows.iter().find(|r| {
+                    r.get("symbol").and_then(|s| s.as_str()) == Some(cfg.bitget_symbol.as_str())
+                })
+            })
+            .and_then(|r| r.get("total").or_else(|| r.get("available")))
+            .and_then(|v| v.as_str())
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.0);
+        if size > 0.0 {
+            return size;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    0.0
+}
+
 #[tokio::test]
 async fn bitget_demo_can_place_and_cancel_limit_order() {
     let cfg = demo_config();
@@ -143,13 +179,18 @@ async fn bitget_demo_can_open_and_reduce_only_close_market_order() {
         .unwrap();
     assert_eq!(opened.get("code").and_then(|v| v.as_str()), Some("00000"));
 
+    // ponytail: wait for the position to register before the reduceOnly close,
+    // else Bitget returns 22002 "No position to close" on the open->close race.
+    let position_size = wait_for_position(&rest, &cfg).await;
+    assert!(position_size > 0.0, "opened position never registered");
+
     let close_oid = format!("pdgy-test-close-{}", prodigy_executor::bitget::now_ms());
     let close = PlaceOrderRequest {
         symbol: cfg.bitget_symbol.clone(),
         product_type: cfg.product_type.clone(),
         margin_mode: cfg.margin_mode.clone(),
         margin_coin: cfg.margin_coin.clone(),
-        size: "0.01".to_string(),
+        size: format!("{position_size}"),
         price: None,
         side: "sell".to_string(),
         order_type: "market".to_string(),
