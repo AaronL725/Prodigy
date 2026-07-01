@@ -9,11 +9,21 @@ pub enum TradingMode {
     Live,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct DemoSecrets {
     pub api_key: String,
     pub api_secret: String,
     pub passphrase: String,
+}
+
+impl std::fmt::Debug for DemoSecrets {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DemoSecrets")
+            .field("api_key", &"<redacted>")
+            .field("api_secret", &"<redacted>")
+            .field("passphrase", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -175,5 +185,19 @@ mod tests {
             ..ExecutorConfig::demo_for_tests()
         };
         assert!(cfg_private.validate_demo_only().is_err());
+    }
+
+    #[test]
+    fn demo_secrets_debug_redacts_values() {
+        let secrets = DemoSecrets {
+            api_key: "real-key".to_string(),
+            api_secret: "real-secret".to_string(),
+            passphrase: "real-pass".to_string(),
+        };
+        let formatted = format!("{:?}", secrets);
+        assert!(!formatted.contains("real-key"));
+        assert!(!formatted.contains("real-secret"));
+        assert!(!formatted.contains("real-pass"));
+        assert!(formatted.contains("<redacted>"));
     }
 }
