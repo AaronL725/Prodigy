@@ -71,7 +71,9 @@ def run_backfill(
     if funding_client is None:
         funding_client = BitgetRestClient(proxy_url=proxy_url)
 
-    effective_end = end if end is not None else start
+    # ponytail: end=None means "now" (today, UTC) — the documented default CLI
+    # invocation omits --end (spec: backfill 2024-01-01→NOW). No config knob.
+    effective_end = end if end is not None else pd.Timestamp.now(tz="UTC").floor("D").strftime("%Y-%m-%d")
 
     # ponytail: forward-paginate OHLCV by since_ms from start to end. Bitget
     # returns only the most recent page per call, so a single fetch would miss
@@ -103,16 +105,17 @@ def run_backfill(
         ohlcv["timestamp"] = pd.to_datetime(ohlcv["timestamp"], utc=True)
         ohlcv = ohlcv.drop_duplicates(subset=["timestamp", "symbol"]).reset_index(drop=True)
         ohlcv = ohlcv[(ohlcv["timestamp"] >= pd.Timestamp(start_ms, unit="ms", tz="UTC")) & (ohlcv["timestamp"] < pd.Timestamp(end_ms, unit="ms", tz="UTC"))]
-    for day, day_frame in ohlcv.groupby(ohlcv["timestamp"].dt.floor("D")):
-        write_daily_partition(
-            day_frame,
-            data_root=data_root,
-            exchange=EXCHANGE_NAME,
-            symbol=symbol,
-            dataset="ohlcv",
-            date=day,
-            timeframe=timeframe,
-        )
+    if not ohlcv.empty:
+        for day, day_frame in ohlcv.groupby(ohlcv["timestamp"].dt.floor("D")):
+            write_daily_partition(
+                day_frame,
+                data_root=data_root,
+                exchange=EXCHANGE_NAME,
+                symbol=symbol,
+                dataset="ohlcv",
+                date=day,
+                timeframe=timeframe,
+            )
 
     funding_pages = []
     for page_no in range(1, MAX_FUNDING_PAGES + 1):
