@@ -21,6 +21,7 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--data-root", default="data")
     train.add_argument("--db", default="var/prodigy.sqlite")
     train.add_argument("--model-version", default="example-1h")
+    train.add_argument("--model-root", default="models")
     return parser
 
 
@@ -36,7 +37,7 @@ def main(argv: list[str] | None = None) -> int:
         result = train_example_model(
             frame=frame,
             db_path=args.db,
-            model_root=parquet_path.parent.parent / "models",
+            model_root=args.model_root,
             horizon=args.horizon,
             model_version=args.model_version,
         )

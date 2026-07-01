@@ -33,6 +33,53 @@ class FakeFundingClient:
         )
 
 
+class FakeMixedWindowFundingClient:
+    # ponytail: returns funding both inside and outside the requested window —
+    # Bitget history-fund-rate is newest-first and unfiltered, so the backfill
+    # must window to [start, end) itself.
+    def __init__(self):
+        self._page = pd.DataFrame(
+            {
+                "timestamp": pd.to_datetime(
+                    ["2026-06-30T00:00:00Z", "2026-07-01T00:00:00Z", "2026-07-02T00:00:00Z"],
+                    utc=True,
+                ),
+                "symbol": ["ETH/USDT:USDT"] * 3,
+                "funding_time": pd.to_datetime(
+                    ["2026-06-30T00:00:00Z", "2026-07-01T00:00:00Z", "2026-07-02T00:00:00Z"],
+                    utc=True,
+                ),
+                "funding_rate": [0.0001, 0.001, 0.002],
+                "raw_symbol": ["ETHUSDT"] * 3,
+            }
+        )
+
+    def fetch_funding_rate_page(self, symbol, product_type, page_no, page_size):
+        return self._page if page_no == 1 else self._page.iloc[0:0]
+
+
+def test_run_backfill_windows_funding_to_range(tmp_path):
+    db_path = tmp_path / "prodigy.sqlite"
+    with connect(db_path) as conn:
+        init_db(conn)
+
+    result = run_backfill(
+        symbol="ETH/USDT:USDT",
+        start="2026-07-01",
+        end="2026-07-02",
+        timeframe="15m",
+        data_root=tmp_path,
+        db_path=db_path,
+        exchange=FakeExchange(),
+        funding_client=FakeMixedWindowFundingClient(),
+    )
+
+    assert result.funding_rows == 1
+    funding = load_funding_rates(tmp_path, "ETH/USDT:USDT", "2026-07-01", "2026-07-02")
+    assert len(funding) == 1
+    assert set(funding["timestamp"].dt.strftime("%Y-%m-%d")) == {"2026-07-01"}
+
+
 def test_run_backfill_writes_partitions_and_checkpoint(tmp_path):
     db_path = tmp_path / "prodigy.sqlite"
     with connect(db_path) as conn:

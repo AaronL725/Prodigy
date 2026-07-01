@@ -129,6 +129,14 @@ def run_backfill(
             break
         funding_pages.append(page)
     funding = pd.concat(funding_pages, ignore_index=True) if funding_pages else pd.DataFrame()
+    # ponytail: window funding to [start, end) — same mask as OHLCV. Bitget
+    # history-fund-rate returns newest-first over the full history, so without
+    # this filter a partial backfill writes/counts out-of-window rows.
+    if not funding.empty:
+        funding = funding[
+            (funding["timestamp"] >= pd.Timestamp(start_ms, unit="ms", tz="UTC"))
+            & (funding["timestamp"] < pd.Timestamp(end_ms, unit="ms", tz="UTC"))
+        ].reset_index(drop=True)
     if not funding.empty:
         for day, day_frame in funding.groupby(funding["timestamp"].dt.floor("D")):
             write_daily_partition(
