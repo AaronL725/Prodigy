@@ -18,6 +18,7 @@ dependencies = [
 
 [project.scripts]
 prodigy-data = "prodigy.cli.data:main"
+prodigy-ml = "prodigy.cli.ml:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
