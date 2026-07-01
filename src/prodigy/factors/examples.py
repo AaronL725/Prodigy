@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 
 from prodigy.factors.base import factor_frame
@@ -14,7 +15,7 @@ def funding_zscore(frame: pd.DataFrame, window: int = 20) -> pd.DataFrame:
     grouped = frame.groupby("symbol", group_keys=False)["funding_rate"]
     mean = grouped.transform(lambda s: s.rolling(window).mean())
     std = grouped.transform(lambda s: s.rolling(window).std())
-    values = (frame["funding_rate"] - mean) / std.replace(0, pd.NA)
+    values = (frame["funding_rate"] - mean) / std.replace(0, np.nan)
     return factor_frame(frame, "funding_zscore", values)
 
 
@@ -33,7 +34,7 @@ def example_funding_factor(funding: pd.DataFrame, window: int = 20) -> pd.DataFr
     grouped = funding.groupby("symbol", group_keys=False)["funding_rate"]
     mean = grouped.transform(lambda s: s.rolling(window).mean())
     std = grouped.transform(lambda s: s.rolling(window).std())
-    zscore = (funding["funding_rate"] - mean) / std.replace(0, pd.NA)
+    zscore = (funding["funding_rate"] - mean) / std.replace(0, np.nan)
     values = (-zscore).clip(-1, 1)
     return factor_frame(funding, "example_funding", values)
 
@@ -52,5 +53,5 @@ def example_volatility_factor(ohlcv: pd.DataFrame, atr_window: int = 14) -> pd.D
         lambda s: s.rolling(atr_window).mean()
     )
     momentum = ohlcv.groupby("symbol", group_keys=False)["close"].pct_change()
-    values = (momentum / atr.replace(0, pd.NA)).clip(-1, 1)
+    values = (momentum / atr.replace(0, np.nan)).clip(-1, 1)
     return factor_frame(ohlcv, "example_volatility", values)
