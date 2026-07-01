@@ -9,4 +9,5 @@ __pycache__/
 *.sqlite-shm
 *.db
 .claude/
+.worktrees/
 target/
