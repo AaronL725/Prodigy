@@ -54,9 +54,13 @@ def purged_walk_forward_splits(
         if valid_end_time >= final_holdout_start:
             break
 
-        # Train ends purge_gap bars before the validation start; expanding, so it
-        # always grows from the frame start.
-        train_end_idx = valid_start_idx - purge_gap_bars
+        # Train ends purge_gap bars before the validation start. purge_gap must be
+        # >= the label horizon so the last training sample's forward label lands
+        # STRICTLY before valid_start (label_i references bar i+horizon; a sample
+        # at valid_start - purge_gap reaches valid_start - purge_gap + horizon,
+        # which is < valid_start only when purge_gap > horizon, i.e. strict).
+        # The -1 makes the gap exclusive so target_idx == valid_start can't happen.
+        train_end_idx = valid_start_idx - purge_gap_bars - 1
         if train_end_idx < 0:
             break
         train_end_time = ts[train_end_idx]

@@ -46,3 +46,29 @@ def test_purged_walk_forward_excludes_final_holdout_and_gap():
     assert first.train_end < first.valid_start
     assert first.valid_start - first.train_end >= pd.Timedelta(hours=1)
     assert splits.final_holdout_start > splits.folds[-1].valid_end
+
+
+def test_purged_walk_forward_no_label_leak_into_validation():
+    # A 1h label uses 4 forward bars: target_i = forward[i+4]. With purge_gap_bars
+    # == label_bars == 4, the last training sample's target must land STRICTLY
+    # before valid_start, never on or past it — otherwise the validation set's
+    # first bar contaminates a training label (optimistic IC).
+    label_bars = horizon_to_bars("1h")  # 4
+    splits = purged_walk_forward_splits(
+        frame(),
+        min_train_days=365,
+        valid_days=30,
+        step_days=30,
+        final_holdout_days=30,
+        purge_gap_bars=label_bars,
+    )
+
+    ts = pd.DatetimeIndex(frame()["timestamp"])
+    bar = pd.Timedelta(minutes=15)
+    for fold in splits.folds:
+        last_train_target_ts = fold.train_end + label_bars * bar
+        assert last_train_target_ts < fold.valid_start, (
+            f"label leak: train_end {fold.train_end} + {label_bars} bars = "
+            f"{last_train_target_ts} >= valid_start {fold.valid_start}"
+        )
+
