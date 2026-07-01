@@ -91,4 +91,3 @@ def test_purged_walk_forward_no_label_leak_into_validation():
             f"label leak: train_end {fold.train_end} + {label_bars} bars = "
             f"{last_train_target_ts} >= valid_start {fold.valid_start}"
         )
-

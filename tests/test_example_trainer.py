@@ -88,4 +88,3 @@ def test_train_example_model_raises_on_insufficient_data(tmp_path):
             "select model_version from models where model_version = ?", ("tiny",)
         ).fetchone()
     assert row is None
-
