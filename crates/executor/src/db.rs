@@ -109,6 +109,22 @@ pub fn reject_intent(conn: &Connection, intent_id: &str, reason: &str) -> Result
     Ok(())
 }
 
+pub fn write_event(
+    conn: &Connection,
+    severity: &str,
+    component: &str,
+    message: &str,
+    payload_json: &str,
+) -> Result<()> {
+    conn.execute(
+        "insert into events (
+          event_id, created_at, severity, component, message, payload_json
+        ) values (lower(hex(randomblob(16))), datetime('now'), ?, ?, ?, ?)",
+        params![severity, component, message, payload_json],
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
