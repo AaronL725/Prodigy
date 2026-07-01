@@ -11,3 +11,12 @@ __pycache__/
 .claude/
 .worktrees/
 target/
+data/**/*.parquet
+data/**/*.parquet.gzip
+# ponytail: models/**/* ignores dir contents wholesale, which would also drop
+# .gitkeep scaffolding (git can't re-include a file under an excluded dir).
+# Un-ignore directories first so the negation below can reach .gitkeep.
+models/**/*
+!models/**/
+var/*
+!**/.gitkeep
