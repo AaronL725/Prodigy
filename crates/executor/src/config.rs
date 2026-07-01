@@ -161,4 +161,19 @@ mod tests {
 
         assert!(cfg.validate_demo_only().is_err());
     }
+
+    #[test]
+    fn demo_config_rejects_non_demo_websocket_urls() {
+        let cfg = ExecutorConfig {
+            public_ws_url: "wss://ws.bitget.com/v2/ws/public".to_string(),
+            ..ExecutorConfig::demo_for_tests()
+        };
+        assert!(cfg.validate_demo_only().is_err());
+
+        let cfg_private = ExecutorConfig {
+            private_ws_url: "wss://ws.bitget.com/v2/ws/private".to_string(),
+            ..ExecutorConfig::demo_for_tests()
+        };
+        assert!(cfg_private.validate_demo_only().is_err());
+    }
 }
