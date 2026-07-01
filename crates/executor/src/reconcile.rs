@@ -76,4 +76,31 @@ mod tests {
         assert_eq!(adopted.ownership, "imported");
         assert_eq!(adopted.adopted_at.as_deref(), Some("2026-07-01T00:00:00Z"));
     }
+
+    #[test]
+    fn exchange_position_matching_local_intent_is_system() {
+        // Positive branch: an exchange position whose source_intent_id is in the
+        // local set is system-owned (NOT imported). Catches a regression toward
+        // unwrap_or(true)/is_some() that would silently reclassify everything.
+        let mut local_order_intents = std::collections::HashSet::new();
+        local_order_intents.insert("intent-7".to_string());
+        let exchange = PositionRecord {
+            symbol: "ETH/USDT:USDT".to_string(),
+            side: "long".to_string(),
+            notional: 1000.0,
+            entry_price: 3000.0,
+            unrealized_pnl: 0.0,
+            ownership: "system".to_string(),
+            opened_at: Some("2026-06-01T00:00:00Z".to_string()),
+            adopted_at: None,
+            source_intent_id: Some("intent-7".to_string()),
+            raw_json: "{}".to_string(),
+        };
+
+        let adopted = classify_position(exchange, &local_order_intents, "2026-07-01T00:00:00Z");
+
+        assert_eq!(adopted.ownership, "system");
+        // system-owned keeps its prior opened_at; adoption timestamp not overwritten.
+        assert_eq!(adopted.adopted_at, None);
+    }
 }
