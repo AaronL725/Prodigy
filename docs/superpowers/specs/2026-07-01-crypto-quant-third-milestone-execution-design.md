@@ -18,8 +18,9 @@ Included:
 - SQLite intent consumption and order/fill/position/equity/event persistence.
 - Local order state machine with idempotent intent processing.
 - REST reconciliation to repair missed WebSocket updates.
+- Runtime manual intervention detection for client-side opens, closes, reductions, and cancellations.
 - Demo integration tests that are allowed to place, cancel, and close Bitget demo orders.
-- Telegram notifications only for fills and major errors.
+- Mode-aware Telegram behavior for demo and future live runs.
 
 Excluded:
 
@@ -70,7 +71,7 @@ The executor must refuse to start unless:
 
 - config trading mode is `demo`;
 - demo API key, secret, and passphrase are present;
-- REST requests include Bitget's demo trading header `paptrading: 1`;
+- REST requests include Bitget's demo trading header `PAPTRADING: 1`;
 - WebSocket URLs use Bitget demo endpoints;
 - product type and symbol mapping target demo USDT futures.
 
@@ -102,6 +103,28 @@ At startup, the executor:
 5. begins processing eligible intents.
 
 If an existing position matches local orders/fills, it is treated as system-owned and its previous context is restored. If no local ownership can be found, it is marked as imported. Imported positions use exchange average entry price and first local adoption time as the baseline for stop-loss, trailing take-profit, and 24h holding review.
+
+## Runtime Manual Intervention
+
+The executor must handle manual actions made in the Bitget client while the program is running.
+
+Manual intervention is detected when WebSocket or REST reconciliation sees an exchange order, fill, cancellation, or position change that cannot be matched to a local `client_oid`, local order, or local intent.
+
+Rules:
+
+- Manual override is per symbol, not global.
+- When manual open, add, reduce, close, or cancel is detected for `ETHUSDT`, the executor enters `manual_override:ETHUSDT`.
+- While a symbol is in manual override, new automatic opening and adding intents for that symbol are rejected or left pending with a durable event.
+- Close, cancel, explicit user close commands, stop-loss, trailing take-profit, and account-safety actions remain allowed.
+- Exchange state wins over local state.
+- System-owned local orders manually cancelled in the client are marked `externally_cancelled`.
+- System-owned local positions manually closed or reduced in the client are marked `externally_closed` or reconciled down to the exchange size.
+- Manual or unmatched positions are marked `imported` and are included in local position and PnL reporting.
+- If a manual position exceeds the system's normal notional cap, that cap breach alone must not trigger automatic reduction.
+- Margin danger remains an account-safety rule. If Bitget reports liquidation or margin danger, the executor may still cancel orders and reduce or close positions to avoid account failure.
+- The symbol automatically leaves manual override only when both exchange position size and exchange open orders for that symbol are zero.
+
+Manual override state is stored durably in SQLite `executor_state`, so restarts do not forget that automatic new openings are paused.
 
 ## Order Rules
 
@@ -162,14 +185,33 @@ Reconciliation must be safe to run repeatedly.
 
 Telegram remains a notification layer, not a control dependency.
 
-The executor sends active Telegram messages only for:
+Demo mode does not proactively send normal opening or closing trade messages. In demo mode, the Telegram bot answers user queries for:
 
-- order filled;
-- position closed with realized PnL if available;
-- rejected intent caused by safety rules;
+- current positions;
+- open orders;
+- recent trades;
+- realized PnL;
+- unrealized PnL;
+- total equity and available margin.
+
+Demo mode still sends active Telegram messages for:
+
 - WebSocket authentication failure;
 - REST order/cancel failure after retry;
 - margin danger or emergency reduce/close.
+- manual override entered or cleared.
+
+Future live mode sends active Telegram messages for:
+
+- every opened position or opening fill;
+- every closed position or closing fill, including realized PnL for that trade when available;
+- rejected intent caused by safety rules;
+- WebSocket authentication failure;
+- REST order/cancel failure after retry;
+- margin danger or emergency reduce/close;
+- manual override entered or cleared.
+
+Future live mode also supports query commands for total account realized PnL, unrealized PnL, equity, available margin, current positions, open orders, and recent trades.
 
 Telegram delivery failure must not block order management. All important messages are still written to SQLite `events`.
 
@@ -224,5 +266,7 @@ This milestone is complete when:
 - Orders, fills, positions, equity snapshots, and events are persisted.
 - REST reconciliation repairs at least one deliberately missing local order/fill/position record.
 - Existing demo positions are adopted instead of automatically closed during normal strategy startup.
-- Telegram sends only fills and major errors.
+- Runtime manual client actions put the affected symbol into manual override, pause automatic new openings for that symbol, and automatically clear only after that symbol has no position and no open orders.
+- Demo Telegram does not proactively send normal open/close messages, but can answer query commands for positions, trades, and PnL.
+- Future live Telegram sends open/close messages and includes realized PnL on closes when available.
 - Full Python and Rust verification passes.
