@@ -27,13 +27,19 @@ class Backtester:
         }
 
     def autocorrelation(self) -> float:
-        frame = self.factors.sort_values(["symbol", "timestamp"]).copy()
-        corr = frame.groupby("symbol")["value"].apply(lambda s: s.corr(s.shift(1)))
-        corr = corr.dropna()
+        # ponytail: Series.autocorr(1) is the native lag-1 Pearson corr the
+        # hand-rolled s.corr(s.shift(1)) computed; NaN (constant/single-point
+        # series) drops out uniformly via dropna, matching prior behavior.
+        corr = (
+            self.factors.sort_values(["symbol", "timestamp"])
+            .groupby("symbol")["value"]
+            .apply(lambda s: s.autocorr(1))
+            .dropna()
+        )
         return float(corr.mean()) if not corr.empty else 0.0
 
-    def ic_summary(self, horizon: int) -> dict[str, float]:
-        returns = forward_returns(self.prices, periods=horizon)
+    def ic_summary(self, horizon: int, returns: pd.DataFrame | None = None) -> dict[str, float]:
+        returns = returns if returns is not None else forward_returns(self.prices, periods=horizon)
         ic = rank_ic_by_timestamp(self.factors, returns).dropna()
         if ic.empty:
             return {"mean": 0.0, "std": 0.0, "icir": 0.0}
@@ -44,12 +50,16 @@ class Backtester:
             "icir": float(ic.mean() / std) if std else 0.0,
         }
 
-    def bucket_returns(self, horizon: int, buckets: int) -> pd.DataFrame:
-        returns = forward_returns(self.prices, periods=horizon)
+    def bucket_returns(
+        self, horizon: int, buckets: int, returns: pd.DataFrame | None = None
+    ) -> pd.DataFrame:
+        returns = returns if returns is not None else forward_returns(self.prices, periods=horizon)
         return bucket_returns(self.factors, returns, buckets=buckets)
 
-    def performance_summary(self, horizon: int) -> dict[str, float]:
-        returns = forward_returns(self.prices, periods=horizon)
+    def performance_summary(
+        self, horizon: int, returns: pd.DataFrame | None = None
+    ) -> dict[str, float]:
+        returns = returns if returns is not None else forward_returns(self.prices, periods=horizon)
         merged = self.factors.merge(returns, on=["timestamp", "symbol"], how="inner")
         merged = merged.dropna(subset=["value", "forward_return"])
         if merged.empty:
@@ -62,10 +72,14 @@ class Backtester:
         }
 
     def run_full_report(self, horizon: int = 4, buckets: int = 5) -> dict[str, object]:
+        # ponytail: forward_returns is the same for the three horizon-bound
+        # methods; compute once, thread it through so run_full_report doesn't
+        # rebuild the same frame three times. Public signatures are unchanged.
+        returns = forward_returns(self.prices, periods=horizon)
         return {
             "distribution": self.factor_distribution(),
             "autocorrelation": self.autocorrelation(),
-            "ic_summary": self.ic_summary(horizon),
-            "bucket_returns": self.bucket_returns(horizon, buckets),
-            "performance": self.performance_summary(horizon),
+            "ic_summary": self.ic_summary(horizon, returns),
+            "bucket_returns": self.bucket_returns(horizon, buckets, returns),
+            "performance": self.performance_summary(horizon, returns),
         }
