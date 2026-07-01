@@ -55,3 +55,18 @@ pub struct PositionRecord {
     pub source_intent_id: Option<String>,
     pub raw_json: String,
 }
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MarketUpdate {
+    pub symbol: String,
+    pub best_bid: f64,
+    pub best_ask: f64,
+    pub exchange_ts_ms: i64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PrivateWsUpdate {
+    pub orders: Vec<OrderRecord>,
+    pub fills: Vec<FillRecord>,
+    pub positions: Vec<PositionRecord>,
+}
