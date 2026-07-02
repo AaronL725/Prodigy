@@ -47,11 +47,15 @@ pub async fn run_once_or_loop(cfg: ExecutorConfig) -> Result<()> {
     verify_public_ws_connects(&cfg).await?;
     verify_private_ws_connects(&cfg).await?;
     // Set leverage once at startup so the demo account runs at the configured
-    // leverage (default 5x). Best-effort: if Bitget rejects it (already set,
-    // or a permission issue), log and continue rather than abort.
-    if let Err(e) = rest.set_leverage(cfg.leverage).await {
-        println!("set-leverage skipped: {e}");
-    }
+    // leverage (default 5x). If Bitget rejects it, we must NOT continue to
+    // place opening orders — the margin/risk math assumes the configured
+    // leverage, and trading at the wrong leverage could exceed intended exposure.
+    rest.set_leverage(cfg.leverage).await.map_err(|e| {
+        anyhow::anyhow!(
+            "set-leverage failed (configured {}x): {e} — refusing to trade at unknown leverage",
+            cfg.leverage
+        )
+    })?;
     // Skip override detection in test-reset mode: the reset is system cleanup,
     // not user manual intervention. Normal strategy runs detect it.
     reconcile_once(
@@ -528,19 +532,17 @@ fn set_local_order_filled(conn: &Connection, client_oid: &str, filled_size: f64)
     Ok(())
 }
 
-/// Record a fill row for the audit trail. Called whenever the execution loop
-/// detects a confirmed fill (maker poll, cancel-race, taker poll).
-/// Uses the real order_id from the orders table (FK target), and the order's
-/// limit price for maker fills. Market fills have price=None → 0.0 here until
-/// reconcile enriches from the exchange fills endpoint.
-fn record_fill(
+/// Record a fill row for the audit trail. Queries the exchange order-detail for
+/// the real average fill price, fee, and trade_id so the fills table can support
+/// PnL/fee calculations. Called whenever the execution loop detects a confirmed
+/// fill (maker poll, cancel-race, taker poll).
+async fn record_fill(
     conn: &Connection,
+    rest: &BitgetRestClient,
     intent: &TradeIntent,
     order: &PlaceOrderRequest,
     filled_size: f64,
 ) -> Result<()> {
-    // Look up the real order_id (the exchange orderId stored by upsert_order_row)
-    // so the fills.order_id FK is satisfied.
     let real_order_id: String = conn
         .query_row(
             "select order_id from orders where client_oid = ?",
@@ -548,20 +550,60 @@ fn record_fill(
             |row| row.get(0),
         )
         .unwrap_or_else(|_| order.client_oid.clone());
+
+    // Query the exchange for real fill data (price, fee, trade_id).
+    let (fill_price, fill_fee, trade_id) = match rest.get_order_detail(&order.client_oid).await {
+        Ok(detail) => {
+            let price = detail
+                .get("priceAvg")
+                .or_else(|| detail.get("averageFillPrice"))
+                .and_then(serde_json::Value::as_str)
+                .and_then(|v| v.parse::<f64>().ok())
+                .unwrap_or_else(|| {
+                    // Fall back to the order's limit price if exchange doesn't report avg.
+                    order
+                        .price
+                        .as_ref()
+                        .and_then(|p| p.parse().ok())
+                        .unwrap_or(0.0)
+                });
+            let fee = detail
+                .get("fee")
+                .or_else(|| detail.get("fillFee"))
+                .and_then(serde_json::Value::as_str)
+                .and_then(|v| v.parse::<f64>().ok())
+                .unwrap_or(0.0);
+            let tid = detail
+                .get("tradeId")
+                .and_then(serde_json::Value::as_str)
+                .map(|s| s.to_string());
+            (price, fee, tid)
+        }
+        Err(_) => {
+            // Exchange query failed — use order price as fallback. Reconcile
+            // owns exchange truth and can enrich later.
+            (
+                order
+                    .price
+                    .as_ref()
+                    .and_then(|p| p.parse().ok())
+                    .unwrap_or(0.0),
+                0.0,
+                None,
+            )
+        }
+    };
+
     let fill = crate::types::FillRecord {
         fill_id: format!("fill-{}-{}", order.client_oid, crate::bitget::now_ms()),
         order_id: real_order_id,
-        trade_id: None,
+        trade_id,
         client_oid: Some(order.client_oid.clone()),
         symbol: intent.symbol.clone(),
         side: order.side.clone(),
-        price: order
-            .price
-            .as_ref()
-            .and_then(|p| p.parse().ok())
-            .unwrap_or(0.0),
+        price: fill_price,
         size: filled_size,
-        fee: 0.0,
+        fee: fill_fee,
         created_at: crate::bitget::now_ms(),
         raw_json: "{}".to_string(),
     };
@@ -717,11 +759,12 @@ pub async fn process_one_intent(
                 // before placing again. The first attempt (attempt == 1) was already
                 // gated by the entry check, so it doesn't re-check here.
                 if attempt > 1 {
-                    let remaining_notional_check =
-                        remaining_base(target_base, cumulative_filled_base) * maker_ref;
+                    // Fetch a FRESH account snapshot so the re-check uses current
+                    // equity/margin, not the stale snapshot from run start.
+                    let fresh_account = fetch_account_snapshot(rest).await?;
                     if let Err(reason) = check_intent(
                         &intent,
-                        &account,
+                        &fresh_account,
                         &RiskParams {
                             total_notional_cap_x_equity: cfg.total_notional_cap_x_equity,
                             trading_suspension_unrealized_loss_x_equity: cfg
@@ -736,7 +779,6 @@ pub async fn process_one_intent(
                         )?;
                         return Ok(());
                     }
-                    let _ = remaining_notional_check;
                 }
                 // Early-terminate: a prior attempt already filled enough that the
                 // remainder is dust. The position is at target, so mark done and
@@ -809,7 +851,7 @@ pub async fn process_one_intent(
                     match poll_order(rest, &order.client_oid, live_order_size).await {
                         (OrderPollOutcome::Filled, filled) => {
                             cumulative_filled_base += filled;
-                            record_fill(conn, &intent, &order, filled)?;
+                            record_fill(conn, rest, &intent, &order, filled).await?;
                             upsert_order_row(
                                 conn,
                                 &intent,
@@ -934,11 +976,11 @@ pub async fn process_one_intent(
                 }
             }
             ExecutionCommand::PlaceTaker => {
-                // Re-check risk before taker fallback. All maker attempts have
-                // been exhausted; the spec requires risk/market to still hold.
+                // Re-check risk with a FRESH account snapshot before taker fallback.
+                let fresh_account = fetch_account_snapshot(rest).await?;
                 if let Err(reason) = check_intent(
                     &intent,
-                    &account,
+                    &fresh_account,
                     &RiskParams {
                         total_notional_cap_x_equity: cfg.total_notional_cap_x_equity,
                         trading_suspension_unrealized_loss_x_equity: cfg
@@ -1008,7 +1050,7 @@ pub async fn process_one_intent(
                     match poll_order(rest, &order.client_oid, taker_size).await {
                         (OrderPollOutcome::Filled, filled) => {
                             cumulative_filled_base += filled;
-                            record_fill(conn, &intent, &order, filled)?;
+                            record_fill(conn, rest, &intent, &order, filled).await?;
                             upsert_order_row(
                                 conn, &intent, &order, &response, "filled", 1, filled,
                             )?;

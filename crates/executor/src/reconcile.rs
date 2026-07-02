@@ -32,25 +32,56 @@ pub fn classify_position(
     exchange_position
 }
 
-/// Determine whether an exchange position for this symbol is system-owned by
-/// checking if the executor has any local orders (filled/submitted) for it.
-/// Returns the intent_id of the most recent local order if found.
+/// Determine whether an exchange position for this symbol is system-owned.
+/// Checks if the executor has any OPENING orders (filled or submitted) for this
+/// symbol that don't have a matching CLOSED order — i.e. an open exposure cycle
+/// that hasn't been closed. This prevents old filled orders from a position that
+/// was already closed from polluting ownership of a new manual position.
+/// Returns the intent_id of the most recent open-cycle order if found.
 pub fn system_ownership_intent(
     conn: &rusqlite::Connection,
     symbol: &str,
 ) -> Result<Option<String>> {
     use rusqlite::params;
-    let intent_id: Option<String> = conn
+    // Count opening orders (action='open') that are filled/submitted.
+    let open_count: i64 = conn
         .query_row(
-            "select intent_id from orders
-             where symbol = ? and intent_id is not null and status in ('filled', 'submitted')
-             order by updated_at desc limit 1",
+            "select count(*) from orders
+             where symbol = ? and intent_id is not null
+               and action = 'open' and status in ('filled', 'submitted')",
             params![symbol],
             |row| row.get(0),
         )
-        .ok()
-        .flatten();
-    Ok(intent_id)
+        .unwrap_or(0);
+    // Count closing orders (action='close') that are filled.
+    let close_count: i64 = conn
+        .query_row(
+            "select count(*) from orders
+             where symbol = ? and intent_id is not null
+               and action = 'close' and status = 'filled'",
+            params![symbol],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    // If opens > closes, there's at least one unclosed system opening cycle →
+    // the current position is likely system-owned. Otherwise the system has
+    // closed everything it opened; a current position is imported/manual.
+    if open_count > close_count {
+        let intent_id: Option<String> = conn
+            .query_row(
+                "select intent_id from orders
+                 where symbol = ? and intent_id is not null
+                   and action = 'open' and status in ('filled', 'submitted')
+                 order by updated_at desc limit 1",
+                params![symbol],
+                |row| row.get(0),
+            )
+            .ok()
+            .flatten();
+        Ok(intent_id)
+    } else {
+        Ok(None)
+    }
 }
 
 pub async fn reconcile_once(
