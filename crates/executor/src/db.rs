@@ -1,7 +1,7 @@
 use anyhow::Result;
 use rusqlite::{params, Connection};
 
-use crate::types::{OrderRecord, PositionRecord, TradeIntent};
+use crate::types::{FillRecord, OrderRecord, PositionRecord, TradeIntent};
 
 pub fn pending_intents(conn: &Connection) -> Result<Vec<TradeIntent>> {
     let mut stmt = conn.prepare(
@@ -170,6 +170,48 @@ pub fn local_system_intent_ids(conn: &Connection) -> Result<std::collections::Ha
     Ok(set)
 }
 
+/// Insert a fill record. Idempotent by fill_id (PK) via insert-or-ignore.
+pub fn insert_fill(conn: &Connection, fill: &FillRecord) -> Result<()> {
+    conn.execute(
+        "insert or ignore into fills (
+           fill_id, order_id, symbol, side, price, size, fee, created_at,
+           trade_id, client_oid, raw_json
+         ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        params![
+            fill.fill_id,
+            fill.order_id,
+            fill.symbol,
+            fill.side,
+            fill.price,
+            fill.size,
+            fill.fee,
+            fill.created_at,
+            fill.trade_id,
+            fill.client_oid,
+            fill.raw_json,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Insert an equity snapshot row for the audit trail.
+pub fn insert_equity_snapshot(
+    conn: &Connection,
+    equity: f64,
+    available_margin: f64,
+    unrealized_pnl: f64,
+    realized_pnl_24h: f64,
+) -> Result<()> {
+    conn.execute(
+        "insert into equity_snapshots (
+           snapshot_id, created_at, equity, available_margin,
+           unrealized_pnl, realized_pnl_24h
+         ) values (lower(hex(randomblob(16))), datetime('now'), ?, ?, ?, ?)",
+        params![equity, available_margin, unrealized_pnl, realized_pnl_24h],
+    )?;
+    Ok(())
+}
+
 pub fn write_event(
     conn: &Connection,
     severity: &str,
@@ -335,5 +377,62 @@ mod tests {
             .unwrap();
         assert_eq!(row.0, 50.0);
         assert_eq!(row.1, "imported");
+    }
+
+    #[test]
+    fn insert_fill_and_equity_snapshot_persist() {
+        use crate::types::{FillRecord, OrderRecord};
+        let conn = memory_db();
+        // FK: fills.order_id references orders.order_id — insert a parent order first.
+        let order = OrderRecord {
+            order_id: "order-1".to_string(),
+            exchange_order_id: Some("order-1".to_string()),
+            client_oid: "client-1".to_string(),
+            intent_id: None,
+            symbol: "ETH/USDT:USDT".to_string(),
+            side: "buy".to_string(),
+            action: "open".to_string(),
+            order_type: "limit".to_string(),
+            status: "filled".to_string(),
+            price: Some(3000.0),
+            size: 0.01,
+            filled_size: 0.01,
+            attempt: 1,
+            raw_json: "{}".to_string(),
+            last_error: None,
+        };
+        upsert_order(&conn, &order).unwrap();
+        let fill = FillRecord {
+            fill_id: "fill-1".to_string(),
+            order_id: "order-1".to_string(),
+            trade_id: Some("trade-1".to_string()),
+            client_oid: Some("client-1".to_string()),
+            symbol: "ETH/USDT:USDT".to_string(),
+            side: "buy".to_string(),
+            price: 3000.0,
+            size: 0.01,
+            fee: 0.006,
+            created_at: "2026-07-01T00:00:00Z".to_string(),
+            raw_json: "{}".to_string(),
+        };
+        insert_fill(&conn, &fill).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "select count(*) from fills where fill_id = 'fill-1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+
+        insert_equity_snapshot(&conn, 5000.0, 4500.0, -50.0, 0.0).unwrap();
+        let eq: f64 = conn
+            .query_row(
+                "select equity from equity_snapshots order by created_at desc limit 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(eq, 5000.0);
     }
 }

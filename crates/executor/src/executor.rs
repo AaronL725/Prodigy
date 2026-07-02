@@ -57,6 +57,13 @@ pub async fn run_once_or_loop(cfg: ExecutorConfig) -> Result<()> {
     let mut market_cache = MarketCache::default();
     market_cache.update(fetch_initial_market_snapshot(&cfg, &rest).await?);
     let account = fetch_account_snapshot(&rest).await?;
+    db::insert_equity_snapshot(
+        &conn,
+        account.equity,
+        account.available_margin,
+        account.unrealized_pnl_24h,
+        0.0,
+    )?;
     for intent in intents {
         let now_ms = crate::bitget::now_ms().parse::<i64>().unwrap_or(0);
         let market = market_cache
@@ -495,6 +502,35 @@ fn set_local_order_filled(conn: &Connection, client_oid: &str, filled_size: f64)
     Ok(())
 }
 
+/// Record a fill row for the audit trail. Called whenever the execution loop
+/// detects a confirmed fill (maker poll, cancel-race, taker poll).
+fn record_fill(
+    conn: &Connection,
+    intent: &TradeIntent,
+    order: &PlaceOrderRequest,
+    filled_size: f64,
+) -> Result<()> {
+    let fill = crate::types::FillRecord {
+        fill_id: format!("fill-{}-{}", order.client_oid, crate::bitget::now_ms()),
+        order_id: order.client_oid.clone(),
+        trade_id: None,
+        client_oid: Some(order.client_oid.clone()),
+        symbol: intent.symbol.clone(),
+        side: order.side.clone(),
+        price: order
+            .price
+            .as_ref()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(0.0),
+        size: filled_size,
+        fee: 0.0,
+        created_at: crate::bitget::now_ms(),
+        raw_json: "{}".to_string(),
+    };
+    db::insert_fill(conn, &fill)?;
+    Ok(())
+}
+
 fn format_price(value: f64) -> String {
     format!("{value:.2}")
         .trim_end_matches('0')
@@ -709,6 +745,7 @@ pub async fn process_one_intent(
                     match poll_order(rest, &order.client_oid, live_order_size).await {
                         (OrderPollOutcome::Filled, filled) => {
                             cumulative_filled_base += filled;
+                            record_fill(conn, &intent, &order, filled)?;
                             upsert_order_row(
                                 conn,
                                 &intent,
@@ -788,6 +825,22 @@ pub async fn process_one_intent(
                     // record its observed size (the prior code left filled_size=0).
                     cumulative_filled_base += confirm_filled;
                     set_local_order_filled(conn, &client_oid, confirm_filled)?;
+                    db::insert_fill(
+                        conn,
+                        &crate::types::FillRecord {
+                            fill_id: format!("fill-{client_oid}-{}", crate::bitget::now_ms()),
+                            order_id: client_oid.clone(),
+                            trade_id: None,
+                            client_oid: Some(client_oid.clone()),
+                            symbol: intent.symbol.clone(),
+                            side: "unknown".to_string(),
+                            price: 0.0,
+                            size: confirm_filled,
+                            fee: 0.0,
+                            created_at: crate::bitget::now_ms(),
+                            raw_json: "{}".to_string(),
+                        },
+                    )?;
                     state.on_order_filled();
                     live_client_oid = None;
                 } else if confirmed {
@@ -864,6 +917,7 @@ pub async fn process_one_intent(
                     match poll_order(rest, &order.client_oid, taker_size).await {
                         (OrderPollOutcome::Filled, filled) => {
                             cumulative_filled_base += filled;
+                            record_fill(conn, &intent, &order, filled)?;
                             upsert_order_row(
                                 conn, &intent, &order, &response, "filled", 1, filled,
                             )?;
