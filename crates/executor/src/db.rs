@@ -172,6 +172,40 @@ pub fn local_order_intent_ids(conn: &Connection) -> Result<std::collections::Has
     Ok(set)
 }
 
+/// Signed net base the system expects to hold for a symbol, summed across ALL
+/// filled orders by direction (buy = +, sell = −): a filled open-long adds, a
+/// filled close-long (a sell) subtracts. Reconcile compares this against the
+/// exchange position size to detect a client manually adding, reducing, or
+/// closing a system-owned position. Returns (signed_base, side): e.g.
+/// +0.10/"long", -0.10/"short", or 0.0/"" when the system holds nothing.
+pub fn system_net_base_for_symbol(
+    conn: &Connection,
+    symbol: &str,
+) -> Result<(f64, &'static str)> {
+    let mut stmt = conn.prepare(
+        "select side, filled_size from orders
+         where symbol = ? and status = 'filled' and filled_size > 0",
+    )?;
+    let rows = stmt.query_map(params![symbol], |row| {
+        let side: String = row.get(0)?;
+        let filled: f64 = row.get(1)?;
+        Ok((side, filled))
+    })?;
+    let mut net = 0.0;
+    for row in rows {
+        let (side, filled) = row?;
+        net += if side == "sell" { -filled } else { filled };
+    }
+    let side = if net > 0.0 {
+        "long"
+    } else if net < 0.0 {
+        "short"
+    } else {
+        ""
+    };
+    Ok((net, side))
+}
+
 /// Insert a fill record. Idempotent by fill_id (PK) via insert-or-ignore.
 pub fn insert_fill(conn: &Connection, fill: &FillRecord) -> Result<()> {
     conn.execute(
@@ -436,5 +470,63 @@ mod tests {
             )
             .unwrap();
         assert_eq!(eq, 5000.0);
+    }
+
+    #[test]
+    fn system_net_base_sums_filled_opens_minus_closes_and_signs_by_side() {
+        // Reconcile uses this to detect a client manually changing a system
+        // position. The net must subtract closes from opens and sign long+/short-.
+        let conn = memory_db();
+        conn.execute(
+            "insert into trade_intents (intent_id, created_at, symbol, side, action,
+               target_notional, max_order_notional, status, source)
+             values ('i1','2026-07-01T00:00:00Z','ETH/USDT:USDT','long','open',100,100,'executed','t')",
+            [],
+        )
+        .unwrap();
+        // Opened 0.05 long (filled), then opened another 0.03 long (filled) → net +0.08.
+        for (oid, sz) in [("o1", 0.05), ("o2", 0.03)] {
+            conn.execute(
+                "insert into orders (order_id, client_oid, intent_id, symbol, side, action,
+                   order_type, status, price, size, filled_size, created_at, updated_at)
+                 values (?1, ?2, 'i1', 'ETH/USDT:USDT', 'buy', 'open', 'limit', 'filled',
+                   3000, ?3, ?3, '2026-07-01T00:00:00Z', '2026-07-01T00:00:00Z')",
+                params![oid, oid, sz],
+            )
+            .unwrap();
+        }
+        let (net, side) = system_net_base_for_symbol(&conn, "ETH/USDT:USDT").unwrap();
+        assert!((net - 0.08).abs() < 1e-9 && side == "long");
+
+        // A filled close of 0.02 reduces the net to +0.06 long.
+        conn.execute(
+            "insert into trade_intents (intent_id, created_at, symbol, side, action,
+               target_notional, max_order_notional, status, source)
+             values ('i2','2026-07-01T00:00:00Z','ETH/USDT:USDT','long','close',100,100,'executed','t')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "insert into orders (order_id, client_oid, intent_id, symbol, side, action,
+               order_type, status, price, size, filled_size, created_at, updated_at)
+             values ('o3','o3','i2','ETH/USDT:USDT','sell','close','market','filled',
+               3000, 0.02, 0.02, '2026-07-01T00:00:00Z', '2026-07-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        let (net2, side2) = system_net_base_for_symbol(&conn, "ETH/USDT:USDT").unwrap();
+        assert!((net2 - 0.06).abs() < 1e-9 && side2 == "long");
+
+        // Unfilled/submitted orders don't count (not yet part of the position).
+        conn.execute(
+            "insert into orders (order_id, client_oid, symbol, side, action, order_type,
+               status, price, size, filled_size, created_at, updated_at)
+             values ('o4','o4','ETH/USDT:USDT','buy','open','limit','submitted',
+               3000, 0.10, 0.0, '2026-07-01T00:00:00Z', '2026-07-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        let (net3, _) = system_net_base_for_symbol(&conn, "ETH/USDT:USDT").unwrap();
+        assert!((net3 - 0.06).abs() < 1e-9);
     }
 }

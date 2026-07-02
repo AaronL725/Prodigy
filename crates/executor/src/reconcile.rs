@@ -112,6 +112,39 @@ pub fn system_ownership_intent(
     }
 }
 
+/// Classify a manual change to a SYSTEM-owned position by comparing the net base
+/// our local orders imply (system_expected_base) against the exchange position's
+/// size/side. Any unexplained drift = a client touched the position in the Bitget
+/// UI (add/reduce/close/reverse), which must enter manual override so auto-open
+/// pauses. Returns None when exchange and system are in sync.
+///
+/// Signs: system_expected_base and exchange_size are signed long+ / short-; sides
+/// are "long"/"short"/"" (no position). Drifts below the dust floor are ignored so
+/// sub-min-qty rounding doesn't spuriously trip override.
+fn classify_position_drift(
+    system_expected_base: f64,
+    exchange_size: f64,
+    system_side: &str,
+    exchange_side: &str,
+) -> Option<InterventionKind> {
+    let drift = exchange_size - system_expected_base;
+    if drift.abs() <= DUST_BASE {
+        return None;
+    }
+    let same_side = exchange_side == system_side && !exchange_side.is_empty();
+    if !same_side {
+        // Side changed (flip or closed-to-zero): a manual close+reverse or full close.
+        return Some(InterventionKind::Close);
+    }
+    if drift > 0.0 {
+        Some(InterventionKind::Add)
+    } else {
+        Some(InterventionKind::Reduce)
+    }
+}
+
+const DUST_BASE: f64 = 1e-6;
+
 pub async fn reconcile_once(
     conn: &Connection,
     rest: &BitgetRestClient,
@@ -308,6 +341,45 @@ pub async fn reconcile_once(
             .await
             .ok();
         }
+
+        // A SYSTEM-owned position whose exchange size/side doesn't match the net
+        // base our local orders imply = a client manually added, reduced, closed,
+        // or reversed it in the Bitget UI. Imported-position detection can't see
+        // this (the position IS traced to a local order), so compare the exchange
+        // size against the local net and enter override on any drift. Skipped in
+        // test-reset mode.
+        if detect_override && record.ownership == "system" && !override_active {
+            let (sys_base, sys_side) =
+                db::system_net_base_for_symbol(conn, &record.symbol)?;
+            let exchange_signed = if record.side == "short" { -size } else { size };
+            if let Some(kind) =
+                classify_position_drift(sys_base, exchange_signed, sys_side, &record.side)
+            {
+                db::set_executor_state(conn, &override_key, "active")?;
+                override_active = true;
+                db::write_event(
+                    conn,
+                    "warning",
+                    "executor",
+                    "manual override entered (position drift)",
+                    &format!(
+                        "{{\"symbol\":\"{}\",\"kind\":\"{:?}\"}}",
+                        record.symbol, kind
+                    ),
+                )?;
+                notify::send_telegram(
+                    telegram_token,
+                    telegram_chat,
+                    "manual_override_entered",
+                    &format!(
+                        "manual override entered for {} (position drift: {:?})",
+                        record.symbol, kind
+                    ),
+                )
+                .await
+                .ok();
+            }
+        }
     }
 
     // Auto-clear the per-symbol override once the exchange has no position and no
@@ -495,6 +567,39 @@ mod tests {
         assert_eq!(classified.ownership, "system");
         assert_eq!(classified.source_intent_id.as_deref(), Some("intent-7"));
         assert_eq!(classified.adopted_at, None);
+    }
+
+    #[test]
+    fn position_drift_classifies_manual_add_reduce_close() {
+        // A system-owned position should match the net base our local orders
+        // imply (filled opens minus filled closes). A client who manually adds,
+        // reduces, or closes the position drives a drift between the two that no
+        // local order explains — that drift must enter manual override, not be
+        // silently adopted as the new system size.
+
+        // In sync: exchange size equals local net → no intervention.
+        assert_eq!(classify_position_drift(0.10, 0.10, "long", "long"), None);
+        // Manual close/reduce-to-zero: system expected 0.10 but exchange has 0.
+        assert_eq!(
+            classify_position_drift(0.10, 0.0, "long", ""),
+            Some(InterventionKind::Close)
+        );
+        // Manual partial reduce: exchange smaller than system expected.
+        assert_eq!(
+            classify_position_drift(0.10, 0.06, "long", "long"),
+            Some(InterventionKind::Reduce)
+        );
+        // Manual add: exchange larger than system expected.
+        assert_eq!(
+            classify_position_drift(0.10, 0.14, "long", "long"),
+            Some(InterventionKind::Add)
+        );
+        // Side flipped (long→short): a manual reverse = close+open; treat as a
+        // manual change so override engages.
+        assert_eq!(
+            classify_position_drift(0.10, 0.02, "long", "short"),
+            Some(InterventionKind::Close)
+        );
     }
 
     #[test]
