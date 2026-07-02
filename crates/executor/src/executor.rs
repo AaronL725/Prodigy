@@ -530,15 +530,27 @@ fn set_local_order_filled(conn: &Connection, client_oid: &str, filled_size: f64)
 
 /// Record a fill row for the audit trail. Called whenever the execution loop
 /// detects a confirmed fill (maker poll, cancel-race, taker poll).
+/// Uses the real order_id from the orders table (FK target), and the order's
+/// limit price for maker fills. Market fills have price=None → 0.0 here until
+/// reconcile enriches from the exchange fills endpoint.
 fn record_fill(
     conn: &Connection,
     intent: &TradeIntent,
     order: &PlaceOrderRequest,
     filled_size: f64,
 ) -> Result<()> {
+    // Look up the real order_id (the exchange orderId stored by upsert_order_row)
+    // so the fills.order_id FK is satisfied.
+    let real_order_id: String = conn
+        .query_row(
+            "select order_id from orders where client_oid = ?",
+            rusqlite::params![order.client_oid],
+            |row| row.get(0),
+        )
+        .unwrap_or_else(|_| order.client_oid.clone());
     let fill = crate::types::FillRecord {
         fill_id: format!("fill-{}-{}", order.client_oid, crate::bitget::now_ms()),
-        order_id: order.client_oid.clone(),
+        order_id: real_order_id,
         trade_id: None,
         client_oid: Some(order.client_oid.clone()),
         symbol: intent.symbol.clone(),
@@ -851,11 +863,19 @@ pub async fn process_one_intent(
                     // record its observed size (the prior code left filled_size=0).
                     cumulative_filled_base += confirm_filled;
                     set_local_order_filled(conn, &client_oid, confirm_filled)?;
+                    // Look up the real order_id for the FK.
+                    let real_oid: String = conn
+                        .query_row(
+                            "select order_id from orders where client_oid = ?",
+                            rusqlite::params![client_oid],
+                            |row| row.get(0),
+                        )
+                        .unwrap_or_else(|_| client_oid.clone());
                     db::insert_fill(
                         conn,
                         &crate::types::FillRecord {
                             fill_id: format!("fill-{client_oid}-{}", crate::bitget::now_ms()),
-                            order_id: client_oid.clone(),
+                            order_id: real_oid,
                             trade_id: None,
                             client_oid: Some(client_oid.clone()),
                             symbol: intent.symbol.clone(),
