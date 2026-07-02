@@ -2,6 +2,7 @@ pub mod bitget;
 pub mod config;
 pub mod db;
 pub mod executor;
+pub mod manual_override;
 pub mod notify;
 pub mod reconcile;
 pub mod risk;

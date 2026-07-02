@@ -125,6 +125,27 @@ pub fn write_event(
     Ok(())
 }
 
+pub fn set_executor_state(conn: &Connection, key: &str, value: &str) -> Result<()> {
+    conn.execute(
+        "insert into executor_state (key, value, updated_at)
+         values (?, ?, datetime('now'))
+         on conflict(key) do update set
+           value = excluded.value,
+           updated_at = datetime('now')",
+        params![key, value],
+    )?;
+    Ok(())
+}
+
+pub fn get_executor_state(conn: &Connection, key: &str) -> Result<Option<String>> {
+    let mut stmt = conn.prepare("select value from executor_state where key = ?")?;
+    let mut rows = stmt.query(params![key])?;
+    Ok(match rows.next()? {
+        Some(row) => Some(row.get(0)?),
+        None => None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
