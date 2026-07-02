@@ -56,25 +56,77 @@ pub async fn run_once_or_loop(cfg: ExecutorConfig) -> Result<()> {
     // /api/v2/mix/account/account path that snapshot will reuse.
     let mut market_cache = MarketCache::default();
     market_cache.update(fetch_initial_market_snapshot(&cfg, &rest).await?);
-    let _account_json = rest.get_account_snapshot().await?;
+    let account = fetch_account_snapshot(&rest).await?;
     for intent in intents {
         let now_ms = crate::bitget::now_ms().parse::<i64>().unwrap_or(0);
         let market = market_cache
             .latest_fresh(now_ms, cfg.stale_market_data_secs)
             .ok_or_else(|| anyhow::anyhow!("market cache is stale"))?;
-        let account = AccountRiskSnapshot {
-            equity: 10_000.0,
-            available_margin: 5_000.0,
-            unrealized_pnl_24h: 0.0,
-            gross_notional: 0.0,
-            market_is_fresh: true,
-            private_state_is_ready: true,
-        };
         process_one_intent(&conn, &cfg, &rest, intent.clone(), market, account).await?;
         db::write_event(&conn, "info", "executor", "processed intent", "{}")?;
         println!("processed {}", intent.intent_id);
     }
     Ok(())
+}
+
+/// Fetch real account equity/margin/unrealized PnL + sum positions into gross
+/// notional. Parses the Bitget v2 mix account + all-position response into the
+/// AccountRiskSnapshot the risk gate consumes — no hardcoded fiction.
+async fn fetch_account_snapshot(rest: &BitgetRestClient) -> Result<AccountRiskSnapshot> {
+    let acct = rest.get_account_snapshot().await?;
+    let data = acct.get("data").unwrap_or(&serde_json::Value::Null);
+    let f = |key: &str| {
+        data.get(key)
+            .and_then(serde_json::Value::as_str)
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.0)
+    };
+    let equity = f("accountEquity");
+    let available_margin = f("available");
+    let unrealized_pnl = f("unrealizedPL");
+
+    // Sum position notionals from all-position for gross_notional.
+    let positions = rest
+        .get(
+            "/api/v2/mix/position/all-position",
+            &[
+                ("productType", rest.product_type().to_string()),
+                ("marginCoin", rest.margin_coin().to_string()),
+            ],
+        )
+        .await?;
+    let gross_notional = positions
+        .get("data")
+        .and_then(serde_json::Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .map(|r| {
+                    let size: f64 = r
+                        .get("total")
+                        .or_else(|| r.get("available"))
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(0.0);
+                    let price: f64 = r
+                        .get("averageOpenPrice")
+                        .or_else(|| r.get("openPriceAvg"))
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(0.0);
+                    size.abs() * price
+                })
+                .sum()
+        })
+        .unwrap_or(0.0);
+
+    Ok(AccountRiskSnapshot {
+        equity,
+        available_margin,
+        unrealized_pnl_24h: unrealized_pnl,
+        gross_notional,
+        market_is_fresh: true,
+        private_state_is_ready: true,
+    })
 }
 
 async fn fetch_initial_market_snapshot(
