@@ -201,16 +201,104 @@ async fn fetch_initial_market_snapshot(
     })
 }
 
+/// Base size to market-close for a position, given its total and available
+/// fields. `total` is the real open size; `available` only reflects what isn't
+/// locked by an open delegate, so a locked position reports total>0, available=0.
+/// We close the FULL total (a market reduce-only close releases the locked
+/// portion), falling back to available only when total is missing/zero.
+fn closeable_size(total: f64, available: f64) -> f64 {
+    if total > 0.0 {
+        total
+    } else {
+        available
+    }
+}
+
+/// Parse a single all-position row into (closeable_size, hold_side) for this
+/// symbol. Returns None for rows of other symbols or with no closeable size.
+fn position_row_closeable<'a>(row: &'a serde_json::Value, symbol: &str) -> Option<(f64, &'a str)> {
+    if row.get("symbol").and_then(serde_json::Value::as_str) != Some(symbol) {
+        return None;
+    }
+    let f = |key: &str| {
+        row.get(key)
+            .and_then(serde_json::Value::as_str)
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.0)
+    };
+    let total = f("total");
+    let available = f("available");
+    let size = closeable_size(total, available);
+    if size <= 0.0 {
+        return None;
+    }
+    let hold_side = row
+        .get("holdSide")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    Some((size, hold_side))
+}
+
+/// Count the exchange's open pending orders for the configured symbol. Used by
+/// the test reset to wait for cancels to settle before closing positions, so a
+/// just-cancelled reduce-only order has released its size lock.
+fn pending_orders_for_symbol(pending: &serde_json::Value, symbol: &str) -> usize {
+    pending
+        .get("data")
+        .and_then(serde_json::Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .filter(|r| r.get("symbol").and_then(serde_json::Value::as_str) == Some(symbol))
+                .count()
+        })
+        .unwrap_or(0)
+}
+
 async fn reset_demo_symbol_state(cfg: &ExecutorConfig, rest: &BitgetRestClient) -> Result<()> {
     // ponytail: best-effort resets behind --test-reset-demo-state. A failure
     // (e.g. no ETHUSDT order to cancel, or a sub-min-qty dust position that
     // can't be market-closed — Bitget 45111) must not abort the run before the
-    // pending intent is processed. Log a line so it isn't silent.
+    // pending intent is processed. But a close that we THINK succeeded must not
+    // be swallowed silently either: if the position is still there afterward we
+    // surface a diagnostic so the residue isn't a silent inconsistency.
     if let Err(e) = rest.cancel_all_orders().await {
         println!("demo reset: cancel-all skipped: {e}");
     }
+    // Bounded-poll for the cancellations to settle before closing: a reduce-only
+    // order still on the book locks position size (available<total), and closing
+    // while locked can be rejected or close less than total. Up to ~5s.
+    let settle_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let pending = rest
+            .get(
+                "/api/v2/mix/order/orders-pending",
+                &[
+                    ("productType", cfg.product_type.clone()),
+                    ("marginCoin", cfg.margin_coin.clone()),
+                ],
+            )
+            .await
+            .unwrap_or(serde_json::Value::Null);
+        if pending_orders_for_symbol(&pending, &cfg.bitget_symbol) == 0 {
+            break;
+        }
+        if Instant::now() >= settle_deadline {
+            println!(
+                "demo reset: {} pending orders for {} still open after cancel settle window",
+                pending_orders_for_symbol(&pending, &cfg.bitget_symbol),
+                cfg.bitget_symbol
+            );
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
     if let Err(e) = close_existing_demo_position_if_any(cfg, rest).await {
-        println!("demo reset: position close skipped: {e}");
+        // A close failure is diagnostic: log loudly, do NOT mark success.
+        println!("demo reset: position close failed: {e}");
+        return Err(anyhow::anyhow!(
+            "demo reset could not close residual position for {}: {e}",
+            cfg.bitget_symbol
+        ));
     }
     Ok(())
 }
@@ -234,23 +322,10 @@ async fn close_existing_demo_position_if_any(
         .cloned()
         .unwrap_or_default();
     for row in rows {
-        if row.get("symbol").and_then(serde_json::Value::as_str) != Some(&cfg.bitget_symbol) {
-            continue;
-        }
-        let size = row
-            .get("available")
-            .or_else(|| row.get("total"))
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("0")
-            .parse::<f64>()
-            .unwrap_or(0.0);
-        if size <= 0.0 {
-            continue;
-        }
-        let hold_side = row
-            .get("holdSide")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("");
+        let (size, hold_side) = match position_row_closeable(&row, &cfg.bitget_symbol) {
+            Some(v) => v,
+            None => continue,
+        };
         let side = if hold_side == "long" { "sell" } else { "buy" };
         let request = PlaceOrderRequest {
             symbol: cfg.bitget_symbol.clone(),
@@ -267,8 +342,51 @@ async fn close_existing_demo_position_if_any(
         };
         rest.post_json("/api/v2/mix/order/place-order", &request)
             .await?;
+        // Confirm the close landed: bounded-poll the position row down to dust.
+        // If the exchange still reports the size (locked state wouldn't release,
+        // or the close was rejected silently), surface a diagnostic error rather
+        // than leave the position for the next intent to trip over.
+        confirm_position_closed(cfg, rest).await?;
     }
     Ok(())
+}
+
+/// Bounded-poll the all-position endpoint until the configured symbol's
+/// closeable size is dust, or the deadline passes. Returns Err with a
+/// diagnostic if a residual position remains.
+async fn confirm_position_closed(cfg: &ExecutorConfig, rest: &BitgetRestClient) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let positions = rest
+            .get(
+                "/api/v2/mix/position/all-position",
+                &[
+                    ("productType", cfg.product_type.clone()),
+                    ("marginCoin", cfg.margin_coin.clone()),
+                ],
+            )
+            .await?;
+        let remaining: f64 = positions
+            .get("data")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|rows| {
+                rows.iter()
+                    .find_map(|r| position_row_closeable(r, &cfg.bitget_symbol))
+                    .map(|(size, _)| size)
+            })
+            .unwrap_or(0.0);
+        if remaining <= DUST_BASE {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(anyhow::anyhow!(
+                "residual {} position still open (size {}) after market close; exchange may be locking the size",
+                cfg.bitget_symbol,
+                remaining
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
 }
 
 /// manual_override open gate: true only when the symbol is marked "active".
@@ -1278,5 +1396,25 @@ mod tests {
         assert!(cache.latest_fresh(4_000, 3).is_none());
         // age 999ms (now 1000 - ts 1) is under it -> fresh -> Some.
         assert!(cache.latest_fresh(1_000, 3).is_some());
+    }
+
+    #[test]
+    fn closeable_size_prefers_total_over_available() {
+        // The bug: a demo position can report total=0.01, available=0 (size
+        // locked by an open delegate / reduce-only fence). Reading available
+        // first made the reset skip the close, leaving a stale position that
+        // broke later integration runs. Total is the real open size; available
+        // is only a fallback when total is missing.
+        // locked: total>0, available=0 -> must still close total.
+        assert_eq!(closeable_size(0.01, 0.0), 0.01);
+        // normal: both report the same positive size.
+        assert_eq!(closeable_size(0.01, 0.01), 0.01);
+        // total missing (0) but available present: fall back to available.
+        assert_eq!(closeable_size(0.0, 0.01), 0.01);
+        // nothing to close.
+        assert_eq!(closeable_size(0.0, 0.0), 0.0);
+        // partial lock: total=0.02, available=0.005 -> close the full total
+        // (market reduce-only close releases the locked portion too).
+        assert_eq!(closeable_size(0.02, 0.005), 0.02);
     }
 }
