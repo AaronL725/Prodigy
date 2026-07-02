@@ -200,6 +200,53 @@ pub enum OrderMode {
     Taker,
 }
 
+/// Map (action, side) to the exchange order side. Pure so the order-builder and
+/// any test can reuse it without duplicating the action→side table.
+pub fn order_side(action: &str, side: &str) -> &'static str {
+    match (action, side) {
+        ("open", "long") | ("close", "short") => "buy",
+        ("open", "short") | ("close", "long") => "sell",
+        _ => "sell",
+    }
+}
+
+/// Reference price for notional→base conversion. Maker prices its own (passive)
+/// side; taker crosses to the opposite side. Must match the limit price logic in
+/// build_order_request so size math uses the same price the order is built on.
+pub fn reference_price(mode: OrderMode, side: &str, market: &MarketUpdate) -> f64 {
+    match (mode, side) {
+        // Maker rests buy at its own bid; taker crosses a sell onto the bid.
+        (OrderMode::Maker, "buy") | (OrderMode::Taker, "sell") => market.best_bid,
+        // Everything else prices off the ask.
+        _ => market.best_ask,
+    }
+}
+
+/// Remaining base to place after deducting what's already been filled across
+/// earlier attempts. Clamped at 0 so an over-reported fill (rounding / opposite-
+/// side price skew) can't drive a negative size on the next order.
+pub fn remaining_base(target_base: f64, cumulative_filled_base: f64) -> f64 {
+    (target_base - cumulative_filled_base).max(0.0)
+}
+
+// ponytail: 0.01 ETH is Bitget's min order qty for ETHUSDT (same value the demo
+// test/config assume). DUST_BASE is a numerical epsilon for "effectively zero".
+const MIN_ORDER_BASE: f64 = 0.01;
+const DUST_BASE: f64 = 1e-6;
+
+/// True once the remaining base is dust we shouldn't (or can't) place: either
+/// numerically ~0, or below Bitget's min order qty. The first placement (no fill
+/// yet) never counts as dust — the loop honours the full target even when it is
+/// itself sub-min, preserving prior behaviour and leaving a too-small intent to
+/// reconcile. Early-termination only fires once something has already filled and
+/// only what's left is dust.
+pub fn remaining_is_dust(target_base: f64, cumulative_filled_base: f64) -> bool {
+    cumulative_filled_base > 0.0 && {
+        let remaining = remaining_base(target_base, cumulative_filled_base);
+        remaining <= DUST_BASE || remaining < MIN_ORDER_BASE
+    }
+}
+
 pub fn build_order_request(
     cfg: &ExecutorConfig,
     intent: &TradeIntent,
@@ -208,24 +255,13 @@ pub fn build_order_request(
     mode: OrderMode,
     attempt: u32,
 ) -> PlaceOrderRequest {
-    let side = match (intent.action.as_str(), intent.side.as_str()) {
-        ("open", "long") => "buy",
-        ("open", "short") => "sell",
-        ("close", "long") => "sell",
-        ("close", "short") => "buy",
-        _ => "sell",
-    };
+    let side = order_side(&intent.action, &intent.side);
     let price = match mode {
         OrderMode::Maker if side == "buy" => Some(format_price(market.best_bid)),
         OrderMode::Maker => Some(format_price(market.best_ask)),
         OrderMode::Taker => None,
     };
-    let reference_price = match (mode, side) {
-        (OrderMode::Maker, "buy") => market.best_bid,
-        (OrderMode::Maker, _) => market.best_ask,
-        (OrderMode::Taker, "buy") => market.best_ask,
-        (OrderMode::Taker, _) => market.best_bid,
-    };
+    let reference_price = reference_price(mode, side, market);
     let size = format_size(approved_notional / reference_price);
     // ponytail: append now_ms so re-running the same intent doesn't collide on
     // Bitget's client_oid uniqueness window (code 40786); matches the demo test
@@ -309,25 +345,29 @@ fn read_detail_fields(data: &serde_json::Value) -> (String, f64) {
     (status, filled)
 }
 
-/// Poll one order by client_oid and classify it.
+/// Poll one order by client_oid and classify it, returning the observed filled
+/// base size alongside the outcome so the loop can deduct partial fills from the
+/// next attempt (an order that retires partially filled must shrink what's left).
 // ponytail: an unknown/transient error resolves to `Live`, never `Vanished`.
 // The safety rule is "never leave a stale order"; treating a failed poll as gone
 // would risk marking a still-live order retired. The cancel-confirmation loop and
 // the hard command cap own the terminal decision, so a Live-on-error keeps the
-// caller cautious rather than optimistic.
+// caller cautious rather than optimistic. On error we report filled=0.0; a
+// transient read failure mid-fill never advances the machine (it stays Live), so
+// the next successful poll re-reads the (monotonic, terminal) baseVolume.
 async fn poll_order(
     rest: &BitgetRestClient,
     client_oid: &str,
     order_size: f64,
-) -> OrderPollOutcome {
+) -> (OrderPollOutcome, f64) {
     match rest.get_order_detail(client_oid).await {
         Ok(data) => {
             let (status, filled) = read_detail_fields(&data);
-            classify_order_poll(&status, filled, order_size)
+            (classify_order_poll(&status, filled, order_size), filled)
         }
         Err(e) => {
             println!("order poll error for {client_oid} (treating as live): {e}");
-            OrderPollOutcome::Live
+            (OrderPollOutcome::Live, 0.0)
         }
     }
 }
@@ -379,6 +419,17 @@ fn set_local_order_status(conn: &Connection, client_oid: &str, status: &str) -> 
     conn.execute(
         "update orders set status = ?, updated_at = datetime('now') where client_oid = ?",
         rusqlite::params![status, client_oid],
+    )?;
+    Ok(())
+}
+
+/// Flip a local orders row to "filled" and record the observed filled base size.
+// ponytail: the taker non-fill branches and the cancel-race fill used to leave
+// filled_size=0; reconcile owns exchange truth but the local row must not lie.
+fn set_local_order_filled(conn: &Connection, client_oid: &str, filled_size: f64) -> Result<()> {
+    conn.execute(
+        "update orders set status = 'filled', filled_size = ?, updated_at = datetime('now') where client_oid = ?",
+        rusqlite::params![filled_size, client_oid],
     )?;
     Ok(())
 }
@@ -457,6 +508,31 @@ pub async fn process_one_intent(
     let mut live_client_oid: Option<String> = None;
     let mut live_order_size: f64 = 0.0;
 
+    // Over-fill guard: the same intended base size was re-placed on every maker
+    // retry and the taker, so a partial fill that timed out and cancelled was
+    // neither recorded nor deducted — the next attempt placed the full amount
+    // again. Cumulative-filled-base tracks what has actually filled across all
+    // attempts; each new placement is sized to (target_base − cumulative) so the
+    // position can never overshoot the intended base. target_base is derived from
+    // the maker reference price (maker is the first placement mode); taker then
+    // re-derives base from that same target via the remaining notional below, so
+    // maker and taker sum to exactly target_base regardless of bid/ask spread.
+    let maker_ref = reference_price(
+        OrderMode::Maker,
+        order_side(&intent.action, &intent.side),
+        &market,
+    );
+    let target_base = if maker_ref > 0.0 {
+        approved / maker_ref
+    } else {
+        // ponytail: build_order_request would already fail loud on a bad price;
+        // guard the divide so the money path can't manufacture an inf target here.
+        return Err(anyhow::anyhow!(
+            "reference price not positive; cannot size order"
+        ));
+    };
+    let mut cumulative_filled_base: f64 = 0.0;
+
     // ponytail: hard cap on state-machine commands so the loop can never spin
     // forever (e.g. a poll that never resolves, or a cancel the exchange keeps
     // reporting live). The happy path uses far fewer than 12: place, wait, cancel
@@ -474,8 +550,27 @@ pub async fn process_one_intent(
 
         match state.next_command(&policy) {
             ExecutionCommand::PlaceMaker { attempt } => {
-                let order =
-                    build_order_request(cfg, &intent, &market, approved, OrderMode::Maker, attempt);
+                // Early-terminate: a prior attempt already filled enough that the
+                // remainder is dust. The position is at target, so mark done and
+                // let reconcile own any sub-min residual rather than place an
+                // order Bitget would reject.
+                if remaining_is_dust(target_base, cumulative_filled_base) {
+                    state.on_order_filled();
+                    continue;
+                }
+                // Size this attempt to the remaining base: convert remaining→notional
+                // with the maker reference price, then build_order_request divides by
+                // that same price, so the placed base == remaining exactly.
+                let remaining_notional =
+                    remaining_base(target_base, cumulative_filled_base) * maker_ref;
+                let order = build_order_request(
+                    cfg,
+                    &intent,
+                    &market,
+                    remaining_notional,
+                    OrderMode::Maker,
+                    attempt,
+                );
                 let response = rest
                     .post_json("/api/v2/mix/order/place-order", &order)
                     .await?;
@@ -501,7 +596,8 @@ pub async fn process_one_intent(
                     }
                     tokio::time::sleep(Duration::from_millis(500)).await;
                     match poll_order(rest, &order.client_oid, live_order_size).await {
-                        OrderPollOutcome::Filled => {
+                        (OrderPollOutcome::Filled, filled) => {
+                            cumulative_filled_base += filled;
                             upsert_order_row(
                                 conn,
                                 &intent,
@@ -509,7 +605,7 @@ pub async fn process_one_intent(
                                 &response,
                                 "filled",
                                 attempt as i64,
-                                live_order_size,
+                                filled,
                             )?;
                             state.on_order_filled();
                             live_client_oid = None;
@@ -518,11 +614,11 @@ pub async fn process_one_intent(
                         // Already gone (rare: cancelled out from under us). Treat as
                         // a timeout so the machine runs its cancel-confirm branch,
                         // which will observe it is gone and count the attempt.
-                        OrderPollOutcome::Vanished => {
+                        (OrderPollOutcome::Vanished, _) => {
                             state.on_order_timeout();
                             break;
                         }
-                        OrderPollOutcome::Live => continue,
+                        (OrderPollOutcome::Live, _) => continue,
                     }
                 }
             }
@@ -547,21 +643,27 @@ pub async fn process_one_intent(
                     println!("cancel-order returned error for {client_oid}: {e}");
                 }
 
-                // Confirm removal (poll up to a short bounded window).
+                // Confirm removal (poll up to a short bounded window). Capture the
+                // observed filled base on either terminal outcome: a cancel that
+                // landed mid-fill (partial) still filled that partial, which the
+                // next attempt must deduct — this is the over-fill root cause.
                 let confirm_deadline = Instant::now() + Duration::from_secs(5);
                 let mut confirmed = false;
                 let mut filled_instead = false;
+                let mut confirm_filled: f64 = 0.0;
                 loop {
                     match poll_order(rest, &client_oid, live_order_size).await {
-                        OrderPollOutcome::Vanished => {
+                        (OrderPollOutcome::Vanished, filled) => {
                             confirmed = true;
+                            confirm_filled = filled;
                             break;
                         }
-                        OrderPollOutcome::Filled => {
+                        (OrderPollOutcome::Filled, filled) => {
                             filled_instead = true;
+                            confirm_filled = filled;
                             break;
                         }
-                        OrderPollOutcome::Live => {
+                        (OrderPollOutcome::Live, _) => {
                             if Instant::now() >= confirm_deadline {
                                 break;
                             }
@@ -571,11 +673,16 @@ pub async fn process_one_intent(
                 }
 
                 if filled_instead {
-                    // The maker filled during the cancel race: honor the fill.
-                    set_local_order_status(conn, &client_oid, "filled")?;
+                    // The maker filled during the cancel race: honor the fill and
+                    // record its observed size (the prior code left filled_size=0).
+                    cumulative_filled_base += confirm_filled;
+                    set_local_order_filled(conn, &client_oid, confirm_filled)?;
                     state.on_order_filled();
                     live_client_oid = None;
                 } else if confirmed {
+                    // Order is gone (cancelled); record any partial fill it left so
+                    // the next attempt sizes to the remainder.
+                    cumulative_filled_base += confirm_filled;
                     set_local_order_status(conn, &client_oid, "cancelled")?;
                     state.on_order_cancelled();
                     live_client_oid = None;
@@ -591,8 +698,27 @@ pub async fn process_one_intent(
                 }
             }
             ExecutionCommand::PlaceTaker => {
-                let order =
-                    build_order_request(cfg, &intent, &market, approved, OrderMode::Taker, 1);
+                // Same early-terminate as the maker arms: if prior attempts
+                // already filled enough that the remainder is dust, stop here and
+                // mark the intent done (reconcile owns the residual).
+                if remaining_is_dust(target_base, cumulative_filled_base) {
+                    state.on_order_filled();
+                    continue;
+                }
+                // Taker sizes to the remaining base. Re-derive base from target
+                // via the maker reference price (so maker+taker sum to target_base
+                // exactly) and let build_order_request price it as a crossing
+                // market order using its own (opposite-side) reference.
+                let remaining_notional =
+                    remaining_base(target_base, cumulative_filled_base) * maker_ref;
+                let order = build_order_request(
+                    cfg,
+                    &intent,
+                    &market,
+                    remaining_notional,
+                    OrderMode::Taker,
+                    1,
+                );
                 let response = rest
                     .post_json("/api/v2/mix/order/place-order", &order)
                     .await?;
@@ -605,24 +731,30 @@ pub async fn process_one_intent(
                 loop {
                     tokio::time::sleep(Duration::from_millis(500)).await;
                     match poll_order(rest, &order.client_oid, taker_size).await {
-                        OrderPollOutcome::Filled => {
+                        (OrderPollOutcome::Filled, filled) => {
+                            cumulative_filled_base += filled;
                             upsert_order_row(
-                                conn, &intent, &order, &response, "filled", 1, taker_size,
+                                conn, &intent, &order, &response, "filled", 1, filled,
                             )?;
                             state.on_order_filled();
                             break;
                         }
-                        OrderPollOutcome::Vanished => {
-                            // A market order should not vanish unfilled; record it
-                            // and let the machine mark done (position reconcile owns
-                            // the residual).
+                        (OrderPollOutcome::Vanished, filled) => {
+                            // A market order should not vanish unfilled; reconcile
+                            // owns the residual. Record the observed fill so the
+                            // local row tells the truth (was "submitted", now "filled").
+                            cumulative_filled_base += filled;
+                            set_local_order_filled(conn, &order.client_oid, filled)?;
                             state.on_order_filled();
                             break;
                         }
-                        OrderPollOutcome::Live => {
+                        (OrderPollOutcome::Live, filled) => {
                             if Instant::now() >= deadline {
                                 // Taker didn't confirm in-window; mark done anyway —
                                 // a market order fills, and reconcile owns the truth.
+                                // Record the observed fill (was "submitted", now "filled").
+                                cumulative_filled_base += filled;
+                                set_local_order_filled(conn, &order.client_oid, filled)?;
                                 state.on_order_filled();
                                 break;
                             }
@@ -679,6 +811,46 @@ mod tests {
         assert_eq!(order.order_type, "limit");
         assert_eq!(order.price.as_deref(), Some("3000"));
         assert_eq!(order.size, "0.1");
+    }
+
+    #[test]
+    fn remaining_base_deducts_cumulative_and_clamps() {
+        // Nothing filled yet: remaining is the full target.
+        assert!((remaining_base(0.10, 0.0) - 0.10).abs() < 1e-12);
+        // A partial fill is deducted so the next attempt sizes to what's left.
+        assert!((remaining_base(0.10, 0.05) - 0.05).abs() < 1e-12);
+        // Never go negative even if reported fills slightly exceed the target
+        // (rounding / opposite-side reference price skew).
+        assert!((remaining_base(0.10, 0.12) - 0.0).abs() < 1e-12);
+        assert!((remaining_base(0.10, 0.10) - 0.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn remaining_is_dust_only_after_a_fill_and_below_min() {
+        // No fill yet: never dust, even if target itself is sub-min (first
+        // placement always honours the full target, matching prior behaviour).
+        assert!(!remaining_is_dust(0.005, 0.0));
+        // A fill that reaches the target leaves ~0 => dust => stop early.
+        assert!(remaining_is_dust(0.10, 0.10));
+        // A partial fill leaving less than the 0.01 min order qty => dust.
+        assert!(remaining_is_dust(0.10, 0.095));
+        // A partial fill leaving more than the min => not dust, keep placing.
+        assert!(!remaining_is_dust(0.10, 0.05));
+    }
+
+    #[test]
+    fn reference_price_matches_maker_and_taker_sides() {
+        let market = MarketUpdate {
+            symbol: "ETHUSDT".to_string(),
+            best_bid: 3000.0,
+            best_ask: 3000.5,
+            exchange_ts_ms: 1,
+        };
+        // Maker rests on its own side; taker crosses to the opposite side.
+        assert_eq!(reference_price(OrderMode::Maker, "buy", &market), 3000.0);
+        assert_eq!(reference_price(OrderMode::Maker, "sell", &market), 3000.5);
+        assert_eq!(reference_price(OrderMode::Taker, "buy", &market), 3000.5);
+        assert_eq!(reference_price(OrderMode::Taker, "sell", &market), 3000.0);
     }
 
     #[test]
