@@ -28,7 +28,12 @@ pub fn classify_position(
     exchange_position
 }
 
-pub async fn reconcile_once(conn: &Connection, rest: &BitgetRestClient, now: &str) -> Result<()> {
+pub async fn reconcile_once(
+    conn: &Connection,
+    rest: &BitgetRestClient,
+    now: &str,
+    detect_override: bool,
+) -> Result<()> {
     // ponytail: WS is the fast path; this REST pass repairs anything it missed.
     // Exchange state wins on conflict (spec). We INSERT missing orders/positions
     // and refresh position fields from exchange truth; we do not delete local rows
@@ -72,7 +77,8 @@ pub async fn reconcile_once(conn: &Connection, rest: &BitgetRestClient, now: &st
         }
         // An exchange order we did NOT place (no local client_oid) = manual
         // intervention. Enter per-symbol override (persisted) so auto-open pauses.
-        if !override_active {
+        // Skipped in test-reset mode (system cleanup, not user intervention).
+        if detect_override && !override_active {
             let kind = intervention_kind_for_side(&str_field(&row, "side"));
             let mut state = override_state_from(override_active);
             if let crate::manual_override::ManualOverrideDecision::Entered(sym) =
@@ -188,6 +194,32 @@ pub async fn reconcile_once(conn: &Connection, rest: &BitgetRestClient, now: &st
         record = classify_position(record, &system_intents, now);
         db::upsert_position(conn, &record)?;
         repaired_positions += 1;
+
+        // A position we can't trace to a local intent = manual intervention
+        // (e.g. operator market-opened in the Bitget client). Enter override.
+        // Skipped in test-reset mode (system cleanup, not user intervention).
+        if detect_override && record.ownership == "imported" && !override_active {
+            db::set_executor_state(conn, &override_key, "active")?;
+            override_active = true;
+            db::write_event(
+                conn,
+                "warning",
+                "executor",
+                "manual override entered (imported position)",
+                &format!("{{\"symbol\":\"{}\"}}", record.symbol),
+            )?;
+            notify::send_telegram(
+                None,
+                None,
+                "manual_override_entered",
+                &format!(
+                    "manual override entered for {} (imported position)",
+                    record.symbol
+                ),
+            )
+            .await
+            .ok();
+        }
     }
 
     // Auto-clear the per-symbol override once the exchange has no position and no

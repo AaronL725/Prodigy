@@ -46,7 +46,9 @@ pub async fn run_once_or_loop(cfg: ExecutorConfig) -> Result<()> {
 
     verify_public_ws_connects(&cfg).await?;
     verify_private_ws_connects(&cfg).await?;
-    reconcile_once(&conn, &rest, "now").await?;
+    // Skip override detection in test-reset mode: the reset is system cleanup,
+    // not user manual intervention. Normal strategy runs detect it.
+    reconcile_once(&conn, &rest, "now", !cfg.test_reset_demo_state).await?;
 
     let intents = db::pending_intents(&conn)?;
     // ponytail: seed the cache once with a real ticker (not the WS stream yet);
