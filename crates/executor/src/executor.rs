@@ -441,8 +441,21 @@ fn format_price(value: f64) -> String {
         .to_string()
 }
 
+/// Round a base size DOWN to Bitget's lot step (sizeMultiplier 0.01 for ETHUSDT).
+// ponytail: Bitget rejects non-multiples of sizeMultiplier with code 45111; rounding
+// down keeps us at-or-below the approved notional (never over-fills). Generalize to a
+// sizeMultiplier config field if a non-0.01 symbol is traded.
+fn round_down_to_step(value: f64, step: f64) -> f64 {
+    if step <= 0.0 {
+        return value;
+    }
+    (value / step).floor() * step
+}
+
 fn format_size(value: f64) -> String {
-    format!("{value:.4}")
+    // ponytail: round to the lot step before formatting so Bitget accepts the size.
+    let rounded = round_down_to_step(value, MIN_ORDER_BASE);
+    format!("{rounded:.4}")
         .trim_end_matches('0')
         .trim_end_matches('.')
         .to_string()
@@ -571,9 +584,32 @@ pub async fn process_one_intent(
                     OrderMode::Maker,
                     attempt,
                 );
-                let response = rest
+                let response = match rest
                     .post_json("/api/v2/mix/order/place-order", &order)
-                    .await?;
+                    .await
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        // ponytail: a rejected placement (e.g. size below exchange min,
+                        // price-band) must fail the intent durably, not crash the executor.
+                        // Record the order row with the error so reconcile/audit see it.
+                        let _ = upsert_order_row(
+                            conn,
+                            &intent,
+                            &order,
+                            &serde_json::Value::Null,
+                            "rejected",
+                            attempt as i64,
+                            0.0,
+                        );
+                        db::fail_intent(
+                            conn,
+                            &intent.intent_id,
+                            &format!("place-order rejected: {e}"),
+                        )?;
+                        return Ok(());
+                    }
+                };
                 upsert_order_row(
                     conn,
                     &intent,
@@ -719,9 +755,29 @@ pub async fn process_one_intent(
                     OrderMode::Taker,
                     1,
                 );
-                let response = rest
+                let response = match rest
                     .post_json("/api/v2/mix/order/place-order", &order)
-                    .await?;
+                    .await
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let _ = upsert_order_row(
+                            conn,
+                            &intent,
+                            &order,
+                            &serde_json::Value::Null,
+                            "rejected",
+                            1,
+                            0.0,
+                        );
+                        db::fail_intent(
+                            conn,
+                            &intent.intent_id,
+                            &format!("taker place-order rejected: {e}"),
+                        )?;
+                        return Ok(());
+                    }
+                };
                 upsert_order_row(conn, &intent, &order, &response, "submitted", 1, 0.0)?;
                 let taker_size: f64 = order.size.parse().unwrap_or(0.0);
                 state.on_taker_sent();
@@ -851,6 +907,18 @@ mod tests {
         assert_eq!(reference_price(OrderMode::Maker, "sell", &market), 3000.5);
         assert_eq!(reference_price(OrderMode::Taker, "buy", &market), 3000.5);
         assert_eq!(reference_price(OrderMode::Taker, "sell", &market), 3000.0);
+    }
+
+    #[test]
+    fn format_size_rounds_down_to_lot_step() {
+        // Bitget rejects non-multiples of sizeMultiplier (0.01) with 45111; size must
+        // be a lot multiple. Round DOWN so we never exceed the approved notional.
+        // 20 USDT / 1643 ≈ 0.01217 → floor to 0.01.
+        assert_eq!(format_size(0.01217), "0.01");
+        // exact multiple is unchanged
+        assert_eq!(format_size(0.05), "0.05");
+        // a value just under a step floors to the step below, never rounds up
+        assert_eq!(format_size(0.0199), "0.01");
     }
 
     #[test]

@@ -139,20 +139,48 @@ impl BitgetRestClient {
     }
 
     pub async fn cancel_all_orders(&self) -> Result<Value> {
-        #[derive(Serialize)]
-        #[serde(rename_all = "camelCase")]
-        struct CancelAll<'a> {
-            product_type: &'a str,
-            margin_coin: &'a str,
+        // ponytail: Bitget v2 mix has no working "cancel all by productType" endpoint
+        // (cancel-all-order 404s). Query pending orders, then cancel each by clientOid
+        // through the single-cancel endpoint (verified working in the demo tests).
+        // Best-effort per order: a 404 on an already-gone order must not abort the rest.
+        let pending = self
+            .get(
+                "/api/v2/mix/order/orders-pending",
+                &[
+                    ("productType", self.cfg.product_type.clone()),
+                    ("marginCoin", self.cfg.margin_coin.clone()),
+                ],
+            )
+            .await?;
+        let rows = pending
+            .get("data")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let mut cancelled = 0u32;
+        for row in rows {
+            if row.get("symbol").and_then(Value::as_str) != Some(self.cfg.bitget_symbol.as_str()) {
+                continue;
+            }
+            let client_oid = row
+                .get("clientOid")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            if client_oid.is_empty() {
+                continue;
+            }
+            let req = CancelOrderRequest {
+                symbol: self.cfg.bitget_symbol.clone(),
+                product_type: self.cfg.product_type.clone(),
+                margin_coin: self.cfg.margin_coin.clone(),
+                client_oid: client_oid.clone(),
+            };
+            if self.cancel_order(&req).await.is_ok() {
+                cancelled += 1;
+            }
         }
-        self.post_json(
-            "/api/v2/mix/order/cancel-all-order",
-            &CancelAll {
-                product_type: &self.cfg.product_type,
-                margin_coin: &self.cfg.margin_coin,
-            },
-        )
-        .await
+        Ok(serde_json::json!({ "cancelled": cancelled }))
     }
 
     pub async fn get_account_snapshot(&self) -> Result<Value> {
