@@ -175,7 +175,8 @@ pub fn local_system_intent_ids(conn: &Connection) -> Result<std::collections::Ha
 /// from an imported/manual one. This is more reliable than source_intent_id on
 /// the position row because exchange all-position doesn't carry our intent_id.
 pub fn local_order_intent_ids(conn: &Connection) -> Result<std::collections::HashSet<String>> {
-    let mut stmt = conn.prepare("select distinct intent_id from orders where intent_id is not null")?;
+    let mut stmt =
+        conn.prepare("select distinct intent_id from orders where intent_id is not null")?;
     let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
     let mut set = std::collections::HashSet::new();
     for row in rows {
