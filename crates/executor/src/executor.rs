@@ -69,22 +69,25 @@ pub async fn run_once_or_loop(cfg: ExecutorConfig) -> Result<()> {
     .await?;
 
     let intents = db::pending_intents(&conn)?;
-    // ponytail: seed the cache once with a real ticker (not the WS stream yet);
-    // latest_fresh per intent rejects openings when the cached price is older
-    // than cfg.stale_market_data_secs. Account stays hardcoded until Task 13
-    // (live equity wiring) — but the REST fetch below proves the signed GET
-    // /api/v2/mix/account/account path that snapshot will reuse.
+    // ponytail: seed the market cache once with a real ticker (not the WS stream
+    // yet); latest_fresh per intent rejects openings when the cached price is
+    // older than cfg.stale_market_data_secs.
     let mut market_cache = MarketCache::default();
     market_cache.update(fetch_initial_market_snapshot(&cfg, &rest).await?);
-    let account = fetch_account_snapshot(&rest).await?;
-    db::insert_equity_snapshot(
-        &conn,
-        account.equity,
-        account.available_margin,
-        account.unrealized_pnl_24h,
-        0.0,
-    )?;
     for intent in intents {
+        // Fetch a FRESH account snapshot per intent. A run can carry multiple
+        // opening intents; if the first fills, its gross notional/equity have
+        // moved by the time the second is risk-checked. Sharing one snapshot
+        // across the loop would let a later intent pass the cap on stale equity
+        // or double-count the headroom the first fill already consumed.
+        let account = fetch_account_snapshot(&rest).await?;
+        db::insert_equity_snapshot(
+            &conn,
+            account.equity,
+            account.available_margin,
+            account.unrealized_pnl_24h,
+            0.0,
+        )?;
         let now_ms = crate::bitget::now_ms().parse::<i64>().unwrap_or(0);
         let market = market_cache
             .latest_fresh(now_ms, cfg.stale_market_data_secs)
