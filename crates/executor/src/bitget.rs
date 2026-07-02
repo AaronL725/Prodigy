@@ -91,6 +91,23 @@ impl BitgetRestClient {
         })
     }
 
+    /// Read-only accessors for the configured symbol/product (reconcile + reset use them).
+    pub fn product_type(&self) -> &str {
+        &self.cfg.product_type
+    }
+
+    pub fn margin_coin(&self) -> &str {
+        &self.cfg.margin_coin
+    }
+
+    pub fn display_symbol(&self) -> &str {
+        &self.cfg.symbol
+    }
+
+    pub fn bitget_symbol(&self) -> &str {
+        &self.cfg.bitget_symbol
+    }
+
     pub async fn get(&self, path: &str, query: &[(&str, String)]) -> Result<Value> {
         let query_string = if query.is_empty() {
             String::new()

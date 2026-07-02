@@ -1,7 +1,7 @@
 use anyhow::Result;
 use rusqlite::{params, Connection};
 
-use crate::types::{OrderRecord, TradeIntent};
+use crate::types::{OrderRecord, PositionRecord, TradeIntent};
 
 pub fn pending_intents(conn: &Connection) -> Result<Vec<TradeIntent>> {
     let mut stmt = conn.prepare(
@@ -107,6 +107,67 @@ pub fn reject_intent(conn: &Connection, intent_id: &str, reason: &str) -> Result
         params![reason, intent_id],
     )?;
     Ok(())
+}
+
+/// Upsert a position row by symbol (PK). Reconciliation writes exchange-truth
+/// positions here; system-owned keeps its source_intent_id, imported gets the
+/// adoption timestamp set by classify_position before this call.
+pub fn upsert_position(conn: &Connection, position: &PositionRecord) -> Result<()> {
+    conn.execute(
+        "insert into positions (
+           symbol, side, notional, entry_price, unrealized_pnl, updated_at,
+           ownership, opened_at, adopted_at, source_intent_id, raw_json
+         ) values (?, ?, ?, ?, ?, datetime('now'), ?, ?, ?, ?, ?)
+         on conflict(symbol) do update set
+           side = excluded.side,
+           notional = excluded.notional,
+           entry_price = excluded.entry_price,
+           unrealized_pnl = excluded.unrealized_pnl,
+           updated_at = datetime('now'),
+           ownership = excluded.ownership,
+           opened_at = excluded.opened_at,
+           adopted_at = excluded.adopted_at,
+           source_intent_id = excluded.source_intent_id,
+           raw_json = excluded.raw_json",
+        params![
+            position.symbol,
+            position.side,
+            position.notional,
+            position.entry_price,
+            position.unrealized_pnl,
+            position.ownership,
+            position.opened_at,
+            position.adopted_at,
+            position.source_intent_id,
+            position.raw_json,
+        ],
+    )?;
+    Ok(())
+}
+
+/// client_oids of orders we already have locally (used to detect exchange orders
+/// we're missing → repair). Reconciliation inserts the missing ones.
+pub fn local_order_client_oids(conn: &Connection) -> Result<std::collections::HashSet<String>> {
+    let mut stmt = conn.prepare("select client_oid from orders")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    let mut set = std::collections::HashSet::new();
+    for row in rows {
+        set.insert(row?);
+    }
+    Ok(set)
+}
+
+/// source_intent_ids of system-owned positions (used by classify_position to tell
+/// a system position from an imported one).
+pub fn local_system_intent_ids(conn: &Connection) -> Result<std::collections::HashSet<String>> {
+    let mut stmt =
+        conn.prepare("select source_intent_id from positions where source_intent_id is not null")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    let mut set = std::collections::HashSet::new();
+    for row in rows {
+        set.insert(row?);
+    }
+    Ok(set)
 }
 
 pub fn write_event(
@@ -238,5 +299,41 @@ mod tests {
             get_executor_state(&conn, "manual_override:ETH/USDT:USDT").unwrap(),
             Some("cleared".to_string())
         );
+    }
+
+    #[test]
+    fn upsert_position_reconciles_exchange_truth() {
+        // ponytail: reconciliation repairs a missing local position by upserting
+        // exchange truth (ownership imported, adoption timestamp set by classifier).
+        use crate::types::PositionRecord;
+        let conn = memory_db();
+        let imported = PositionRecord {
+            symbol: "ETH/USDT:USDT".to_string(),
+            side: "long".to_string(),
+            notional: 1000.0,
+            entry_price: 3000.0,
+            unrealized_pnl: 12.0,
+            ownership: "imported".to_string(),
+            opened_at: Some("2026-07-01T00:00:00Z".to_string()),
+            adopted_at: Some("2026-07-01T00:00:00Z".to_string()),
+            source_intent_id: None,
+            raw_json: "{}".to_string(),
+        };
+        upsert_position(&conn, &imported).unwrap();
+        // re-reconcile with updated exchange fields → upsert overwrites mutable cols
+        let updated = PositionRecord {
+            unrealized_pnl: 50.0,
+            ..imported
+        };
+        upsert_position(&conn, &updated).unwrap();
+        let row = conn
+            .query_row(
+                "select unrealized_pnl, ownership from positions where symbol='ETH/USDT:USDT'",
+                [],
+                |r| Ok((r.get::<_, f64>(0)?, r.get::<_, String>(1)?)),
+            )
+            .unwrap();
+        assert_eq!(row.0, 50.0);
+        assert_eq!(row.1, "imported");
     }
 }
