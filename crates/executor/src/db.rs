@@ -157,19 +157,6 @@ pub fn local_order_client_oids(conn: &Connection) -> Result<std::collections::Ha
     Ok(set)
 }
 
-/// source_intent_ids of system-owned positions (used by classify_position to tell
-/// a system position from an imported one).
-pub fn local_system_intent_ids(conn: &Connection) -> Result<std::collections::HashSet<String>> {
-    let mut stmt =
-        conn.prepare("select source_intent_id from positions where source_intent_id is not null")?;
-    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-    let mut set = std::collections::HashSet::new();
-    for row in rows {
-        set.insert(row?);
-    }
-    Ok(set)
-}
-
 /// intent_ids of orders the executor has placed (filled or submitted). Used by
 /// reconcile to tell a system position (we have a local order for this symbol)
 /// from an imported/manual one. This is more reliable than source_intent_id on

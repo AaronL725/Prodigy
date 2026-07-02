@@ -32,6 +32,34 @@ pub fn classify_position(
     exchange_position
 }
 
+/// Classify a single exchange position as system vs imported, tracing ownership
+/// from the LOCAL ORDERS TABLE (not the positions row). The exchange all-position
+/// response never carries our source_intent_id, so on the first reconcile that
+/// sees a freshly-opened position the positions row has no source_intent_id yet
+/// — a position-source-based classify would mark our own position imported and
+/// spuriously enter manual override. The orders trace (an unclosed system open
+/// cycle) is the reliable signal: if found, the position is system-owned and its
+/// source_intent_id is backfilled from that order. Otherwise imported/manual.
+fn classify_exchange_position(
+    conn: &rusqlite::Connection,
+    mut exchange_position: PositionRecord,
+    now: &str,
+) -> Result<PositionRecord> {
+    let traced = system_ownership_intent(conn, &exchange_position.symbol)?;
+    match traced {
+        Some(intent_id) => {
+            exchange_position.source_intent_id = Some(intent_id);
+            exchange_position.ownership = "system".to_string();
+        }
+        None => {
+            exchange_position.ownership = "imported".to_string();
+            exchange_position.adopted_at = Some(now.to_string());
+            exchange_position.opened_at = Some(now.to_string());
+        }
+    }
+    Ok(exchange_position)
+}
+
 /// Determine whether an exchange position for this symbol is system-owned.
 /// Checks if the executor has any OPENING orders (filled or submitted) for this
 /// symbol that don't have a matching CLOSED order — i.e. an open exposure cycle
@@ -98,7 +126,6 @@ pub async fn reconcile_once(
     // the exchange no longer lists (a filled/cancelled order's terminal state is
     // already persisted by the execution loop).
     let local_oids = db::local_order_client_oids(conn)?;
-    let system_intents = db::local_system_intent_ids(conn)?;
     let mut repaired_orders = 0u32;
     let mut repaired_positions = 0u32;
     let symbol = rest.display_symbol().to_string();
@@ -237,10 +264,10 @@ pub async fn reconcile_once(
             .and_then(serde_json::Value::as_str)
             .and_then(|v| v.parse::<f64>().ok())
             .unwrap_or(0.0);
-        // Check if this symbol has system orders → trace ownership to avoid
-        // misclassifying our own position as imported/manual.
-        let source_intent = system_ownership_intent(conn, &symbol.clone())?;
-        let mut record = PositionRecord {
+        // Trace ownership from the LOCAL ORDERS TABLE (a position-source-based
+        // classify misjudges a freshly-opened position that has no
+        // source_intent_id on the positions row yet as imported).
+        let record = PositionRecord {
             symbol,
             side: str_field(&row, "holdSide"),
             notional: size.abs() * entry,
@@ -249,10 +276,10 @@ pub async fn reconcile_once(
             ownership: "system".to_string(),
             opened_at: None,
             adopted_at: None,
-            source_intent_id: source_intent.clone(),
+            source_intent_id: None,
             raw_json: row.to_string(),
         };
-        record = classify_position(record, &system_intents, now);
+        let record = classify_exchange_position(conn, record, now)?;
         db::upsert_position(conn, &record)?;
         repaired_positions += 1;
 
@@ -409,6 +436,65 @@ mod tests {
 
         assert_eq!(adopted.ownership, "imported");
         assert_eq!(adopted.adopted_at.as_deref(), Some("2026-07-01T00:00:00Z"));
+    }
+
+    #[test]
+    fn exchange_position_traced_from_local_order_is_system_without_position_row() {
+        // The bug this guards: reconcile used to build the classify set from
+        // positions.source_intent_id. But the exchange all-position response
+        // never carries our intent_id, and on the FIRST reconcile that sees a
+        // freshly-opened position the positions row has NO source_intent_id yet.
+        // Ownership must be traced from the orders table (a filled/submitted
+        // open order whose intent is unmatched by a close) — so a position with
+        // no source_intent_id on the positions row still classifies as system.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(include_str!("../../../schema/001_initial.sql"))
+            .unwrap();
+        conn.execute_batch(include_str!("../../../schema/002_execution.sql"))
+            .unwrap();
+        // Local open order already filled for intent-7; no close order, so there
+        // is an unclosed system opening cycle for this symbol.
+        conn.execute(
+            "insert into trade_intents (
+               intent_id, created_at, symbol, side, action, target_notional,
+               max_order_notional, status, source
+             ) values ('intent-7', '2026-07-01T00:00:00Z', 'ETH/USDT:USDT',
+               'long', 'open', 100, 100, 'executed', 'test')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "insert into orders (
+               order_id, client_oid, intent_id, symbol, side, action, order_type,
+               status, price, size, filled_size, created_at, updated_at
+             ) values ('oid-7', 'client-7', 'intent-7', 'ETH/USDT:USDT', 'buy',
+               'open', 'limit', 'filled', 3000, 0.01, 0.01,
+               '2026-07-01T00:00:00Z', '2026-07-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        // No positions row at all → local_system_intent_ids() (the buggy source)
+        // returns an EMPTY set, so a position-source-based classify would mark
+        // this imported. The orders trace must win.
+        let exchange = PositionRecord {
+            symbol: "ETH/USDT:USDT".to_string(),
+            side: "long".to_string(),
+            notional: 30.0,
+            entry_price: 3000.0,
+            unrealized_pnl: 0.0,
+            ownership: "system".to_string(),
+            opened_at: None,
+            adopted_at: None,
+            source_intent_id: None,
+            raw_json: "{}".to_string(),
+        };
+
+        let classified =
+            classify_exchange_position(&conn, exchange, "2026-07-01T00:00:00Z").unwrap();
+
+        assert_eq!(classified.ownership, "system");
+        assert_eq!(classified.source_intent_id.as_deref(), Some("intent-7"));
+        assert_eq!(classified.adopted_at, None);
     }
 
     #[test]
