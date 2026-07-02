@@ -258,6 +258,84 @@ impl BitgetRestClient {
             .await?;
         Ok(response.get("data").cloned().unwrap_or(Value::Null))
     }
+
+    /// Fetch the demo order book depth (best bid/ask + sizes) for the configured
+    /// symbol via GET /api/v2/mix/market/merge-depth. The signed `get` carries the
+    /// `paptrading: 1` header, so this returns the DEMO book (not live) — used to
+    /// judge whether the demo book is actually tradable before an order test.
+    pub async fn merge_depth(&self) -> Result<DepthSnapshot> {
+        let resp = self
+            .get(
+                "/api/v2/mix/market/merge-depth",
+                &[
+                    ("productType", self.cfg.product_type.clone()),
+                    ("symbol", self.cfg.bitget_symbol.clone()),
+                    ("limit", "5".to_string()),
+                    ("precision", "scale0".to_string()),
+                ],
+            )
+            .await?;
+        let data = resp
+            .get("data")
+            .ok_or_else(|| anyhow::anyhow!("merge-depth missing data"))?;
+        // asks/bids are arrays of [price, size] levels; best = first. ask asc, bid desc.
+        let best_level = |side: &str| -> Option<&Value> {
+            data.get(side)
+                .and_then(Value::as_array)
+                .and_then(|rows| rows.first())
+        };
+        let parse = |lvl: Option<&Value>| -> Option<(f64, f64)> {
+            let lvl = lvl?.as_array()?;
+            let price = num_or_str_f64(lvl.first()?)?;
+            let size = num_or_str_f64(lvl.get(1)?)?;
+            Some((price, size))
+        };
+        Ok(DepthSnapshot {
+            best_bid: parse(best_level("bids")),
+            best_ask: parse(best_level("asks")),
+        })
+    }
+}
+
+/// Read a depth level field that Bitget serializes as either a JSON number
+/// (merge-depth: `1977.31`) or a string (ticker/order-detail: `"1977.31"`).
+fn num_or_str_f64(v: &Value) -> Option<f64> {
+    v.as_f64()
+        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+}
+
+/// Best bid/ask (price, base size) snapshot from merge-depth. Either side is
+/// None when the book has no level at that depth.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DepthSnapshot {
+    pub best_bid: Option<(f64, f64)>,
+    pub best_ask: Option<(f64, f64)>,
+}
+
+/// Decide whether a demo book is tradable for a market order test. The demo
+/// ETHUSDT book is often phantom-liquid: it publishes a best ask/bid that sit
+/// far apart (spread many × a real market) and beyond the exchange price-limit
+/// band, so a market order is accepted then cancelled by Bitget with no fill.
+/// A spread larger than `max_spread_fraction` of the mid (default 2%), or a
+/// missing/zero-size top level, marks the book non-tradable. Pure so the test
+/// can assert the classifier and the threshold is named, not magic.
+pub fn book_tradable(depth: &DepthSnapshot, max_spread_fraction: f64) -> bool {
+    // Require a positive price AND positive size on both top levels — a level
+    // with price but zero size is phantom and won't fill.
+    let valid = |lvl: Option<(f64, f64)>| lvl.filter(|(p, s)| *p > 0.0 && *s > 0.0);
+    let bid = match valid(depth.best_bid) {
+        Some(v) => v.0,
+        None => return false,
+    };
+    let ask = match valid(depth.best_ask) {
+        Some(v) => v.0,
+        None => return false,
+    };
+    if ask <= bid {
+        return false; // crossed/inverted — treat cautiously.
+    }
+    let mid = (bid + ask) / 2.0;
+    (ask - bid) / mid <= max_spread_fraction
 }
 
 async fn parse_bitget_response(response: reqwest::Response) -> Result<Value> {
@@ -540,5 +618,37 @@ mod tests {
         assert_eq!(update.orders.len(), 1);
         assert_eq!(update.orders[0].client_oid, "client-1");
         assert_eq!(update.orders[0].status, "live");
+    }
+
+    #[test]
+    fn book_tradable_flags_wide_phantom_spread_and_missing_levels() {
+        // A real market: tight spread, both sides have size → tradable.
+        let tight = DepthSnapshot {
+            best_bid: Some((1703.97, 51.0)),
+            best_ask: Some((1703.98, 36.0)),
+        };
+        assert!(book_tradable(&tight, 0.02));
+
+        // The phantom demo book: ask 1977 / bid 1740 → ~12.5% spread, far beyond
+        // any real market → not tradable (a market order would be cancelled).
+        let phantom = DepthSnapshot {
+            best_bid: Some((1740.66, 0.04)),
+            best_ask: Some((1977.31, 1.30)),
+        };
+        assert!(!book_tradable(&phantom, 0.02));
+
+        // Missing one side → not tradable.
+        let one_sided = DepthSnapshot {
+            best_bid: Some((1703.97, 51.0)),
+            best_ask: None,
+        };
+        assert!(!book_tradable(&one_sided, 0.02));
+
+        // Top level with zero size → not tradable.
+        let zero_size = DepthSnapshot {
+            best_bid: Some((1703.97, 0.0)),
+            best_ask: Some((1703.98, 36.0)),
+        };
+        assert!(!book_tradable(&zero_size, 0.02));
     }
 }

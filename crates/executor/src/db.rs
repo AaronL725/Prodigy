@@ -178,10 +178,7 @@ pub fn local_order_intent_ids(conn: &Connection) -> Result<std::collections::Has
 /// exchange position size to detect a client manually adding, reducing, or
 /// closing a system-owned position. Returns (signed_base, side): e.g.
 /// +0.10/"long", -0.10/"short", or 0.0/"" when the system holds nothing.
-pub fn system_net_base_for_symbol(
-    conn: &Connection,
-    symbol: &str,
-) -> Result<(f64, &'static str)> {
+pub fn system_net_base_for_symbol(conn: &Connection, symbol: &str) -> Result<(f64, &'static str)> {
     let mut stmt = conn.prepare(
         "select side, filled_size from orders
          where symbol = ? and status = 'filled' and filled_size > 0",
@@ -224,7 +221,8 @@ pub fn local_fill_trade_ids(conn: &Connection) -> Result<std::collections::HashS
 pub fn local_order_id_to_client_oid(
     conn: &Connection,
 ) -> Result<std::collections::HashMap<String, String>> {
-    let mut stmt = conn.prepare("select order_id, client_oid from orders where order_id is not null")?;
+    let mut stmt =
+        conn.prepare("select order_id, client_oid from orders where order_id is not null")?;
     let rows = stmt.query_map([], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
     })?;

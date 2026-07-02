@@ -1,6 +1,6 @@
 use prodigy_executor::bitget::{
-    verify_private_ws_connects, verify_public_ws_connects, BitgetRestClient, CancelOrderRequest,
-    PlaceOrderRequest,
+    book_tradable, verify_private_ws_connects, verify_public_ws_connects, BitgetRestClient,
+    CancelOrderRequest, PlaceOrderRequest,
 };
 use prodigy_executor::config::{load_env_file, DemoSecrets, ExecutorConfig};
 use serde::Serialize;
@@ -171,8 +171,21 @@ async fn bitget_demo_can_open_and_reduce_only_close_market_order() {
     let cfg = demo_config();
     let rest = BitgetRestClient::new(cfg.clone()).unwrap();
     ensure_one_way_mode(&rest, &cfg).await;
-    let open_oid = format!("pdgy-test-open-{}", prodigy_executor::bitget::now_ms());
 
+    // Judge whether the DEMO book (paptrading:1) is actually tradable before
+    // attempting a fill. The demo ETHUSDT book is frequently phantom-liquid —
+    // its best ask/bid sit far apart and beyond the exchange price-limit band,
+    // so a market order is accepted then cancelled by Bitget with no fill. A
+    // spread wider than 2% of mid marks it non-tradable; we then verify the
+    // signed place-order path only, never treating a zero-fill as a fill.
+    let depth = rest.merge_depth().await.expect("demo merge-depth");
+    let tradable = book_tradable(&depth, 0.02);
+    eprintln!(
+        "demo depth best_bid={:?} best_ask={:?} tradable={tradable}",
+        depth.best_bid, depth.best_ask
+    );
+
+    let open_oid = format!("pdgy-test-open-{}", prodigy_executor::bitget::now_ms());
     let open = PlaceOrderRequest {
         symbol: cfg.bitget_symbol.clone(),
         product_type: cfg.product_type.clone(),
@@ -190,25 +203,31 @@ async fn bitget_demo_can_open_and_reduce_only_close_market_order() {
         .post_json("/api/v2/mix/order/place-order", &open)
         .await
         .unwrap();
-    // The order was accepted by Bitget — this proves the signed place-order path,
-    // the demo PAPTRADING header, and one-way mode all work end to end.
+    // The order was accepted by Bitget — proves the signed place-order path, the
+    // demo PAPTRADING header, and one-way mode all work end to end.
     assert_eq!(opened.get("code").and_then(|v| v.as_str()), Some("00000"));
 
-    // ponytail: the Bitget demo ETHUSDT book is frequently phantom-liquid — its
-    // only quotes sit beyond the exchange price-limit band, so a market open is
-    // accepted then cancelled by Bitget with no fill and no position registers.
-    // The open->close fill path can only be exercised when the book has real,
-    // in-band liquidity; when it doesn't, the signed place-order acceptance
-    // above is the verifiable part. Log clearly so a no-fill run isn't silent.
     let position_size = wait_for_position(&rest, &cfg).await;
-    if position_size <= 0.0 {
+    if !tradable {
+        // Phantom/illiquid book: the market open is accepted then cancelled by
+        // Bitget with no fill. A real fill can't be asserted here; record the
+        // diagnostic and confirm we did NOT register a phantom position.
         eprintln!(
-            "demo book did not fill the market open (phantom/illiquid); \
-             verified place-order acceptance only"
+            "demo book non-tradable (spread too wide); verified place-order \
+             acceptance only, no fill asserted"
+        );
+        assert!(
+            position_size <= 0.0,
+            "non-tradable book unexpectedly registered a position"
         );
         return;
     }
 
+    // Tradable book: exercise the real open -> reduceOnly close happy path.
+    assert!(
+        position_size > 0.0,
+        "tradable demo book but market open did not register a position"
+    );
     let close_oid = format!("pdgy-test-close-{}", prodigy_executor::bitget::now_ms());
     let close = PlaceOrderRequest {
         symbol: cfg.bitget_symbol.clone(),

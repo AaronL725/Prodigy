@@ -418,8 +418,7 @@ pub async fn reconcile_once(
         // size against the local net and enter override on any drift. Skipped in
         // test-reset mode.
         if detect_override && record.ownership == "system" && !override_active {
-            let (sys_base, sys_side) =
-                db::system_net_base_for_symbol(conn, &record.symbol)?;
+            let (sys_base, sys_side) = db::system_net_base_for_symbol(conn, &record.symbol)?;
             let exchange_signed = if record.side == "short" { -size } else { size };
             if let Some(kind) =
                 classify_position_drift(sys_base, exchange_signed, sys_side, &record.side)
@@ -477,11 +476,9 @@ pub async fn reconcile_once(
         .cloned()
         .unwrap_or_default()
     {
-        if let Some(fill) =
-            fill_to_repair(&row, &local_order_id_set, &existing_trade_ids, |oid| {
-                local_order_ids.get(oid).cloned()
-            })
-        {
+        if let Some(fill) = fill_to_repair(&row, &local_order_id_set, &existing_trade_ids, |oid| {
+            local_order_ids.get(oid).cloned()
+        }) {
             db::insert_fill(conn, &fill)?;
             repaired_fills += 1;
         }
@@ -642,7 +639,8 @@ mod tests {
             "cTime": "1783010850639",
             "feeDetail": [{"totalFee": "-0.09"}],
         });
-        let rec = fill_to_repair(&row, &local_order_ids, &existing, client_oid_for).expect("should repair");
+        let rec = fill_to_repair(&row, &local_order_ids, &existing, client_oid_for)
+            .expect("should repair");
         assert_eq!(rec.order_id, "oid-7");
         assert_eq!(rec.client_oid.as_deref(), Some("client-7"));
         assert_eq!(rec.trade_id.as_deref(), Some("trade-new"));
