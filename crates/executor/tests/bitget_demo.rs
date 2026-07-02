@@ -6,6 +6,14 @@ use prodigy_executor::config::{load_env_file, DemoSecrets, ExecutorConfig};
 use serde::Serialize;
 use std::env;
 use std::path::Path;
+use std::sync::LazyLock;
+use tokio::sync::Mutex;
+
+// ponytail: the two mutating tests share one real demo account/symbol, and
+// set-position-mode requires no open positions. cargo runs tests concurrently
+// by default (and the acceptance cmd has no --test-threads=1), so serialize the
+// account-mutating tests through one lock to keep them order/timing independent.
+static DEMO_ACCOUNT_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 // ponytail: cargo runs the integration test from crates/executor/, but
 // .env.local lives at the workspace root. Walk up to find it rather than
@@ -111,6 +119,10 @@ async fn wait_for_position(rest: &BitgetRestClient, cfg: &ExecutorConfig) -> f64
 
 #[tokio::test]
 async fn bitget_demo_can_place_and_cancel_limit_order() {
+    // ponytail: both mutating tests share one real demo account/symbol; serialize
+    // them so concurrent set-position-mode / positions don't race under the default
+    // parallel `cargo test`. WS-only test doesn't touch account state, so it's free.
+    let _guard = DEMO_ACCOUNT_LOCK.lock().await;
     let cfg = demo_config();
     let rest = BitgetRestClient::new(cfg.clone()).unwrap();
     ensure_one_way_mode(&rest, &cfg).await;
@@ -155,6 +167,7 @@ async fn bitget_demo_can_place_and_cancel_limit_order() {
 
 #[tokio::test]
 async fn bitget_demo_can_open_and_reduce_only_close_market_order() {
+    let _guard = DEMO_ACCOUNT_LOCK.lock().await;
     let cfg = demo_config();
     let rest = BitgetRestClient::new(cfg.clone()).unwrap();
     ensure_one_way_mode(&rest, &cfg).await;
