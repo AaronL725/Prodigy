@@ -37,22 +37,35 @@ fn parse_args_and_config() -> Result<ExecutorConfig> {
     }
 
     cfg.secrets = DemoSecrets {
-        api_key: read_secret("BITGET_DEMO_API_KEY", &env_file)?,
-        api_secret: read_secret("BITGET_DEMO_API_SECRET", &env_file)?,
-        passphrase: read_secret("BITGET_DEMO_API_PASSPHRASE", &env_file)?,
+        api_key: read_secret(&["BITGET_DEMO_API_KEY"], &env_file)?,
+        // ponytail: .env.local ships two naming conventions; accept either so the
+        // demo creds load regardless of which key the operator set.
+        api_secret: read_secret(
+            &["BITGET_DEMO_API_SECRET", "BITGET_DEMO_SECRET_KEY"],
+            &env_file,
+        )?,
+        passphrase: read_secret(
+            &["BITGET_DEMO_API_PASSPHRASE", "BITGET_DEMO_PASSPHRASE"],
+            &env_file,
+        )?,
     };
-    cfg.telegram_bot_token = read_optional("TELEGRAM_BOT_TOKEN", &env_file);
-    cfg.telegram_chat_id = read_optional("TELEGRAM_CHAT_ID", &env_file);
+    cfg.telegram_bot_token = read_optional(&["TELEGRAM_BOT_TOKEN"], &env_file);
+    cfg.telegram_chat_id = read_optional(&["TELEGRAM_CHAT_ID"], &env_file);
     Ok(cfg)
 }
 
-fn read_secret(key: &str, env_file: &std::collections::HashMap<String, String>) -> Result<String> {
-    read_optional(key, env_file).ok_or_else(|| anyhow::anyhow!("missing {key}"))
+fn read_secret(
+    keys: &[&str],
+    env_file: &std::collections::HashMap<String, String>,
+) -> Result<String> {
+    read_optional(keys, env_file).ok_or_else(|| anyhow::anyhow!("missing one of {:?}", keys))
 }
 
 fn read_optional(
-    key: &str,
+    keys: &[&str],
     env_file: &std::collections::HashMap<String, String>,
 ) -> Option<String> {
-    env::var(key).ok().or_else(|| env_file.get(key).cloned())
+    keys.iter()
+        .filter_map(|k| env::var(k).ok().or_else(|| env_file.get(*k).cloned()))
+        .find(|v| !v.is_empty())
 }
