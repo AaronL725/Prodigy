@@ -206,6 +206,36 @@ pub fn system_net_base_for_symbol(
     Ok((net, side))
 }
 
+/// trade_ids of fills we already recorded (reconcile dedupes missing-fill repair
+/// against this so a fill isn't inserted twice across runs).
+pub fn local_fill_trade_ids(conn: &Connection) -> Result<std::collections::HashSet<String>> {
+    let mut stmt = conn.prepare("select trade_id from fills where trade_id is not null")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    let mut set = std::collections::HashSet::new();
+    for row in rows {
+        set.insert(row?);
+    }
+    Ok(set)
+}
+
+/// Map of exchange order_id → our client_oid for orders we placed. The exchange
+/// fillList carries orderId but not clientOid, so reconcile joins a fill to our
+/// order via this map to populate the fills.client_oid FK.
+pub fn local_order_id_to_client_oid(
+    conn: &Connection,
+) -> Result<std::collections::HashMap<String, String>> {
+    let mut stmt = conn.prepare("select order_id, client_oid from orders where order_id is not null")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut map = std::collections::HashMap::new();
+    for row in rows {
+        let (oid, cid) = row?;
+        map.insert(oid, cid);
+    }
+    Ok(map)
+}
+
 /// Insert a fill record. Idempotent by fill_id (PK) via insert-or-ignore.
 pub fn insert_fill(conn: &Connection, fill: &FillRecord) -> Result<()> {
     conn.execute(

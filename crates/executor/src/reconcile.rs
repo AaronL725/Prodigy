@@ -145,6 +145,75 @@ fn classify_position_drift(
 
 const DUST_BASE: f64 = 1e-6;
 
+/// Decide whether a single fillList row from GET /api/v2/mix/order/fills is a
+/// missing local fill worth repairing, and if so build its FillRecord. The
+/// exchange fillList carries `orderId` (the exchange order id) but NOT our
+/// `clientOid`, so we join on order_id: a fill is ours iff its orderId is a
+/// local order we placed, and it's new iff its trade_id isn't already recorded.
+/// `client_oid_for` resolves the local client_oid for that order_id (for the FK).
+/// A fill with no baseVolume is skipped (nothing to record). Pure so the dedup
+/// logic is testable without a network round-trip.
+fn fill_to_repair(
+    row: &serde_json::Value,
+    local_order_ids: &HashSet<String>,
+    existing_trade_ids: &HashSet<String>,
+    client_oid_for: impl Fn(&str) -> Option<String>,
+) -> Option<crate::types::FillRecord> {
+    use crate::types::FillRecord;
+    let order_id = str_field(row, "orderId");
+    if order_id.is_empty() || !local_order_ids.contains(&order_id) {
+        return None;
+    }
+    let trade_id = str_field(row, "tradeId");
+    if !trade_id.is_empty() && existing_trade_ids.contains(&trade_id) {
+        return None;
+    }
+    let size: f64 = row
+        .get("baseVolume")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.0);
+    if size <= 0.0 {
+        return None;
+    }
+    let price: f64 = row
+        .get("price")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.0);
+    let fee: f64 = row
+        .get("feeDetail")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|arr| arr.first())
+        .and_then(|d| d.get("totalFee"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(|v| v.parse::<f64>().ok())
+        .map(|f| f.abs())
+        .unwrap_or(0.0);
+    Some(FillRecord {
+        // fill_id keyed by trade_id so the insert-or-ignore PK dedupes across runs.
+        fill_id: if trade_id.is_empty() {
+            format!("fill-{order_id}-{}", str_field(row, "cTime"))
+        } else {
+            format!("fill-{trade_id}")
+        },
+        order_id: order_id.clone(),
+        trade_id: if trade_id.is_empty() {
+            None
+        } else {
+            Some(trade_id)
+        },
+        client_oid: client_oid_for(&order_id),
+        symbol: str_field(row, "symbol"),
+        side: str_field(row, "side"),
+        price,
+        size,
+        fee,
+        created_at: str_field(row, "cTime"),
+        raw_json: row.to_string(),
+    })
+}
+
 pub async fn reconcile_once(
     conn: &Connection,
     rest: &BitgetRestClient,
@@ -382,6 +451,42 @@ pub async fn reconcile_once(
         }
     }
 
+    // Fills: repair any exchange fill for one of our orders we haven't recorded
+    // yet (the execution loop records fills as it polls, but a crash/restart or a
+    // missed WS event can leave a fill un-persisted). Source = the exchange
+    // fillList (GET /api/v2/mix/order/fills); join on orderId (the fillList has
+    // no clientOid), dedup by trade_id, insert-or-ignore.
+    let existing_trade_ids = db::local_fill_trade_ids(conn)?;
+    let local_order_ids = db::local_order_id_to_client_oid(conn)?;
+    let local_order_id_set: HashSet<String> = local_order_ids.keys().cloned().collect();
+    let mut repaired_fills = 0u32;
+    let fills = rest
+        .get(
+            "/api/v2/mix/order/fills",
+            &[
+                ("productType", rest.product_type().to_string()),
+                ("symbol", rest.bitget_symbol().to_string()),
+                ("limit", "50".to_string()),
+            ],
+        )
+        .await?;
+    for row in fills
+        .get("data")
+        .and_then(|d| d.get("fillList"))
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+    {
+        if let Some(fill) =
+            fill_to_repair(&row, &local_order_id_set, &existing_trade_ids, |oid| {
+                local_order_ids.get(oid).cloned()
+            })
+        {
+            db::insert_fill(conn, &fill)?;
+            repaired_fills += 1;
+        }
+    }
+
     // Auto-clear the per-symbol override once the exchange has no position and no
     // open orders for it (spec: resume auto-open when pos+orders reach zero).
     if override_active {
@@ -443,7 +548,7 @@ pub async fn reconcile_once(
     }
 
     let summary = format!(
-        "{{\"repaired_orders\":{repaired_orders},\"repaired_positions\":{repaired_positions}}}"
+        "{{\"repaired_orders\":{repaired_orders},\"repaired_positions\":{repaired_positions},\"repaired_fills\":{repaired_fills}}}"
     );
     db::write_event(
         conn,
@@ -508,6 +613,66 @@ mod tests {
 
         assert_eq!(adopted.ownership, "imported");
         assert_eq!(adopted.adopted_at.as_deref(), Some("2026-07-01T00:00:00Z"));
+    }
+
+    #[test]
+    fn fill_to_repair_only_inserts_missing_fills_for_local_orders() {
+        // Reconcile repairs fills from the exchange fillList, which carries
+        // orderId but NOT clientOid. It must insert a fill only when (a) its
+        // orderId is one of OUR orders, and (b) we don't already have its
+        // trade_id; otherwise it stays deduped.
+        use std::collections::HashSet;
+        let mut local_order_ids = HashSet::new();
+        local_order_ids.insert("oid-7".to_string());
+        let mut existing = HashSet::new();
+        existing.insert("trade-already".to_string());
+        // Resolve our client_oid for a local order_id (for the fills FK).
+        let client_oid_for = |oid: &str| {
+            if oid == "oid-7" {
+                Some("client-7".to_string())
+            } else {
+                None
+            }
+        };
+
+        // A fill for our order, not yet recorded → repair it, with real price/fee.
+        let row = serde_json::json!({
+            "tradeId": "trade-new", "orderId": "oid-7",
+            "symbol": "ETHUSDT", "side": "buy", "price": "1800", "baseVolume": "0.05",
+            "cTime": "1783010850639",
+            "feeDetail": [{"totalFee": "-0.09"}],
+        });
+        let rec = fill_to_repair(&row, &local_order_ids, &existing, client_oid_for).expect("should repair");
+        assert_eq!(rec.order_id, "oid-7");
+        assert_eq!(rec.client_oid.as_deref(), Some("client-7"));
+        assert_eq!(rec.trade_id.as_deref(), Some("trade-new"));
+        assert_eq!(rec.size, 0.05);
+        assert_eq!(rec.price, 1800.0);
+        assert_eq!(rec.fee, 0.09); // abs value
+
+        // Same trade_id we already have → skip (dedup).
+        let dup = serde_json::json!({
+            "tradeId": "trade-already", "orderId": "oid-7",
+            "symbol": "ETHUSDT", "side": "buy", "price": "1800", "baseVolume": "0.05",
+            "cTime": "1",
+        });
+        assert!(fill_to_repair(&dup, &local_order_ids, &existing, client_oid_for).is_none());
+
+        // A fill for someone else's order (orderId not local) → skip.
+        let foreign = serde_json::json!({
+            "tradeId": "trade-x", "orderId": "oid-x",
+            "symbol": "ETHUSDT", "side": "buy", "price": "1800", "baseVolume": "0.05",
+            "cTime": "1",
+        });
+        assert!(fill_to_repair(&foreign, &local_order_ids, &existing, client_oid_for).is_none());
+
+        // A fill with no baseVolume → nothing to record → skip.
+        let empty = serde_json::json!({
+            "tradeId": "trade-z", "orderId": "oid-7",
+            "symbol": "ETHUSDT", "side": "buy", "price": "1800", "baseVolume": "0",
+            "cTime": "1",
+        });
+        assert!(fill_to_repair(&empty, &local_order_ids, &existing, client_oid_for).is_none());
     }
 
     #[test]
