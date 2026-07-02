@@ -434,6 +434,27 @@ pub enum OrderMode {
     Taker,
 }
 
+/// How to treat a taker (market) order that Vanished from the order-detail poll.
+/// A market order that disappears with NO fill is NOT a fill — it's an unknown
+/// terminal state (rejected, cancelled, or the poll raced) that reconcile must
+/// confirm. Only a Vanished order that left a positive fill is treated as filled.
+/// Guards against the prior bug of marking filled_size=0 orders as "filled".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TakerVanishedOutcome {
+    /// The order filled (fully or partially) before vanishing: record the fill.
+    Filled,
+    /// No fill observed: do NOT mark filled; leave it to reconcile.
+    NeedsReconcile,
+}
+
+pub fn taker_vanished_outcome(filled: f64) -> TakerVanishedOutcome {
+    if filled > 0.0 {
+        TakerVanishedOutcome::Filled
+    } else {
+        TakerVanishedOutcome::NeedsReconcile
+    }
+}
+
 /// Map (action, side) to the exchange order side. Pure so the order-builder and
 /// any test can reuse it without duplicating the action→side table.
 pub fn order_side(action: &str, side: &str) -> &'static str {
@@ -854,9 +875,12 @@ pub async fn process_one_intent(
     };
 
     // Track the client_oid of the current live order so timeout/cancel/poll all
-    // target the same placement.
+    // target the same placement. The PlaceOrderRequest is kept too so the
+    // cancel-race fill branch can reuse record_fill (real price/fee/trade_id)
+    // instead of hand-writing a side="unknown"/price=0 placeholder fill.
     let mut live_client_oid: Option<String> = None;
     let mut live_order_size: f64 = 0.0;
+    let mut live_order_request: Option<PlaceOrderRequest> = None;
 
     // Over-fill guard: the same intended base size was re-placed on every maker
     // retry and the taker, so a partial fill that timed out and cancelled was
@@ -1006,6 +1030,7 @@ pub async fn process_one_intent(
                 )?;
                 live_order_size = order.size.parse().unwrap_or(0.0);
                 live_client_oid = Some(order.client_oid.clone());
+                live_order_request = Some(order.clone());
                 state.on_order_placed(&order.client_oid);
 
                 // Poll for fill up to the maker timeout (every ~500ms).
@@ -1031,6 +1056,7 @@ pub async fn process_one_intent(
                             )?;
                             state.on_order_filled();
                             live_client_oid = None;
+                            live_order_request = None;
                             break;
                         }
                         // Already gone (rare: cancelled out from under us). Treat as
@@ -1095,36 +1121,19 @@ pub async fn process_one_intent(
                 }
 
                 if filled_instead {
-                    // The maker filled during the cancel race: honor the fill and
-                    // record its observed size (the prior code left filled_size=0).
+                    // The maker filled during the cancel race: honor the fill.
+                    // Reuse record_fill so the fill row carries the REAL price,
+                    // fee, and trade_id (queried from order detail) — the prior
+                    // code hand-wrote side="unknown"/price=0/fee=0 here.
                     cumulative_filled_base += confirm_filled;
+                    let live_order = live_order_request
+                        .clone()
+                        .ok_or_else(|| anyhow::anyhow!("cancel-race fill with no live order"))?;
+                    record_fill(conn, rest, &intent, &live_order, confirm_filled).await?;
                     set_local_order_filled(conn, &client_oid, confirm_filled)?;
-                    // Look up the real order_id for the FK.
-                    let real_oid: String = conn
-                        .query_row(
-                            "select order_id from orders where client_oid = ?",
-                            rusqlite::params![client_oid],
-                            |row| row.get(0),
-                        )
-                        .unwrap_or_else(|_| client_oid.clone());
-                    db::insert_fill(
-                        conn,
-                        &crate::types::FillRecord {
-                            fill_id: format!("fill-{client_oid}-{}", crate::bitget::now_ms()),
-                            order_id: real_oid,
-                            trade_id: None,
-                            client_oid: Some(client_oid.clone()),
-                            symbol: intent.symbol.clone(),
-                            side: "unknown".to_string(),
-                            price: 0.0,
-                            size: confirm_filled,
-                            fee: 0.0,
-                            created_at: crate::bitget::now_ms(),
-                            raw_json: "{}".to_string(),
-                        },
-                    )?;
                     state.on_order_filled();
                     live_client_oid = None;
+                    live_order_request = None;
                 } else if confirmed {
                     // Order is gone (cancelled); record any partial fill it left so
                     // the next attempt sizes to the remainder.
@@ -1132,6 +1141,7 @@ pub async fn process_one_intent(
                     set_local_order_status(conn, &client_oid, "cancelled")?;
                     state.on_order_cancelled();
                     live_client_oid = None;
+                    live_order_request = None;
                 } else {
                     // Could not confirm the order is gone — refuse to place another
                     // order on top of a possibly-live one. Fail loudly.
@@ -1246,13 +1256,32 @@ pub async fn process_one_intent(
                             break;
                         }
                         (OrderPollOutcome::Vanished, filled) => {
-                            // A market order should not vanish unfilled; reconcile
-                            // owns the residual. Record the observed fill so the
-                            // local row tells the truth (was "submitted", now "filled").
-                            cumulative_filled_base += filled;
-                            set_local_order_filled(conn, &order.client_oid, filled)?;
-                            state.on_order_filled();
-                            break;
+                            // A market order that vanishes with NO fill is not a
+                            // fill — it's an unknown terminal state reconcile must
+                            // confirm; don't claim a fill that didn't happen. Only a
+                            // Vanished order that left a positive fill is honored.
+                            match taker_vanished_outcome(filled) {
+                                TakerVanishedOutcome::Filled => {
+                                    cumulative_filled_base += filled;
+                                    record_fill(conn, rest, &intent, &order, filled).await?;
+                                    set_local_order_filled(conn, &order.client_oid, filled)?;
+                                    state.on_order_filled();
+                                    break;
+                                }
+                                TakerVanishedOutcome::NeedsReconcile => {
+                                    set_local_order_status(
+                                        conn,
+                                        &order.client_oid,
+                                        "needs_reconcile",
+                                    )?;
+                                    db::fail_intent(
+                                        conn,
+                                        &intent.intent_id,
+                                        "taker vanished with no fill; left to reconcile",
+                                    )?;
+                                    return Ok(());
+                                }
+                            }
                         }
                         (OrderPollOutcome::Live, filled) => {
                             if Instant::now() >= deadline {
@@ -1466,6 +1495,20 @@ mod tests {
         assert!(cache.latest_fresh(4_000, 3).is_none());
         // age 999ms (now 1000 - ts 1) is under it -> fresh -> Some.
         assert!(cache.latest_fresh(1_000, 3).is_some());
+    }
+
+    #[test]
+    fn taker_vanished_with_no_fill_is_needs_reconcile_not_filled() {
+        // Bug: the taker Vanished branch marked the order "filled" even when the
+        // observed fill was 0, claiming a fill that never happened. A market order
+        // that vanishes with no fill is an unknown terminal state — reconcile must
+        // confirm it; we must not call it filled.
+        assert_eq!(
+            taker_vanished_outcome(0.0),
+            TakerVanishedOutcome::NeedsReconcile
+        );
+        // A positive fill (even partial) before vanishing is a real fill.
+        assert_eq!(taker_vanished_outcome(0.01), TakerVanishedOutcome::Filled);
     }
 
     #[test]

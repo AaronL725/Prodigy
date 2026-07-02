@@ -273,7 +273,7 @@ async fn parse_bitget_response(response: reqwest::Response) -> Result<Value> {
     Ok(value)
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlaceOrderRequest {
     pub symbol: String,
