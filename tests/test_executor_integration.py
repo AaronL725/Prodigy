@@ -48,10 +48,16 @@ def test_rust_demo_executor_processes_pending_intent(tmp_path):
             "select status, error from trade_intents where intent_id = 'intent-1'"
         ).fetchone()
         order_count = conn.execute("select count(*) from orders").fetchone()[0]
+        filled_count = conn.execute(
+            "select count(*) from orders where status = 'filled'"
+        ).fetchone()[0]
         event_count = conn.execute("select count(*) from events").fetchone()[0]
 
     assert "processed intent-1" in result.stdout
-    assert intent["status"] in {"accepted", "executed"}
+    # Tightened: the state machine must drive the intent to fully executed (not
+    # just accepted), and at least one order must have filled on the demo exchange.
+    assert intent["status"] == "executed", f"expected executed, got {intent['status']}"
     assert intent["error"] is None
     assert order_count >= 1
+    assert filled_count >= 1, "expected at least one filled demo order"
     assert event_count >= 1
