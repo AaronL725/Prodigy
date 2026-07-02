@@ -12,15 +12,16 @@ Included:
 
 - Bitget demo USDT-M futures execution for `ETH/USDT:USDT`.
 - Single-process Rust executor.
-- Public WebSocket cache for best bid, best ask, ticker, and mark price.
-- Private WebSocket cache for orders, fills, positions, and account state.
+- Public WebSocket connection verification (subscribe + auth check).
+- Private WebSocket login verification (auth check).
 - REST client for place order, cancel order, query orders, query positions, query account, and query open orders.
+- REST market data snapshot (ticker) as the price source for order construction.
 - SQLite intent consumption and order/fill/position/equity/event persistence.
 - Local order state machine with idempotent intent processing.
-- REST reconciliation to repair missed WebSocket updates.
+- REST reconciliation to repair missed updates.
 - Runtime manual intervention detection for client-side opens, closes, reductions, and cancellations.
+- Mode-aware Telegram notification filtering for demo and future live runs.
 - Demo integration tests that are allowed to place, cancel, and close Bitget demo orders.
-- Mode-aware Telegram behavior for demo and future live runs.
 
 Excluded:
 
@@ -29,6 +30,8 @@ Excluded:
 - Production model publication.
 - Multi-exchange execution.
 - Redis, Kafka, FastAPI, or multiple execution services.
+- Long-running WebSocket event loop with continuous cache maintenance (deferred to M4; M3 uses REST snapshot + one-shot processing).
+- Telegram query commands (/positions, /trades, /pnl) as an interactive bot (deferred to M4; M3 has notification filtering only).
 
 ## Architecture
 
@@ -267,6 +270,6 @@ This milestone is complete when:
 - REST reconciliation repairs at least one deliberately missing local order/fill/position record.
 - Existing demo positions are adopted instead of automatically closed during normal strategy startup.
 - Runtime manual client actions put the affected symbol into manual override, pause automatic new openings for that symbol, and automatically clear only after that symbol has no position and no open orders.
-- Demo Telegram does not proactively send normal open/close messages, but can answer query commands for positions, trades, and PnL.
+- Demo Telegram does not proactively send normal open/close messages; it sends manual-override enter/clear, critical errors, and margin-danger notifications. Interactive query commands (/positions, /trades, /pnl) are deferred to M4.
 - Future live Telegram sends open/close messages and includes realized PnL on closes when available.
 - Full Python and Rust verification passes.
