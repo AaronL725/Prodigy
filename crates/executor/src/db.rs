@@ -219,4 +219,24 @@ mod tests {
             .unwrap();
         assert_eq!(status, "filled");
     }
+
+    #[test]
+    fn executor_state_upserts_and_reads_back() {
+        let conn = memory_db();
+        assert_eq!(
+            get_executor_state(&conn, "manual_override:ETH/USDT:USDT").unwrap(),
+            None
+        );
+        set_executor_state(&conn, "manual_override:ETH/USDT:USDT", "active").unwrap();
+        assert_eq!(
+            get_executor_state(&conn, "manual_override:ETH/USDT:USDT").unwrap(),
+            Some("active".to_string())
+        );
+        // upsert overwrites the same key (no duplicate PK error)
+        set_executor_state(&conn, "manual_override:ETH/USDT:USDT", "cleared").unwrap();
+        assert_eq!(
+            get_executor_state(&conn, "manual_override:ETH/USDT:USDT").unwrap(),
+            Some("cleared".to_string())
+        );
+    }
 }
