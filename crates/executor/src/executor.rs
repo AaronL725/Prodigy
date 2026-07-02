@@ -1,14 +1,16 @@
 use anyhow::Result;
 use rusqlite::Connection;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::bitget::{
-    verify_private_ws_connects, verify_public_ws_connects, BitgetRestClient, PlaceOrderRequest,
+    verify_private_ws_connects, verify_public_ws_connects, BitgetRestClient, CancelOrderRequest,
+    PlaceOrderRequest,
 };
 use crate::config::ExecutorConfig;
 use crate::db;
 use crate::reconcile::reconcile_once;
 use crate::risk::{check_intent, AccountRiskSnapshot, RiskParams};
+use crate::state::{ExecutionCommand, ExecutionPolicy, IntentExecution};
 use crate::types::{MarketUpdate, OrderRecord, TradeIntent};
 
 #[derive(Debug, Clone, Default)]
@@ -262,6 +264,125 @@ pub fn build_order_request(
     }
 }
 
+/// Outcome of polling one order's exchange status. Pure classification over the
+/// fields read from GET /api/v2/mix/order/detail so the wiring test can drive the
+/// maker/cancel/taker loop without a network round-trip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrderPollOutcome {
+    /// Fully filled (terminal): advance the execution to done.
+    Filled,
+    /// Still working on the book (live / partially filled): the timeout owns it.
+    Live,
+    /// Gone from the book (canceled / rejected): a cancel is confirmed.
+    Vanished,
+}
+
+/// Classify an order-status poll. `filled_size >= order_size` wins over the
+/// status string so a fill that the status enum hasn't caught up to still counts
+/// as done. Bitget's detail endpoint reports status under either `status` or
+/// `state` (docs are inconsistent), so the caller passes whichever it found.
+pub fn classify_order_poll(status: &str, filled_size: f64, order_size: f64) -> OrderPollOutcome {
+    if order_size > 0.0 && filled_size >= order_size {
+        return OrderPollOutcome::Filled;
+    }
+    match status {
+        "filled" | "full_fill" | "full-fill" => OrderPollOutcome::Filled,
+        "canceled" | "cancelled" | "rejected" => OrderPollOutcome::Vanished,
+        _ => OrderPollOutcome::Live,
+    }
+}
+
+/// Read (status, filled_size) out of a detail `data` object, tolerating both the
+/// `status` and `state` key spellings and the `baseVolume` fill field.
+fn read_detail_fields(data: &serde_json::Value) -> (String, f64) {
+    let status = data
+        .get("status")
+        .or_else(|| data.get("state"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let filled = data
+        .get("baseVolume")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(0.0);
+    (status, filled)
+}
+
+/// Poll one order by client_oid and classify it.
+// ponytail: an unknown/transient error resolves to `Live`, never `Vanished`.
+// The safety rule is "never leave a stale order"; treating a failed poll as gone
+// would risk marking a still-live order retired. The cancel-confirmation loop and
+// the hard command cap own the terminal decision, so a Live-on-error keeps the
+// caller cautious rather than optimistic.
+async fn poll_order(
+    rest: &BitgetRestClient,
+    client_oid: &str,
+    order_size: f64,
+) -> OrderPollOutcome {
+    match rest.get_order_detail(client_oid).await {
+        Ok(data) => {
+            let (status, filled) = read_detail_fields(&data);
+            classify_order_poll(&status, filled, order_size)
+        }
+        Err(e) => {
+            println!("order poll error for {client_oid} (treating as live): {e}");
+            OrderPollOutcome::Live
+        }
+    }
+}
+
+/// Insert/update the local orders row for a placement. Returns the exchange order id.
+#[allow(clippy::too_many_arguments)]
+fn upsert_order_row(
+    conn: &Connection,
+    intent: &TradeIntent,
+    order: &PlaceOrderRequest,
+    response: &serde_json::Value,
+    status: &str,
+    attempt: i64,
+    filled_size: f64,
+) -> Result<String> {
+    let exchange_order_id = response
+        .pointer("/data/orderId")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(&order.client_oid)
+        .to_string();
+    db::upsert_order(
+        conn,
+        &OrderRecord {
+            order_id: exchange_order_id.clone(),
+            exchange_order_id: Some(exchange_order_id.clone()),
+            client_oid: order.client_oid.clone(),
+            intent_id: Some(intent.intent_id.clone()),
+            symbol: intent.symbol.clone(),
+            side: order.side.clone(),
+            action: intent.action.clone(),
+            order_type: order.order_type.clone(),
+            status: status.to_string(),
+            price: order.price.as_ref().and_then(|v| v.parse().ok()),
+            size: order.size.parse().unwrap_or(0.0),
+            filled_size,
+            attempt,
+            raw_json: response.to_string(),
+            last_error: None,
+        },
+    )?;
+    Ok(exchange_order_id)
+}
+
+/// Update just the status of the local orders row for a client_oid.
+// ponytail: inline UPDATE here (not a db:: helper) keeps this task's diff to
+// executor.rs + bitget.rs. The orders row is created by upsert_order_row on
+// placement; here we only flip its status on cancel/late-fill.
+fn set_local_order_status(conn: &Connection, client_oid: &str, status: &str) -> Result<()> {
+    conn.execute(
+        "update orders set status = ?, updated_at = datetime('now') where client_oid = ?",
+        rusqlite::params![status, client_oid],
+    )?;
+    Ok(())
+}
+
 fn format_price(value: f64) -> String {
     format!("{value:.2}")
         .trim_end_matches('0')
@@ -318,35 +439,208 @@ pub async fn process_one_intent(
         return Ok(());
     }
 
-    let order = build_order_request(cfg, &intent, &market, approved, OrderMode::Maker, 1);
-    let response = rest
-        .post_json("/api/v2/mix/order/place-order", &order)
-        .await?;
-    let exchange_order_id = response
-        .pointer("/data/orderId")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or(&order.client_oid)
-        .to_string();
-    db::upsert_order(
-        conn,
-        &OrderRecord {
-            order_id: exchange_order_id.clone(),
-            exchange_order_id: Some(exchange_order_id),
-            client_oid: order.client_oid.clone(),
-            intent_id: Some(intent.intent_id.clone()),
-            symbol: intent.symbol.clone(),
-            side: order.side.clone(),
-            action: intent.action.clone(),
-            order_type: order.order_type.clone(),
-            status: "submitted".to_string(),
-            price: order.price.as_ref().and_then(|v| v.parse().ok()),
-            size: order.size.parse().unwrap_or(0.0),
-            filled_size: 0.0,
-            attempt: 1,
-            raw_json: response.to_string(),
-            last_error: None,
-        },
-    )?;
+    // Drive the approved intent through the state machine: maker, retry maker
+    // once, then taker. Every maker timeout cancels the live order AND confirms
+    // it is gone before the next attempt (safety: no stale orders left behind).
+    let policy = ExecutionPolicy {
+        max_maker_attempts_before_taker: 2,
+    };
+    let mut state = IntentExecution::new(&intent.intent_id, &intent.action);
+    let maker_timeout = if is_opening_action(&intent.action) {
+        Duration::from_secs(cfg.open_maker_timeout_secs)
+    } else {
+        Duration::from_secs(cfg.close_maker_timeout_secs)
+    };
+
+    // Track the client_oid of the current live order so timeout/cancel/poll all
+    // target the same placement.
+    let mut live_client_oid: Option<String> = None;
+    let mut live_order_size: f64 = 0.0;
+
+    // ponytail: hard cap on state-machine commands so the loop can never spin
+    // forever (e.g. a poll that never resolves, or a cancel the exchange keeps
+    // reporting live). The happy path uses far fewer than 12: place, wait, cancel
+    // per maker attempt (2), then a taker place + wait. On cap we fail the intent
+    // loudly rather than leave it wedged.
+    const MAX_COMMANDS: u32 = 12;
+    let mut commands_issued: u32 = 0;
+
+    loop {
+        if commands_issued >= MAX_COMMANDS {
+            db::fail_intent(conn, &intent.intent_id, "execution did not converge")?;
+            break;
+        }
+        commands_issued += 1;
+
+        match state.next_command(&policy) {
+            ExecutionCommand::PlaceMaker { attempt } => {
+                let order =
+                    build_order_request(cfg, &intent, &market, approved, OrderMode::Maker, attempt);
+                let response = rest
+                    .post_json("/api/v2/mix/order/place-order", &order)
+                    .await?;
+                upsert_order_row(
+                    conn,
+                    &intent,
+                    &order,
+                    &response,
+                    "submitted",
+                    attempt as i64,
+                    0.0,
+                )?;
+                live_order_size = order.size.parse().unwrap_or(0.0);
+                live_client_oid = Some(order.client_oid.clone());
+                state.on_order_placed(&order.client_oid);
+
+                // Poll for fill up to the maker timeout (every ~500ms).
+                let deadline = Instant::now() + maker_timeout;
+                loop {
+                    if Instant::now() >= deadline {
+                        state.on_order_timeout();
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    match poll_order(rest, &order.client_oid, live_order_size).await {
+                        OrderPollOutcome::Filled => {
+                            upsert_order_row(
+                                conn,
+                                &intent,
+                                &order,
+                                &response,
+                                "filled",
+                                attempt as i64,
+                                live_order_size,
+                            )?;
+                            state.on_order_filled();
+                            live_client_oid = None;
+                            break;
+                        }
+                        // Already gone (rare: cancelled out from under us). Treat as
+                        // a timeout so the machine runs its cancel-confirm branch,
+                        // which will observe it is gone and count the attempt.
+                        OrderPollOutcome::Vanished => {
+                            state.on_order_timeout();
+                            break;
+                        }
+                        OrderPollOutcome::Live => continue,
+                    }
+                }
+            }
+            ExecutionCommand::CancelCurrent => {
+                // Safety: cancel the live maker order AND confirm it is gone before
+                // the machine moves to the next attempt. A cancel that the exchange
+                // still reports live keeps polling until the confirm deadline; only
+                // a confirmed-gone (or terminal-fill) order advances the machine.
+                let client_oid = live_client_oid
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("cancel requested with no live order"))?;
+                let cancel = CancelOrderRequest {
+                    symbol: cfg.bitget_symbol.clone(),
+                    product_type: cfg.product_type.clone(),
+                    margin_coin: cfg.margin_coin.clone(),
+                    client_oid: client_oid.clone(),
+                };
+                // ponytail: a cancel on an order that already vanished (filled/gone)
+                // returns a Bitget error; don't abort the intent on it — the confirm
+                // poll below is the source of truth for whether the order is gone.
+                if let Err(e) = rest.cancel_order(&cancel).await {
+                    println!("cancel-order returned error for {client_oid}: {e}");
+                }
+
+                // Confirm removal (poll up to a short bounded window).
+                let confirm_deadline = Instant::now() + Duration::from_secs(5);
+                let mut confirmed = false;
+                let mut filled_instead = false;
+                loop {
+                    match poll_order(rest, &client_oid, live_order_size).await {
+                        OrderPollOutcome::Vanished => {
+                            confirmed = true;
+                            break;
+                        }
+                        OrderPollOutcome::Filled => {
+                            filled_instead = true;
+                            break;
+                        }
+                        OrderPollOutcome::Live => {
+                            if Instant::now() >= confirm_deadline {
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(500)).await;
+                        }
+                    }
+                }
+
+                if filled_instead {
+                    // The maker filled during the cancel race: honor the fill.
+                    set_local_order_status(conn, &client_oid, "filled")?;
+                    state.on_order_filled();
+                    live_client_oid = None;
+                } else if confirmed {
+                    set_local_order_status(conn, &client_oid, "cancelled")?;
+                    state.on_order_cancelled();
+                    live_client_oid = None;
+                } else {
+                    // Could not confirm the order is gone — refuse to place another
+                    // order on top of a possibly-live one. Fail loudly.
+                    db::fail_intent(
+                        conn,
+                        &intent.intent_id,
+                        "could not confirm maker cancellation; leaving to reconcile",
+                    )?;
+                    break;
+                }
+            }
+            ExecutionCommand::PlaceTaker => {
+                let order =
+                    build_order_request(cfg, &intent, &market, approved, OrderMode::Taker, 1);
+                let response = rest
+                    .post_json("/api/v2/mix/order/place-order", &order)
+                    .await?;
+                upsert_order_row(conn, &intent, &order, &response, "submitted", 1, 0.0)?;
+                let taker_size: f64 = order.size.parse().unwrap_or(0.0);
+                state.on_taker_sent();
+
+                // Poll for the market fill over a short bounded window.
+                let deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    match poll_order(rest, &order.client_oid, taker_size).await {
+                        OrderPollOutcome::Filled => {
+                            upsert_order_row(
+                                conn, &intent, &order, &response, "filled", 1, taker_size,
+                            )?;
+                            state.on_order_filled();
+                            break;
+                        }
+                        OrderPollOutcome::Vanished => {
+                            // A market order should not vanish unfilled; record it
+                            // and let the machine mark done (position reconcile owns
+                            // the residual).
+                            state.on_order_filled();
+                            break;
+                        }
+                        OrderPollOutcome::Live => {
+                            if Instant::now() >= deadline {
+                                // Taker didn't confirm in-window; mark done anyway —
+                                // a market order fills, and reconcile owns the truth.
+                                state.on_order_filled();
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            ExecutionCommand::MarkIntentExecuted => {
+                db::mark_intent_executed(conn, &intent.intent_id)?;
+                break;
+            }
+            ExecutionCommand::Wait => {
+                // has_live_order but no timeout fired inside the placement branch
+                // means nothing left to do this pass; sleep briefly and re-evaluate.
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -425,6 +719,38 @@ mod tests {
         assert_eq!(order.order_type, "market");
         assert_eq!(order.reduce_only.as_deref(), Some("YES"));
         assert!(order.price.is_none());
+    }
+
+    #[test]
+    fn classify_order_poll_detects_filled_live_and_vanished() {
+        // Explicit terminal-fill status.
+        assert_eq!(
+            classify_order_poll("filled", 0.0, 0.1),
+            OrderPollOutcome::Filled
+        );
+        // Size-complete even if the status string lags (>= order size).
+        assert_eq!(
+            classify_order_poll("partially_filled", 0.1, 0.1),
+            OrderPollOutcome::Filled
+        );
+        // Working orders (nothing / part filled) stay Live so the timeout owns them.
+        assert_eq!(
+            classify_order_poll("live", 0.0, 0.1),
+            OrderPollOutcome::Live
+        );
+        assert_eq!(
+            classify_order_poll("partially_filled", 0.05, 0.1),
+            OrderPollOutcome::Live
+        );
+        // Cancelled / rejected => the order is gone from the book (cancel confirm).
+        assert_eq!(
+            classify_order_poll("canceled", 0.0, 0.1),
+            OrderPollOutcome::Vanished
+        );
+        assert_eq!(
+            classify_order_poll("cancelled", 0.0, 0.1),
+            OrderPollOutcome::Vanished
+        );
     }
 
     #[test]

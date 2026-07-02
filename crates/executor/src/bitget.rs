@@ -166,6 +166,30 @@ impl BitgetRestClient {
         )
         .await
     }
+
+    /// Poll a single order by client_oid. Returns the `data` object from
+    /// GET /api/v2/mix/order/detail. A canceled or filled order is still
+    /// returned here (it is historical, not deleted), so this is the correct
+    /// endpoint for terminal-state polling of both fills and cancellations.
+    // ponytail: return the raw `data` Value and let the pure classifier
+    // (classify_order_poll) read status/state + baseVolume. Keeping the field
+    // extraction in the caller avoids a second status struct and reuses the
+    // one glue function the wiring test covers. Detail's status key is
+    // inconsistent across Bitget's docs (table says `status`, example shows
+    // `state`), so callers read both.
+    pub async fn get_order_detail(&self, client_oid: &str) -> Result<Value> {
+        let response = self
+            .get(
+                "/api/v2/mix/order/detail",
+                &[
+                    ("symbol", self.cfg.bitget_symbol.clone()),
+                    ("productType", self.cfg.product_type.clone()),
+                    ("clientOid", client_oid.to_string()),
+                ],
+            )
+            .await?;
+        Ok(response.get("data").cloned().unwrap_or(Value::Null))
+    }
 }
 
 async fn parse_bitget_response(response: reqwest::Response) -> Result<Value> {
