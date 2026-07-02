@@ -4,7 +4,7 @@
 
 **Goal:** Build the Bitget demo execution safety layer so the Rust executor can place, cancel, reconcile, and safely manage real Bitget demo futures orders.
 
-**Architecture:** Keep execution in one Rust process. Public/private WebSocket maintains fast in-memory market/account/order state, REST sends explicit order actions, SQLite remains the durable intent queue and audit log, and REST reconciliation repairs missed WebSocket events.
+**Architecture:** Keep execution in one Rust process. Public/private WebSocket is verified (connect + auth + subscribe) but no long-running WS cache is maintained in M3; a one-shot REST ticker seeds the market snapshot, REST sends explicit order actions and refreshes the market before the maker retry and taker fallback, SQLite remains the durable intent queue and audit log, and REST reconciliation repairs any local state the one-shot processing missed. A continuously-maintained WS cache and Telegram query commands are deferred to M4.
 
 **Tech Stack:** Rust 2021, `tokio`, `reqwest`, `tokio-tungstenite`, `serde`, `serde_json`, `hmac`, `sha2`, `base64`, `rusqlite`, Python `quantmamba` for existing research tests.
 

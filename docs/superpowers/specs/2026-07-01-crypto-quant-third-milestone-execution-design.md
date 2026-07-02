@@ -42,9 +42,9 @@ SQLite trade_intents
         |
         v
 Rust executor
-  - public WS market cache
-  - private WS account/order cache
-  - REST action client
+  - public/private WS connect + auth + subscribe verification (no live cache)
+  - REST action client (place / cancel / order-detail / account / position)
+  - REST ticker one-shot market snapshot
   - local state machine
   - risk gate
   - REST reconciler
@@ -53,18 +53,17 @@ Rust executor
 Bitget demo futures
 ```
 
-The fast path is:
+The M3 fast path is:
 
-1. Public WS keeps market data in memory.
-2. Private WS keeps account, order, fill, and position state in memory.
-3. Rust polls pending SQLite intents.
-4. Risk gate checks cached state before any order action.
-5. REST sends place/cancel requests.
-6. The local state machine immediately records the order lifecycle.
-7. WS updates fill in real-time state.
-8. REST reconciliation periodically repairs missing local data.
+1. At startup the executor verifies it can connect, authenticate, and subscribe to the public and private demo WS channels (no long-running cache is maintained — that is M4).
+2. It seeds a market snapshot from a one-shot REST ticker and writes a real account equity snapshot.
+3. Rust polls pending SQLite intents, one run through.
+4. For each intent the risk gate runs on a freshly-fetched REST account snapshot and the seeded market snapshot; market data older than `stale_market_data_secs` blocks new openings.
+5. REST sends place/cancel requests through the local state machine (maker → retry maker → taker); the market snapshot is refreshed from REST before the maker retry and the taker fallback so neither places on a stale price.
+6. The local state machine records the order lifecycle, including fills (queried from REST order-detail for real price/fee/trade_id).
+7. REST reconciliation repairs any local state the one-shot processing missed.
 
-SQLite is the durable command queue and audit log, not the hot decision store.
+SQLite is the durable command queue and audit log. The in-memory market snapshot is a short-lived freshness check, not a continuously-maintained WS cache.
 
 ## Bitget Demo Safety
 
@@ -101,7 +100,7 @@ At startup, the executor:
 
 1. loads local SQLite orders, fills, positions, and active intents;
 2. queries Bitget account, positions, and open orders;
-3. subscribes to public and private WS channels;
+3. verifies it can connect, authenticate, and subscribe to the public and private demo WS channels (verification only — no long-running cache in M3);
 4. reconciles local and exchange state;
 5. begins processing eligible intents.
 
@@ -133,13 +132,13 @@ Manual override state is stored durably in SQLite `executor_state`, so restarts 
 
 Opening orders:
 
-- First attempt is maker.
-- Maker buy uses cached best bid.
-- Maker sell uses cached best ask.
+- First attempt is maker, priced off the seeded REST ticker snapshot.
+- Maker buy rests at best bid.
+- Maker sell rests at best ask.
 - If the maker order is not filled within `open_maker_timeout_seconds = 15`, cancel it.
-- If signal, risk, and market state are still valid, retry maker once.
+- If signal, risk, and market state are still valid, retry maker once. The market snapshot is refreshed from a new REST ticker before the retry so the limit price is current.
 - If the second maker attempt also times out, cancel it.
-- If signal, risk, and market state are still valid, use taker.
+- If signal, risk, and market state are still valid, use taker. The market snapshot is refreshed again before the taker fallback so the crossing market order uses a current price.
 
 Closing orders:
 
@@ -171,9 +170,9 @@ The executor may reject an unsafe intent with a durable error in SQLite.
 
 ## Reconciliation
 
-WebSocket is the real-time path. REST is the repair path.
+REST is the source of truth for exchange state in M3. (A long-running WS-driven cache is M4; M3 verifies WS connectivity/auth/subscription and parses WS messages, but execution and reconciliation both run over REST.)
 
-The reconciler periodically queries Bitget for:
+The reconciler queries Bitget for:
 
 - open orders;
 - recent order details;
@@ -188,14 +187,7 @@ Reconciliation must be safe to run repeatedly.
 
 Telegram remains a notification layer, not a control dependency.
 
-Demo mode does not proactively send normal opening or closing trade messages. In demo mode, the Telegram bot answers user queries for:
-
-- current positions;
-- open orders;
-- recent trades;
-- realized PnL;
-- unrealized PnL;
-- total equity and available margin.
+Demo mode does not proactively send normal opening or closing trade messages. In M3 the Telegram bot is notification-only; interactive query commands (/positions, /trades, /pnl, equity, available margin) are deferred to M4.
 
 Demo mode still sends active Telegram messages for:
 
