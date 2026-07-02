@@ -258,8 +258,17 @@ pub fn order_side(action: &str, side: &str) -> &'static str {
     match (action, side) {
         ("open", "long") | ("close", "short") => "buy",
         ("open", "short") | ("close", "long") => "sell",
+        // ponytail: reduce/reverse are rejected before reaching here (see
+        // is_supported_action). This default prevents a silent wrong-side order
+        // if an unsupported action slips through.
         _ => "sell",
     }
+}
+
+/// Only open/close are supported in the third milestone. reduce/reverse must be
+/// rejected before any order placement to avoid a dangerous default-side order.
+pub fn is_supported_action(action: &str) -> bool {
+    matches!(action, "open" | "close")
 }
 
 /// Reference price for notional→base conversion. Maker prices its own (passive)
@@ -522,6 +531,20 @@ pub async fn process_one_intent(
     account: AccountRiskSnapshot,
 ) -> Result<()> {
     if !db::accept_intent(conn, &intent.intent_id)? {
+        return Ok(());
+    }
+    // Reject unsupported actions (reduce/reverse) before any order placement.
+    // Third milestone supports open and close only; defaulting to a side would be
+    // a dangerous silent order.
+    if !is_supported_action(&intent.action) {
+        db::fail_intent(
+            conn,
+            &intent.intent_id,
+            &format!(
+                "unsupported action: {} (only open/close supported)",
+                intent.action
+            ),
+        )?;
         return Ok(());
     }
     let risk = check_intent(
@@ -858,13 +881,21 @@ pub async fn process_one_intent(
                         }
                         (OrderPollOutcome::Live, filled) => {
                             if Instant::now() >= deadline {
-                                // Taker didn't confirm in-window; mark done anyway —
-                                // a market order fills, and reconcile owns the truth.
-                                // Record the observed fill (was "submitted", now "filled").
-                                cumulative_filled_base += filled;
-                                set_local_order_filled(conn, &order.client_oid, filled)?;
-                                state.on_order_filled();
-                                break;
+                                // ponytail: a market order that hasn't confirmed
+                                // in 5s is NOT assumed filled — that's too
+                                // optimistic on the money path. Record any partial
+                                // fill observed, then mark needs_reconcile and fail
+                                // the intent so reconcile confirms from exchange.
+                                if filled > 0.0 {
+                                    set_local_order_filled(conn, &order.client_oid, filled)?;
+                                }
+                                set_local_order_status(conn, &order.client_oid, "needs_reconcile")?;
+                                db::fail_intent(
+                                    conn,
+                                    &intent.intent_id,
+                                    "taker fill not confirmed in window; left to reconcile",
+                                )?;
+                                return Ok(());
                             }
                         }
                     }
