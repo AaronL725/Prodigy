@@ -154,6 +154,18 @@ impl BitgetRestClient {
         )
         .await
     }
+
+    pub async fn get_account_snapshot(&self) -> Result<Value> {
+        self.get(
+            "/api/v2/mix/account/account",
+            &[
+                ("symbol", self.cfg.bitget_symbol.clone()),
+                ("productType", self.cfg.product_type.clone()),
+                ("marginCoin", self.cfg.margin_coin.clone()),
+            ],
+        )
+        .await
+    }
 }
 
 async fn parse_bitget_response(response: reqwest::Response) -> Result<Value> {

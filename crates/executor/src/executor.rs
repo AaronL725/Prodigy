@@ -11,6 +11,27 @@ use crate::reconcile::reconcile_once;
 use crate::risk::{check_intent, AccountRiskSnapshot, RiskParams};
 use crate::types::{MarketUpdate, OrderRecord, TradeIntent};
 
+#[derive(Debug, Clone, Default)]
+pub struct MarketCache {
+    latest: Option<MarketUpdate>,
+}
+
+impl MarketCache {
+    pub fn update(&mut self, update: MarketUpdate) {
+        self.latest = Some(update);
+    }
+
+    pub fn latest_fresh(&self, now_ms: i64, stale_after_secs: u64) -> Option<MarketUpdate> {
+        let update = self.latest.clone()?;
+        let age_ms = now_ms.saturating_sub(update.exchange_ts_ms);
+        if age_ms <= (stale_after_secs as i64) * 1000 {
+            Some(update)
+        } else {
+            None
+        }
+    }
+}
+
 pub async fn run_once_or_loop(cfg: ExecutorConfig) -> Result<()> {
     cfg.validate_demo_only()?;
     let conn = Connection::open(&cfg.db_path)?;
@@ -26,13 +47,19 @@ pub async fn run_once_or_loop(cfg: ExecutorConfig) -> Result<()> {
     reconcile_once(&conn, &rest, "now").await?;
 
     let intents = db::pending_intents(&conn)?;
-    // ponytail: TEMPORARY snapshot. Account stays hardcoded (Task 12 wires live
-    // equity), but the market price MUST be real: a maker limit at a stale
-    // hardcoded price is rejected by Bitget's price band (code 22047), so the
-    // money path would never place. One ticker fetch gives a band-valid price;
-    // Task 12 replaces this with the streaming WS book cache.
-    let market = fetch_market_snapshot(&cfg, &rest).await?;
+    // ponytail: seed the cache once with a real ticker (not the WS stream yet);
+    // latest_fresh per intent rejects openings when the cached price is older
+    // than cfg.stale_market_data_secs. Account stays hardcoded until Task 13
+    // (live equity wiring) — but the REST fetch below proves the signed GET
+    // /api/v2/mix/account/account path that snapshot will reuse.
+    let mut market_cache = MarketCache::default();
+    market_cache.update(fetch_initial_market_snapshot(&cfg, &rest).await?);
+    let _account_json = rest.get_account_snapshot().await?;
     for intent in intents {
+        let now_ms = crate::bitget::now_ms().parse::<i64>().unwrap_or(0);
+        let market = market_cache
+            .latest_fresh(now_ms, cfg.stale_market_data_secs)
+            .ok_or_else(|| anyhow::anyhow!("market cache is stale"))?;
         let account = AccountRiskSnapshot {
             equity: 10_000.0,
             available_margin: 5_000.0,
@@ -41,14 +68,14 @@ pub async fn run_once_or_loop(cfg: ExecutorConfig) -> Result<()> {
             market_is_fresh: true,
             private_state_is_ready: true,
         };
-        process_one_intent(&conn, &cfg, &rest, intent.clone(), market.clone(), account).await?;
+        process_one_intent(&conn, &cfg, &rest, intent.clone(), market, account).await?;
         db::write_event(&conn, "info", "executor", "processed intent", "{}")?;
         println!("processed {}", intent.intent_id);
     }
     Ok(())
 }
 
-async fn fetch_market_snapshot(
+async fn fetch_initial_market_snapshot(
     cfg: &ExecutorConfig,
     rest: &BitgetRestClient,
 ) -> Result<MarketUpdate> {
@@ -79,7 +106,7 @@ async fn fetch_market_snapshot(
         symbol: cfg.bitget_symbol.clone(),
         best_bid: parse_price("bidPr")?,
         best_ask: parse_price("askPr")?,
-        exchange_ts_ms: 0,
+        exchange_ts_ms: crate::bitget::now_ms().parse().unwrap_or(0),
     })
 }
 
@@ -398,5 +425,22 @@ mod tests {
         assert_eq!(order.order_type, "market");
         assert_eq!(order.reduce_only.as_deref(), Some("YES"));
         assert!(order.price.is_none());
+    }
+
+    #[test]
+    fn stale_market_cache_returns_none() {
+        let mut cache = MarketCache::default();
+        cache.update(MarketUpdate {
+            symbol: "ETHUSDT".to_string(),
+            best_bid: 3000.0,
+            best_ask: 3000.5,
+            exchange_ts_ms: 1,
+        });
+
+        // units are ms: stale_after_secs(3) -> 3000ms threshold.
+        // age 3999ms (now 4000 - ts 1) exceeds it -> stale -> None.
+        assert!(cache.latest_fresh(4_000, 3).is_none());
+        // age 999ms (now 1000 - ts 1) is under it -> fresh -> Some.
+        assert!(cache.latest_fresh(1_000, 3).is_some());
     }
 }
