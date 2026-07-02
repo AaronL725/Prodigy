@@ -34,6 +34,15 @@ impl MarketCache {
     }
 }
 
+/// Turn a (possibly stale/missing) market snapshot into a Result. Used at the
+/// maker-retry and taker-fallback decision points: a maker order times out after
+/// up to 15s while the cache's freshness window is 3s, so re-placing on the
+/// pre-timeout price would post a stale limit. None (stale or unavailable) must
+/// FAIL the intent rather than place on a price we can't trust.
+fn require_fresh_market(market: Option<MarketUpdate>) -> Result<MarketUpdate> {
+    market.ok_or_else(|| anyhow::anyhow!("market data is stale; cannot place on stale price"))
+}
+
 pub async fn run_once_or_loop(cfg: ExecutorConfig) -> Result<()> {
     cfg.validate_demo_only()?;
     let conn = Connection::open(&cfg.db_path)?;
@@ -73,7 +82,7 @@ pub async fn run_once_or_loop(cfg: ExecutorConfig) -> Result<()> {
     // yet); latest_fresh per intent rejects openings when the cached price is
     // older than cfg.stale_market_data_secs.
     let mut market_cache = MarketCache::default();
-    market_cache.update(fetch_initial_market_snapshot(&cfg, &rest).await?);
+    market_cache.update(fetch_market_snapshot(&cfg, &rest).await?);
     for intent in intents {
         // Fetch a FRESH account snapshot per intent. A run can carry multiple
         // opening intents; if the first fills, its gross notional/equity have
@@ -89,10 +98,18 @@ pub async fn run_once_or_loop(cfg: ExecutorConfig) -> Result<()> {
             0.0,
         )?;
         let now_ms = crate::bitget::now_ms().parse::<i64>().unwrap_or(0);
-        let market = market_cache
-            .latest_fresh(now_ms, cfg.stale_market_data_secs)
-            .ok_or_else(|| anyhow::anyhow!("market cache is stale"))?;
-        process_one_intent(&conn, &cfg, &rest, intent.clone(), market, account).await?;
+        let market =
+            require_fresh_market(market_cache.latest_fresh(now_ms, cfg.stale_market_data_secs))?;
+        process_one_intent(
+            &conn,
+            &cfg,
+            &rest,
+            intent.clone(),
+            market,
+            account,
+            &mut market_cache,
+        )
+        .await?;
         db::write_event(&conn, "info", "executor", "processed intent", "{}")?;
         println!("processed {}", intent.intent_id);
     }
@@ -164,12 +181,17 @@ async fn fetch_account_snapshot(rest: &BitgetRestClient) -> Result<AccountRiskSn
         available_margin,
         unrealized_pnl_24h: unrealized_pnl,
         gross_notional,
+        // ponytail: every caller fetches a FRESH ticker right before this
+        // (entry seeds market_cache; retry/taker both call fetch_market_snapshot
+        // above), so claiming market_is_fresh=true is truthful here. The
+        // maker-retry/taker arms fail the intent before reaching this risk check
+        // when the ticker refresh itself fails, so this never hides a stale price.
         market_is_fresh: true,
         private_state_is_ready: true,
     })
 }
 
-async fn fetch_initial_market_snapshot(
+async fn fetch_market_snapshot(
     cfg: &ExecutorConfig,
     rest: &BitgetRestClient,
 ) -> Result<MarketUpdate> {
@@ -195,7 +217,9 @@ async fn fetch_initial_market_snapshot(
     };
     // ponytail: fail loud on a bad price — unwrap_or(0.0) would make size =
     // notional/0.0 = "inf"; the money path must not build an order on a price
-    // it couldn't read, even though Bitget would reject "inf" loudly.
+    // it couldn't read, even though Bitget would reject "inf" loudly. Refreshed
+    // one-shot before the maker retry and the taker fallback so neither places on
+    // a price older than the cache's freshness window (maker timeout 15s >> 3s).
     Ok(MarketUpdate {
         symbol: cfg.bitget_symbol.clone(),
         best_bid: parse_price("bidPr")?,
@@ -766,6 +790,7 @@ pub async fn process_one_intent(
     intent: TradeIntent,
     market: MarketUpdate,
     account: AccountRiskSnapshot,
+    market_cache: &mut MarketCache,
 ) -> Result<()> {
     if !db::accept_intent(conn, &intent.intent_id)? {
         return Ok(());
@@ -879,6 +904,28 @@ pub async fn process_one_intent(
                 // ran at entry; the spec requires signal/risk/market to still hold
                 // before placing again. The first attempt (attempt == 1) was already
                 // gated by the entry check, so it doesn't re-check here.
+                //
+                // The maker order may have rested on the book for up to the maker
+                // timeout (15s), far longer than the market freshness window (3s),
+                // so a retry must place on a FRESH price, not the pre-timeout one.
+                let place_market = if attempt > 1 {
+                    match fetch_market_snapshot(cfg, rest).await {
+                        Ok(m) => {
+                            market_cache.update(m.clone());
+                            m
+                        }
+                        Err(e) => {
+                            db::fail_intent(
+                                conn,
+                                &intent.intent_id,
+                                &format!("market refresh failed before maker retry: {e}"),
+                            )?;
+                            return Ok(());
+                        }
+                    }
+                } else {
+                    market.clone()
+                };
                 if attempt > 1 {
                     // Fetch a FRESH account snapshot so the re-check uses current
                     // equity/margin, not the stale snapshot from run start.
@@ -917,7 +964,7 @@ pub async fn process_one_intent(
                 let order = build_order_request(
                     cfg,
                     &intent,
-                    &market,
+                    &place_market,
                     remaining_notional,
                     OrderMode::Maker,
                     attempt,
@@ -1097,6 +1144,25 @@ pub async fn process_one_intent(
                 }
             }
             ExecutionCommand::PlaceTaker => {
+                // Refresh the market before the taker fallback. The taker is only
+                // reached after the maker attempts timed out (~30s on the book),
+                // far past the 3s freshness window — placing a market order on the
+                // pre-timeout price would cross at a stale level. Fail the intent
+                // (don't place) if a fresh snapshot can't be obtained.
+                let place_market = match fetch_market_snapshot(cfg, rest).await {
+                    Ok(m) => {
+                        market_cache.update(m.clone());
+                        m
+                    }
+                    Err(e) => {
+                        db::fail_intent(
+                            conn,
+                            &intent.intent_id,
+                            &format!("market refresh failed before taker fallback: {e}"),
+                        )?;
+                        return Ok(());
+                    }
+                };
                 // Re-check risk with a FRESH account snapshot before taker fallback.
                 let fresh_account = fetch_account_snapshot(rest).await?;
                 if let Err(reason) = check_intent(
@@ -1126,13 +1192,14 @@ pub async fn process_one_intent(
                 // Taker sizes to the remaining base. Re-derive base from target
                 // via the maker reference price (so maker+taker sum to target_base
                 // exactly) and let build_order_request price it as a crossing
-                // market order using its own (opposite-side) reference.
+                // market order using its own (opposite-side) reference on the
+                // freshly-refreshed market.
                 let remaining_notional =
                     remaining_base(target_base, cumulative_filled_base) * maker_ref;
                 let order = build_order_request(
                     cfg,
                     &intent,
-                    &market,
+                    &place_market,
                     remaining_notional,
                     OrderMode::Taker,
                     1,
@@ -1399,6 +1466,23 @@ mod tests {
         assert!(cache.latest_fresh(4_000, 3).is_none());
         // age 999ms (now 1000 - ts 1) is under it -> fresh -> Some.
         assert!(cache.latest_fresh(1_000, 3).is_some());
+    }
+
+    #[test]
+    fn require_fresh_market_rejects_missing_snapshot() {
+        // A maker order can wait up to 15s before timing out; the freshness
+        // window is 3s. Re-placing the retry/taker on the pre-timeout price
+        // would post a stale limit, so a None (stale/unavailable) snapshot must
+        // be an error the intent fails on — not a silent place-on-old-price.
+        assert!(require_fresh_market(None).is_err());
+        let fresh = MarketUpdate {
+            symbol: "ETHUSDT".to_string(),
+            best_bid: 3000.0,
+            best_ask: 3000.5,
+            exchange_ts_ms: 1,
+        };
+        let got = require_fresh_market(Some(fresh.clone())).unwrap();
+        assert_eq!(got.best_bid, fresh.best_bid);
     }
 
     #[test]
