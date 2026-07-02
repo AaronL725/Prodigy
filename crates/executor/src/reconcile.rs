@@ -13,6 +13,10 @@ pub fn classify_position(
     local_order_intents: &HashSet<String>,
     now: &str,
 ) -> PositionRecord {
+    // System-owned if we can trace it to a local order/intent. The exchange
+    // all-position response doesn't carry our source_intent_id, so reconcile
+    // sets it before calling this (from the local orders table). If it's set
+    // and matches a local intent, it's system; otherwise imported.
     if exchange_position
         .source_intent_id
         .as_ref()
@@ -26,6 +30,27 @@ pub fn classify_position(
         exchange_position.opened_at = Some(now.to_string());
     }
     exchange_position
+}
+
+/// Determine whether an exchange position for this symbol is system-owned by
+/// checking if the executor has any local orders (filled/submitted) for it.
+/// Returns the intent_id of the most recent local order if found.
+pub fn system_ownership_intent(
+    conn: &rusqlite::Connection,
+    symbol: &str,
+) -> Result<Option<String>> {
+    use rusqlite::params;
+    let intent_id: Option<String> = conn
+        .query_row(
+            "select intent_id from orders
+             where symbol = ? and intent_id is not null and status in ('filled', 'submitted')
+             order by updated_at desc limit 1",
+            params![symbol],
+            |row| row.get(0),
+        )
+        .ok()
+        .flatten();
+    Ok(intent_id)
 }
 
 pub async fn reconcile_once(
@@ -179,6 +204,9 @@ pub async fn reconcile_once(
             .and_then(serde_json::Value::as_str)
             .and_then(|v| v.parse::<f64>().ok())
             .unwrap_or(0.0);
+        // Check if this symbol has system orders → trace ownership to avoid
+        // misclassifying our own position as imported/manual.
+        let source_intent = system_ownership_intent(conn, &symbol.clone())?;
         let mut record = PositionRecord {
             symbol,
             side: str_field(&row, "holdSide"),
@@ -188,7 +216,7 @@ pub async fn reconcile_once(
             ownership: "system".to_string(),
             opened_at: None,
             adopted_at: None,
-            source_intent_id: None,
+            source_intent_id: source_intent.clone(),
             raw_json: row.to_string(),
         };
         record = classify_position(record, &system_intents, now);

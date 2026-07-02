@@ -170,6 +170,20 @@ pub fn local_system_intent_ids(conn: &Connection) -> Result<std::collections::Ha
     Ok(set)
 }
 
+/// intent_ids of orders the executor has placed (filled or submitted). Used by
+/// reconcile to tell a system position (we have a local order for this symbol)
+/// from an imported/manual one. This is more reliable than source_intent_id on
+/// the position row because exchange all-position doesn't carry our intent_id.
+pub fn local_order_intent_ids(conn: &Connection) -> Result<std::collections::HashSet<String>> {
+    let mut stmt = conn.prepare("select distinct intent_id from orders where intent_id is not null")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    let mut set = std::collections::HashSet::new();
+    for row in rows {
+        set.insert(row?);
+    }
+    Ok(set)
+}
+
 /// Insert a fill record. Idempotent by fill_id (PK) via insert-or-ignore.
 pub fn insert_fill(conn: &Connection, fill: &FillRecord) -> Result<()> {
     conn.execute(
