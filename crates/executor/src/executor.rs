@@ -712,6 +712,32 @@ pub async fn process_one_intent(
 
         match state.next_command(&policy) {
             ExecutionCommand::PlaceMaker { attempt } => {
+                // Re-check risk before any retry (attempt > 1). The initial check
+                // ran at entry; the spec requires signal/risk/market to still hold
+                // before placing again. The first attempt (attempt == 1) was already
+                // gated by the entry check, so it doesn't re-check here.
+                if attempt > 1 {
+                    let remaining_notional_check =
+                        remaining_base(target_base, cumulative_filled_base) * maker_ref;
+                    if let Err(reason) = check_intent(
+                        &intent,
+                        &account,
+                        &RiskParams {
+                            total_notional_cap_x_equity: cfg.total_notional_cap_x_equity,
+                            trading_suspension_unrealized_loss_x_equity: cfg
+                                .trading_suspension_unrealized_loss_x_equity,
+                            ..RiskParams::default()
+                        },
+                    ) {
+                        db::fail_intent(
+                            conn,
+                            &intent.intent_id,
+                            &format!("risk gate rejected on retry: {reason}"),
+                        )?;
+                        return Ok(());
+                    }
+                    let _ = remaining_notional_check;
+                }
                 // Early-terminate: a prior attempt already filled enough that the
                 // remainder is dust. The position is at target, so mark done and
                 // let reconcile own any sub-min residual rather than place an
@@ -908,6 +934,25 @@ pub async fn process_one_intent(
                 }
             }
             ExecutionCommand::PlaceTaker => {
+                // Re-check risk before taker fallback. All maker attempts have
+                // been exhausted; the spec requires risk/market to still hold.
+                if let Err(reason) = check_intent(
+                    &intent,
+                    &account,
+                    &RiskParams {
+                        total_notional_cap_x_equity: cfg.total_notional_cap_x_equity,
+                        trading_suspension_unrealized_loss_x_equity: cfg
+                            .trading_suspension_unrealized_loss_x_equity,
+                        ..RiskParams::default()
+                    },
+                ) {
+                    db::fail_intent(
+                        conn,
+                        &intent.intent_id,
+                        &format!("risk gate rejected before taker fallback: {reason}"),
+                    )?;
+                    return Ok(());
+                }
                 // Same early-terminate as the maker arms: if prior attempts
                 // already filled enough that the remainder is dust, stop here and
                 // mark the intent done (reconcile owns the residual).
