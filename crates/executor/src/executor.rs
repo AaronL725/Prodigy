@@ -46,9 +46,23 @@ pub async fn run_once_or_loop(cfg: ExecutorConfig) -> Result<()> {
 
     verify_public_ws_connects(&cfg).await?;
     verify_private_ws_connects(&cfg).await?;
+    // Set leverage once at startup so the demo account runs at the configured
+    // leverage (default 5x). Best-effort: if Bitget rejects it (already set,
+    // or a permission issue), log and continue rather than abort.
+    if let Err(e) = rest.set_leverage(cfg.leverage).await {
+        println!("set-leverage skipped: {e}");
+    }
     // Skip override detection in test-reset mode: the reset is system cleanup,
     // not user manual intervention. Normal strategy runs detect it.
-    reconcile_once(&conn, &rest, "now", !cfg.test_reset_demo_state).await?;
+    reconcile_once(
+        &conn,
+        &rest,
+        "now",
+        !cfg.test_reset_demo_state,
+        cfg.telegram_bot_token.as_deref(),
+        cfg.telegram_chat_id.as_deref(),
+    )
+    .await?;
 
     let intents = db::pending_intents(&conn)?;
     // ponytail: seed the cache once with a real ticker (not the WS stream yet);
@@ -83,16 +97,26 @@ pub async fn run_once_or_loop(cfg: ExecutorConfig) -> Result<()> {
 /// AccountRiskSnapshot the risk gate consumes — no hardcoded fiction.
 async fn fetch_account_snapshot(rest: &BitgetRestClient) -> Result<AccountRiskSnapshot> {
     let acct = rest.get_account_snapshot().await?;
-    let data = acct.get("data").unwrap_or(&serde_json::Value::Null);
-    let f = |key: &str| {
+    let data = acct
+        .get("data")
+        .ok_or_else(|| anyhow::anyhow!("account snapshot missing data field"))?;
+    // ponytail: equity and available are critical for the risk gate — a missing or
+    // unparseable field must fail loud (not silently become 0, which would either
+    // block all trading or allow unlimited trading). unrealizedPL can legitimately
+    // be absent (no open positions), so it defaults to 0.0.
+    let parse_required = |key: &str| -> Result<f64> {
         data.get(key)
             .and_then(serde_json::Value::as_str)
             .and_then(|v| v.parse::<f64>().ok())
-            .unwrap_or(0.0)
+            .ok_or_else(|| anyhow::anyhow!("account snapshot missing/unparseable {key}"))
     };
-    let equity = f("accountEquity");
-    let available_margin = f("available");
-    let unrealized_pnl = f("unrealizedPL");
+    let equity = parse_required("accountEquity")?;
+    let available_margin = parse_required("available")?;
+    let unrealized_pnl = data
+        .get("unrealizedPL")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(0.0);
 
     // Sum position notionals from all-position for gross_notional.
     let positions = rest

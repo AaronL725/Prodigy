@@ -212,6 +212,29 @@ impl BitgetRestClient {
         .await
     }
 
+    /// Set the leverage for the configured symbol. Called once at startup so the
+    /// demo account runs at the configured leverage (default 5x).
+    pub async fn set_leverage(&self, leverage: u32) -> Result<Value> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct SetLeverage<'a> {
+            symbol: &'a str,
+            product_type: &'a str,
+            margin_coin: &'a str,
+            leverage: String,
+        }
+        self.post_json(
+            "/api/v2/mix/account/set-leverage",
+            &SetLeverage {
+                symbol: &self.cfg.bitget_symbol,
+                product_type: &self.cfg.product_type,
+                margin_coin: &self.cfg.margin_coin,
+                leverage: leverage.to_string(),
+            },
+        )
+        .await
+    }
+
     /// Poll a single order by client_oid. Returns the `data` object from
     /// GET /api/v2/mix/order/detail. A canceled or filled order is still
     /// returned here (it is historical, not deleted), so this is the correct

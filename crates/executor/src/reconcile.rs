@@ -58,6 +58,8 @@ pub async fn reconcile_once(
     rest: &BitgetRestClient,
     now: &str,
     detect_override: bool,
+    telegram_token: Option<&str>,
+    telegram_chat: Option<&str>,
 ) -> Result<()> {
     // ponytail: WS is the fast path; this REST pass repairs anything it missed.
     // Exchange state wins on conflict (spec). We INSERT missing orders/positions
@@ -126,8 +128,8 @@ pub async fn reconcile_once(
                     &format!("{{\"symbol\":\"{sym}\"}}"),
                 )?;
                 notify::send_telegram(
-                    None,
-                    None,
+                    telegram_token,
+                    telegram_chat,
                     "manual_override_entered",
                     &format!("manual override entered for {sym}"),
                 )
@@ -237,8 +239,8 @@ pub async fn reconcile_once(
                 &format!("{{\"symbol\":\"{}\"}}", record.symbol),
             )?;
             notify::send_telegram(
-                None,
-                None,
+                telegram_token,
+                telegram_chat,
                 "manual_override_entered",
                 &format!(
                     "manual override entered for {} (imported position)",
@@ -300,8 +302,8 @@ pub async fn reconcile_once(
                 &format!("{{\"symbol\":\"{sym}\"}}"),
             )?;
             notify::send_telegram(
-                None,
-                None,
+                telegram_token,
+                telegram_chat,
                 "manual_override_cleared",
                 &format!("manual override cleared for {sym}"),
             )
