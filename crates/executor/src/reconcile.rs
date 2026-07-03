@@ -615,36 +615,51 @@ pub async fn reconcile_once(
     // the Bitget UI, the exchange stops returning a position row for the symbol, so
     // the per-row drift check above never runs. Detect it here: our local orders
     // still imply a nonzero system net base, but the exchange returned no position
-    // for the symbol → the position was closed out from under us. Enter override
-    // and retire the contributing system orders (externally_closed) so the net base
-    // returns to zero and this doesn't re-fire on every subsequent pass. Skipped in
-    // test-reset mode (system cleanup, not user intervention).
-    if detect_override && !override_active && !exchange_has_position {
+    // for the symbol → the position was closed out from under us. ALWAYS sync the
+    // local state to exchange truth (retire the contributing orders + clear the
+    // local position row) — even when override is already active from a prior
+    // reduce/add — so the net base returns to zero and the next pass won't
+    // clear-then-re-enter override (flapping). Only ENTER override if it isn't
+    // already active. Skipped in test-reset mode (system cleanup, not user
+    // intervention).
+    if detect_override && !exchange_has_position {
         let (sys_base, _sys_side) = db::system_net_base_for_symbol(conn, &symbol)?;
         if sys_base.abs() > f64::EPSILON {
-            db::set_executor_state(conn, &override_key, "active")?;
-            override_active = true;
-            entered_this_run = true;
             db::mark_system_orders_externally_closed(conn, &symbol)?;
             // Exchange state wins: the exchange no longer holds this position, so
             // remove the local positions row too — otherwise local /positions and
             // PnL queries keep reporting a position Bitget closed.
             db::clear_local_position(conn, &symbol)?;
-            db::write_event(
-                conn,
-                "warning",
-                "executor",
-                "manual override entered (position externally closed)",
-                &format!("{{\"symbol\":\"{symbol}\"}}"),
-            )?;
-            notify::send_telegram(
-                telegram_token,
-                telegram_chat,
-                "manual_override_entered",
-                &format!("manual override entered for {symbol} (position externally closed)"),
-            )
-            .await
-            .ok();
+            if !override_active {
+                db::set_executor_state(conn, &override_key, "active")?;
+                override_active = true;
+                entered_this_run = true;
+                db::write_event(
+                    conn,
+                    "warning",
+                    "executor",
+                    "manual override entered (position externally closed)",
+                    &format!("{{\"symbol\":\"{symbol}\"}}"),
+                )?;
+                notify::send_telegram(
+                    telegram_token,
+                    telegram_chat,
+                    "manual_override_entered",
+                    &format!("manual override entered for {symbol} (position externally closed)"),
+                )
+                .await
+                .ok();
+            } else {
+                // Override already active (e.g. from a prior reduce/add); still
+                // record that the position was externally closed this pass.
+                db::write_event(
+                    conn,
+                    "warning",
+                    "executor",
+                    "position externally closed while override active",
+                    &format!("{{\"symbol\":\"{symbol}\"}}"),
+                )?;
+            }
         }
     }
 
