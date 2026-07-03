@@ -490,18 +490,24 @@ fn parse_f64(value: Option<&Value>, name: &str) -> Result<f64> {
         .with_context(|| format!("parse {name}"))
 }
 
-pub async fn verify_public_ws_connects(cfg: &ExecutorConfig) -> Result<()> {
-    cfg.validate_demo_only()?;
-    let (mut socket, _) = tokio_tungstenite::connect_async(&cfg.public_ws_url).await?;
-    use futures_util::{SinkExt, StreamExt};
-    let msg = serde_json::json!({
+/// Public books5 subscribe payload for the configured symbol. Pure so the one-shot
+/// verify and the long-running WS loop build the identical subscription.
+pub fn public_books5_subscribe_message(cfg: &ExecutorConfig) -> serde_json::Value {
+    serde_json::json!({
         "op": "subscribe",
         "args": [{
             "instType": cfg.product_type,
             "channel": "books5",
             "instId": cfg.bitget_symbol
         }]
-    });
+    })
+}
+
+pub async fn verify_public_ws_connects(cfg: &ExecutorConfig) -> Result<()> {
+    cfg.validate_demo_only()?;
+    let (mut socket, _) = tokio_tungstenite::connect_async(&cfg.public_ws_url).await?;
+    use futures_util::{SinkExt, StreamExt};
+    let msg = public_books5_subscribe_message(cfg);
     socket
         .send(tokio_tungstenite::tungstenite::Message::Text(
             msg.to_string(),
@@ -618,6 +624,18 @@ mod tests {
         assert_eq!(update.orders.len(), 1);
         assert_eq!(update.orders[0].client_oid, "client-1");
         assert_eq!(update.orders[0].status, "live");
+    }
+
+    #[test]
+    fn public_books5_subscribe_payload_targets_demo_symbol() {
+        let cfg = ExecutorConfig::demo_for_tests();
+        let msg = public_books5_subscribe_message(&cfg);
+        let text = msg.to_string();
+
+        assert!(text.contains("\"op\":\"subscribe\""));
+        assert!(text.contains("\"channel\":\"books5\""));
+        assert!(text.contains("\"instId\":\"ETHUSDT\""));
+        assert!(text.contains("\"instType\":\"USDT-FUTURES\""));
     }
 
     #[test]
