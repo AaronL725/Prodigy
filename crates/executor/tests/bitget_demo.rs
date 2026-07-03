@@ -237,37 +237,52 @@ async fn bitget_demo_can_open_and_reduce_only_close_market_order() {
         return;
     }
 
-    // The open filled — exercise the real reduceOnly close to clean up the
-    // position we just created. Best-effort: the same volatile book can refuse to
-    // fill the close, in which case we log loudly but do NOT fail the test on the
-    // close (the open->fill path is what we set out to prove). Any residue is
-    // reported, not hidden.
+    // The open filled — we created real exposure, so we MUST clean it up. The same
+    // volatile book can refuse a single reduce-only market close, so retry a few
+    // times. If we genuinely cannot reduce the position WE opened, fail loudly:
+    // a green test that leaves accumulating demo residue (F2) is worse than a red
+    // one that flags an un-runnable demo environment.
     eprintln!("market open filled (size {opened_size}); reduceOnly closing");
-    let close_oid = format!("pdgy-test-close-{}", prodigy_executor::bitget::now_ms());
-    let close = PlaceOrderRequest {
-        symbol: cfg.bitget_symbol.clone(),
-        product_type: cfg.product_type.clone(),
-        margin_mode: cfg.margin_mode.clone(),
-        margin_coin: cfg.margin_coin.clone(),
-        size: format!("{opened_size}"),
-        price: None,
-        side: "sell".to_string(),
-        order_type: "market".to_string(),
-        force: None,
-        client_oid: close_oid,
-        reduce_only: Some("YES".to_string()),
-    };
-    let closed = rest
-        .post_json("/api/v2/mix/order/place-order", &close)
-        .await
-        .unwrap();
-    assert_eq!(closed.get("code").and_then(|v| v.as_str()), Some("00000"));
-    // Poll briefly for the close to land; if it didn't (phantom book), report it.
-    let after_close = position_size(&rest, &cfg).await;
-    if after_close > baseline + 1e-9 {
-        eprintln!(
-            "WARNING: reduceOnly close did not clear the opened position \
-             (after_close={after_close}, baseline={baseline}); demo book may be illiquid"
+    let mut cleared = false;
+    for attempt in 1..=4 {
+        let close_oid = format!(
+            "pdgy-test-close-{}-{attempt}",
+            prodigy_executor::bitget::now_ms()
         );
+        let close = PlaceOrderRequest {
+            symbol: cfg.bitget_symbol.clone(),
+            product_type: cfg.product_type.clone(),
+            margin_mode: cfg.margin_mode.clone(),
+            margin_coin: cfg.margin_coin.clone(),
+            size: format!("{opened_size}"),
+            price: None,
+            side: "sell".to_string(),
+            order_type: "market".to_string(),
+            force: None,
+            client_oid: close_oid,
+            reduce_only: Some("YES".to_string()),
+        };
+        let closed = rest
+            .post_json("/api/v2/mix/order/place-order", &close)
+            .await
+            .unwrap();
+        assert_eq!(closed.get("code").and_then(|v| v.as_str()), Some("00000"));
+        // Give the close a short window to land, then re-check vs baseline.
+        for _ in 0..10 {
+            if position_size(&rest, &cfg).await <= baseline + 1e-9 {
+                cleared = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        }
+        if cleared {
+            break;
+        }
+        eprintln!("reduceOnly close attempt {attempt} did not clear the position; retrying");
     }
+    assert!(
+        cleared,
+        "opened {opened_size} ETHUSDT but could not reduce-only close it after retries \
+         (demo book too illiquid); failing rather than leaving demo residue"
+    );
 }
