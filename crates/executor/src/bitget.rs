@@ -490,6 +490,21 @@ fn parse_f64(value: Option<&Value>, name: &str) -> Result<f64> {
         .with_context(|| format!("parse {name}"))
 }
 
+/// Private WS login payload: signs `GET /user/verify` with the per-connection
+/// timestamp. Pure so the one-shot verify and the long-running WS loop build the
+/// identical login (and the test pins the signature path).
+pub fn private_login_message(cfg: &ExecutorConfig, timestamp: &str) -> serde_json::Value {
+    serde_json::json!({
+        "op": "login",
+        "args": [{
+            "apiKey": cfg.secrets.api_key,
+            "passphrase": cfg.secrets.passphrase,
+            "timestamp": timestamp,
+            "sign": websocket_sign(&cfg.secrets.api_secret, timestamp)
+        }]
+    })
+}
+
 /// Public books5 subscribe payload for the configured symbol. Pure so the one-shot
 /// verify and the long-running WS loop build the identical subscription.
 pub fn public_books5_subscribe_message(cfg: &ExecutorConfig) -> serde_json::Value {
@@ -528,15 +543,7 @@ pub async fn verify_private_ws_connects(cfg: &ExecutorConfig) -> Result<()> {
     let (mut socket, _) = tokio_tungstenite::connect_async(&cfg.private_ws_url).await?;
     use futures_util::{SinkExt, StreamExt};
     let timestamp = now_seconds();
-    let login = serde_json::json!({
-        "op": "login",
-        "args": [{
-            "apiKey": cfg.secrets.api_key,
-            "passphrase": cfg.secrets.passphrase,
-            "timestamp": timestamp,
-            "sign": websocket_sign(&cfg.secrets.api_secret, &timestamp)
-        }]
-    });
+    let login = private_login_message(cfg, &timestamp);
     socket
         .send(tokio_tungstenite::tungstenite::Message::Text(
             login.to_string(),
@@ -636,6 +643,19 @@ mod tests {
         assert!(text.contains("\"channel\":\"books5\""));
         assert!(text.contains("\"instId\":\"ETHUSDT\""));
         assert!(text.contains("\"instType\":\"USDT-FUTURES\""));
+    }
+
+    #[test]
+    fn private_login_payload_uses_websocket_signature() {
+        let cfg = ExecutorConfig::demo_for_tests();
+        let msg = private_login_message(&cfg, "1538054050");
+        let text = msg.to_string();
+
+        assert!(text.contains("\"op\":\"login\""));
+        assert!(text.contains("\"apiKey\":\"key\""));
+        assert!(text.contains("\"passphrase\":\"pass\""));
+        assert!(text.contains("\"timestamp\":\"1538054050\""));
+        assert!(text.contains(&websocket_sign("secret", "1538054050")));
     }
 
     #[test]
