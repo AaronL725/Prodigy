@@ -11,12 +11,189 @@ pub struct DaemonOptions {
 
 pub async fn run_daemon(cfg: ExecutorConfig, options: DaemonOptions) -> Result<()> {
     cfg.validate_demo_only()?;
-    if let Some(max_runtime) = options.max_runtime {
-        tokio::time::sleep(max_runtime).await;
-        return Ok(());
+    let conn = rusqlite::Connection::open(&cfg.db_path)?;
+    conn.busy_timeout(Duration::from_secs(5))?;
+    let rest = crate::bitget::BitgetRestClient::new(cfg.clone())?;
+
+    if cfg.test_reset_demo_state {
+        crate::db::write_event(
+            &conn,
+            "warning",
+            "daemon",
+            "test reset requested in daemon mode",
+            "{}",
+        )?;
     }
-    futures_util::future::pending::<()>().await;
+
+    rest.set_leverage(cfg.leverage).await.map_err(|e| {
+        anyhow::anyhow!(
+            "set-leverage failed (configured {}x): {e} — refusing to trade at unknown leverage",
+            cfg.leverage
+        )
+    })?;
+    // Startup reconcile BEFORE processing intents: repair any local/exchange
+    // divergence left over from a prior run so the first tick starts from
+    // exchange-truth. (Daemon mode does NOT call reset_demo_symbol_state here —
+    // reset is the one-shot's job; daemon only logs the warning above.)
+    crate::reconcile::reconcile_once(
+        &conn,
+        &rest,
+        "daemon-startup",
+        !cfg.test_reset_demo_state,
+        cfg.telegram_bot_token.as_deref(),
+        cfg.telegram_chat_id.as_deref(),
+    )
+    .await?;
+    crate::db::write_event(&conn, "info", "daemon", "daemon started", "{}")?;
+
+    let market_cache = Arc::new(tokio::sync::Mutex::new(
+        crate::executor::MarketCache::default(),
+    ));
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+    let mut public_task = tokio::spawn(run_public_ws_loop(
+        cfg.clone(),
+        market_cache.clone(),
+        shutdown_rx.clone(),
+    ));
+    let mut private_task = tokio::spawn(run_private_ws_loop(cfg.clone(), shutdown_rx.clone()));
+
+    // ponytail: monotonic Instant for the bounded-runtime check — immune to
+    // wall-clock skew that SystemTime would inject mid-loop.
+    let started = tokio::time::Instant::now();
+    let mut poll = tokio::time::interval(Duration::from_millis(250));
+    let mut last_reconcile_ms = crate::bitget::now_ms().parse::<i64>().unwrap_or(0);
+
+    loop {
+        tokio::select! {
+            _ = shutdown_signal() => {
+                log_shutdown_requested(&conn)?;
+                break;
+            }
+            _ = poll.tick() => {
+                if options.max_runtime.is_some_and(|max| started.elapsed() >= max) {
+                    crate::db::write_event(
+                        &conn,
+                        "info",
+                        "daemon",
+                        "bounded daemon runtime elapsed",
+                        "{}",
+                    )?;
+                    break;
+                }
+                let now_ms = crate::bitget::now_ms().parse::<i64>().unwrap_or(0);
+                if should_run_reconcile(now_ms, last_reconcile_ms, cfg.reconcile_interval_secs) {
+                    // Periodic reconcile errors are LOGGED, not propagated: a single
+                    // flaky REST pass must not bring the daemon down (the next tick
+                    // retries). Same isolation as the intent-loop below.
+                    if let Err(err) = crate::reconcile::reconcile_once(
+                        &conn,
+                        &rest,
+                        "daemon-periodic",
+                        !cfg.test_reset_demo_state,
+                        cfg.telegram_bot_token.as_deref(),
+                        cfg.telegram_chat_id.as_deref(),
+                    )
+                    .await
+                    {
+                        crate::db::write_event(
+                            &conn,
+                            "warning",
+                            "reconcile",
+                            &format!("reconcile failed: {err}"),
+                            "{}",
+                        )?;
+                    }
+                    last_reconcile_ms = now_ms;
+                }
+
+                let mut local_cache = {
+                    let cache = market_cache.lock().await;
+                    cache.clone()
+                };
+                // Error isolation: a stale-market or REST failure here (common in
+                // the first few hundred ms before the public WS delivers, or on a
+                // transient network blip) is logged as an event and the loop
+                // continues — the daemon must not crash on a loop-iteration error.
+                // The next tick retries once the WS cache is fresh.
+                if let Err(err) = crate::executor::process_pending_intents_once(
+                    &conn,
+                    &cfg,
+                    &rest,
+                    &mut local_cache,
+                )
+                .await
+                {
+                    crate::db::write_event(
+                        &conn,
+                        "error",
+                        "intent_loop",
+                        &format!("intent loop failed: {err}"),
+                        "{}",
+                    )?;
+                }
+            }
+        }
+    }
+
+    // Shutdown ordering: signal WS loops via the watch channel, then give them
+    // a short grace window to observe it and return cooperatively (flush/close).
+    // abort() is the hard fallback so the process still exits within the
+    // bounded test runtime if a task is stuck mid-await on a socket read.
+    let _ = shutdown_tx.send(true);
+    let _ = tokio::time::timeout(
+        Duration::from_millis(200),
+        futures_util::future::join(&mut public_task, &mut private_task),
+    )
+    .await;
+    public_task.abort();
+    private_task.abort();
+    crate::db::write_event(&conn, "info", "daemon", "daemon stopped", "{}")?;
     Ok(())
+}
+
+/// Pure gate for the periodic reconcile cadence: true once `interval_secs`
+/// have elapsed since the last reconcile. Saturating subtraction keeps it
+/// safe against clock-skew-driven `now < last` orderings.
+pub fn should_run_reconcile(now_ms: i64, last_reconcile_ms: i64, interval_secs: u64) -> bool {
+    now_ms.saturating_sub(last_reconcile_ms) >= (interval_secs as i64) * 1000
+}
+
+/// Shared shutdown-requested event write for both the ctrl_c (SIGINT) and
+/// SIGTERM arms of `run_daemon`'s main select. Same body either way so a
+/// production signal (SIGTERM from `kill`/systemd/container stop) gets the
+/// identical graceful-shutdown audit trail as an interactive Ctrl+C.
+fn log_shutdown_requested(conn: &rusqlite::Connection) -> Result<()> {
+    crate::db::write_event(conn, "info", "daemon", "shutdown requested", "{}")
+}
+
+/// Wait for SIGTERM. Production daemons receive SIGTERM from `kill`, systemd
+/// and container stop; without this handler the default disposition kills the
+/// process hard — no "shutdown requested" event, no task abort, no
+/// "daemon stopped". Unix-only (Windows has no SIGTERM equivalent here).
+#[cfg(unix)]
+async fn sigterm() {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut s = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+    s.recv().await;
+}
+
+/// Neutral shutdown-signal future for the main select: resolves on either
+/// ctrl_c (SIGINT) or, on Unix, SIGTERM. Wrapping both in one future lets
+/// `tokio::select!` take a single branch (the macro rejects `#[cfg]` on its
+/// own arms). Same shutdown path either way — SIGTERM is the signal
+/// production daemons actually receive.
+#[cfg(unix)]
+async fn shutdown_signal() {
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = sigterm() => {}
+    }
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() {
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 /// Pure glue: stamp a parsed public-WS books5 update into the shared market cache
@@ -222,6 +399,24 @@ mod tests {
         let options = DaemonOptions::default();
 
         assert!(options.max_runtime.is_none());
+    }
+
+    #[test]
+    fn should_run_reconcile_when_interval_elapsed() {
+        assert!(should_run_reconcile(10_000, 0, 10));
+        assert!(!should_run_reconcile(9_999, 0, 10));
+    }
+
+    #[test]
+    fn daemon_allows_bounded_runtime_for_tests() {
+        let options = DaemonOptions {
+            max_runtime: Some(std::time::Duration::from_millis(5)),
+        };
+
+        assert_eq!(
+            options.max_runtime.unwrap(),
+            std::time::Duration::from_millis(5)
+        );
     }
 
     #[tokio::test]
