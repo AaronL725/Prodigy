@@ -39,13 +39,45 @@ fn parse_args_and_config() -> Result<ParsedExecutorArgs> {
     parse_args_from(env::args())
 }
 
+// Production entry point for arg parsing. Loads the `.env.local` file, overlays
+// real process env vars (real env wins over the file, matching prior behavior),
+// then delegates to the pure `parse_args_from_env`. Kept as a thin wrapper so
+// the actual CLI parsing can be unit-tested with an injected env map and no
+// filesystem/secret dependency.
 fn parse_args_from<I, S>(args: I) -> Result<ParsedExecutorArgs>
 where
     I: IntoIterator<Item = S>,
     S: Into<String>,
 {
+    let mut env_file = load_env_file(&find_env_local())?;
+    for key in [
+        "BITGET_DEMO_API_KEY",
+        "BITGET_DEMO_API_SECRET",
+        "BITGET_DEMO_SECRET_KEY",
+        "BITGET_DEMO_API_PASSPHRASE",
+        "BITGET_DEMO_PASSPHRASE",
+        "TELEGRAM_BOT_TOKEN",
+        "TELEGRAM_CHAT_ID",
+    ] {
+        if let Ok(value) = env::var(key) {
+            env_file.insert(key.to_string(), value);
+        }
+    }
+    parse_args_from_env(args, &env_file)
+}
+
+// Pure CLI parsing + secret resolution against an injected env map. Reads NO
+// filesystem and NO real process env — everything comes from `env_file`. This
+// makes the parse-mode unit tests hermetic.
+fn parse_args_from_env<I, S>(
+    args: I,
+    env_file: &std::collections::HashMap<String, String>,
+) -> Result<ParsedExecutorArgs>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
     let mut cfg = ExecutorConfig::demo_for_tests();
-    let env_file = load_env_file(&find_env_local())?;
 
     let mut run_mode = RunMode::Once;
     let mut max_runtime_ms: Option<u64> = None;
@@ -93,20 +125,20 @@ where
     }
 
     cfg.secrets = DemoSecrets {
-        api_key: read_secret(&["BITGET_DEMO_API_KEY"], &env_file)?,
+        api_key: read_secret(&["BITGET_DEMO_API_KEY"], env_file)?,
         // ponytail: .env.local ships two naming conventions; accept either so the
         // demo creds load regardless of which key the operator set.
         api_secret: read_secret(
             &["BITGET_DEMO_API_SECRET", "BITGET_DEMO_SECRET_KEY"],
-            &env_file,
+            env_file,
         )?,
         passphrase: read_secret(
             &["BITGET_DEMO_API_PASSPHRASE", "BITGET_DEMO_PASSPHRASE"],
-            &env_file,
+            env_file,
         )?,
     };
-    cfg.telegram_bot_token = read_optional(&["TELEGRAM_BOT_TOKEN"], &env_file);
-    cfg.telegram_chat_id = read_optional(&["TELEGRAM_CHAT_ID"], &env_file);
+    cfg.telegram_bot_token = read_optional(&["TELEGRAM_BOT_TOKEN"], env_file);
+    cfg.telegram_chat_id = read_optional(&["TELEGRAM_CHAT_ID"], env_file);
     Ok(ParsedExecutorArgs {
         cfg,
         run_mode,
@@ -145,17 +177,28 @@ fn read_optional(
     env_file: &std::collections::HashMap<String, String>,
 ) -> Option<String> {
     keys.iter()
-        .filter_map(|k| env::var(k).ok().or_else(|| env_file.get(*k).cloned()))
+        .filter_map(|k| env_file.get(*k).cloned())
         .find(|v| !v.is_empty())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+
+    // Injected fake demo creds so the parse tests never touch `.env.local` or
+    // real machine secrets. These are obviously-fake test values.
+    fn fake_env() -> HashMap<String, String> {
+        let mut m = HashMap::new();
+        m.insert("BITGET_DEMO_API_KEY".into(), "test-key".into());
+        m.insert("BITGET_DEMO_API_SECRET".into(), "test-secret".into());
+        m.insert("BITGET_DEMO_API_PASSPHRASE".into(), "test-pass".into());
+        m
+    }
 
     #[test]
     fn parses_once_mode_by_default() {
-        let parsed = parse_args_from(["prodigy-executor"]).unwrap();
+        let parsed = parse_args_from_env(["prodigy-executor"], &fake_env()).unwrap();
 
         assert_eq!(parsed.run_mode, RunMode::Once);
         assert_eq!(
@@ -166,12 +209,15 @@ mod tests {
 
     #[test]
     fn parses_daemon_mode_and_db_path() {
-        let parsed = parse_args_from([
-            "prodigy-executor",
-            "--daemon",
-            "--db",
-            "/tmp/prodigy-test.sqlite",
-        ])
+        let parsed = parse_args_from_env(
+            [
+                "prodigy-executor",
+                "--daemon",
+                "--db",
+                "/tmp/prodigy-test.sqlite",
+            ],
+            &fake_env(),
+        )
         .unwrap();
 
         assert_eq!(parsed.run_mode, RunMode::Daemon);
@@ -183,7 +229,8 @@ mod tests {
 
     #[test]
     fn rejects_once_and_daemon_together() {
-        let err = parse_args_from(["prodigy-executor", "--once", "--daemon"]).unwrap_err();
+        let err = parse_args_from_env(["prodigy-executor", "--once", "--daemon"], &HashMap::new())
+            .unwrap_err();
 
         assert!(err
             .to_string()
@@ -192,8 +239,11 @@ mod tests {
 
     #[test]
     fn parses_bounded_daemon_runtime_for_tests() {
-        let parsed =
-            parse_args_from(["prodigy-executor", "--daemon", "--max-runtime-ms", "1500"]).unwrap();
+        let parsed = parse_args_from_env(
+            ["prodigy-executor", "--daemon", "--max-runtime-ms", "1500"],
+            &fake_env(),
+        )
+        .unwrap();
 
         assert_eq!(parsed.run_mode, RunMode::Daemon);
         assert_eq!(parsed.max_runtime_ms, Some(1500));
@@ -201,7 +251,8 @@ mod tests {
 
     #[test]
     fn rejects_live_mode_before_execution() {
-        let err = parse_args_from(["prodigy-executor", "--mode", "live"]).unwrap_err();
+        let err = parse_args_from_env(["prodigy-executor", "--mode", "live"], &HashMap::new())
+            .unwrap_err();
 
         assert!(err.to_string().contains("only supports --mode demo"));
     }
