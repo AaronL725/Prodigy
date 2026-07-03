@@ -1,19 +1,9 @@
 use std::collections::HashSet;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InterventionKind {
-    Open,
-    Add,
-    Reduce,
-    Close,
-    Cancel,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExchangeIntervention {
     pub symbol: String,
     pub matched_local_client_oid: bool,
-    pub kind: InterventionKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,12 +11,6 @@ pub enum ManualOverrideDecision {
     Entered(String),
     Cleared(String),
     NoChange,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ManualRiskAction {
-    DoNothing,
-    AllowEmergencyReduce,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -74,32 +58,6 @@ pub fn maybe_clear_manual_override(
     ManualOverrideDecision::NoChange
 }
 
-pub fn risk_action_for_manual_position(
-    manual_notional: f64,
-    normal_cap: f64,
-    margin_danger: bool,
-) -> ManualRiskAction {
-    if margin_danger {
-        return ManualRiskAction::AllowEmergencyReduce;
-    }
-    let _ = (manual_notional, normal_cap);
-    ManualRiskAction::DoNothing
-}
-
-pub fn classify_external_status(
-    kind: InterventionKind,
-    was_system_owned: bool,
-) -> Option<&'static str> {
-    if !was_system_owned {
-        return None;
-    }
-    match kind {
-        InterventionKind::Cancel => Some("externally_cancelled"),
-        InterventionKind::Close | InterventionKind::Reduce => Some("externally_closed"),
-        InterventionKind::Open | InterventionKind::Add => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -110,7 +68,6 @@ mod tests {
         let event = ExchangeIntervention {
             symbol: "ETH/USDT:USDT".to_string(),
             matched_local_client_oid: false,
-            kind: InterventionKind::Open,
         };
 
         let decision = apply_exchange_intervention(&mut state, event);
@@ -128,7 +85,6 @@ mod tests {
         let event = ExchangeIntervention {
             symbol: "ETH/USDT:USDT".to_string(),
             matched_local_client_oid: true,
-            kind: InterventionKind::Open,
         };
 
         let decision = apply_exchange_intervention(&mut state, event);
@@ -153,35 +109,5 @@ mod tests {
             ManualOverrideDecision::Cleared("ETH/USDT:USDT".to_string())
         );
         assert!(!state.is_blocked_for_open("ETH/USDT:USDT"));
-    }
-
-    #[test]
-    fn cap_breach_alone_does_not_force_reduce_manual_position() {
-        let action = risk_action_for_manual_position(20_000.0, 5_000.0, false);
-
-        assert_eq!(action, ManualRiskAction::DoNothing);
-    }
-
-    #[test]
-    fn margin_danger_can_force_reduce_manual_position() {
-        let action = risk_action_for_manual_position(20_000.0, 5_000.0, true);
-
-        assert_eq!(action, ManualRiskAction::AllowEmergencyReduce);
-    }
-
-    #[test]
-    fn system_order_manual_cancel_is_external_cancel() {
-        assert_eq!(
-            classify_external_status(InterventionKind::Cancel, true),
-            Some("externally_cancelled")
-        );
-    }
-
-    #[test]
-    fn system_position_manual_close_is_external_close() {
-        assert_eq!(
-            classify_external_status(InterventionKind::Close, true),
-            Some("externally_closed")
-        );
     }
 }

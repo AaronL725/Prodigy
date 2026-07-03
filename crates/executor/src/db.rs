@@ -97,18 +97,6 @@ pub fn upsert_order(conn: &Connection, order: &OrderRecord) -> Result<()> {
     Ok(())
 }
 
-pub fn reject_intent(conn: &Connection, intent_id: &str, reason: &str) -> Result<()> {
-    conn.execute(
-        "update trade_intents
-         set status = 'rejected',
-             processed_at = datetime('now'),
-             error = ?
-         where intent_id = ? and status = 'pending'",
-        params![reason, intent_id],
-    )?;
-    Ok(())
-}
-
 /// Remove the local positions row for a symbol. Called by reconcile when the
 /// exchange no longer lists a position for it (manual full-close): exchange state
 /// wins, so the local row must not keep reporting a position Bitget no longer
@@ -166,21 +154,6 @@ pub fn local_order_client_oids(conn: &Connection) -> Result<std::collections::Ha
     Ok(set)
 }
 
-/// intent_ids of orders the executor has placed (filled or submitted). Used by
-/// reconcile to tell a system position (we have a local order for this symbol)
-/// from an imported/manual one. This is more reliable than source_intent_id on
-/// the position row because exchange all-position doesn't carry our intent_id.
-pub fn local_order_intent_ids(conn: &Connection) -> Result<std::collections::HashSet<String>> {
-    let mut stmt =
-        conn.prepare("select distinct intent_id from orders where intent_id is not null")?;
-    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-    let mut set = std::collections::HashSet::new();
-    for row in rows {
-        set.insert(row?);
-    }
-    Ok(set)
-}
-
 /// Signed net base the system expects to hold for a symbol, summed across all
 /// SYSTEM orders with any filled base, by direction (buy = +, sell = −): a filled
 /// open-long adds, a filled close-long (a sell) subtracts. Reconcile compares this
@@ -188,17 +161,20 @@ pub fn local_order_intent_ids(conn: &Connection) -> Result<std::collections::Has
 /// reducing, or closing a system-owned position. Returns (signed_base, side):
 /// e.g. +0.10/"long", -0.10/"short", or 0.0/"" when the system holds nothing.
 ///
-/// Counts by filled_size, NOT status: a PARTIAL fill keeps the order 'submitted'
+/// Counts by filled_size, not terminal fill status: a PARTIAL fill keeps the order 'submitted'
 /// (set_order_fill_state / set_order_filled_from_detail only flip to 'filled' at
 /// the full ordered size) but its filled base is real position the system holds.
 /// Keying on status='filled' would zero-out partials and mis-classify the
 /// position as imported. Only counts orders WE placed (intent_id is not null): a
 /// manual/imported order repaired into the orders table has no intent_id and must
-/// not pollute the system's expected position.
+/// not pollute the system's expected position. Orders marked externally_closed are
+/// historical fills for a position the client already closed outside the executor,
+/// so they no longer contribute to current system exposure.
 pub fn system_net_base_for_symbol(conn: &Connection, symbol: &str) -> Result<(f64, &'static str)> {
     let mut stmt = conn.prepare(
         "select side, filled_size from orders
-         where symbol = ? and filled_size > 0 and intent_id is not null",
+         where symbol = ? and filled_size > 0 and intent_id is not null
+           and status != 'externally_closed'",
     )?;
     let rows = stmt.query_map(params![symbol], |row| {
         let side: String = row.get(0)?;
@@ -348,14 +324,13 @@ pub fn sync_order_fill_state(conn: &Connection, order_id: &str) -> Result<()> {
 }
 
 /// Retire the symbol's filled system orders (intent_id set, filled_size > 0) to
-/// 'externally_closed' AND zero their filled_size, after a client manually closed
-/// the whole position in the Bitget UI. system_net_base_for_symbol counts by
-/// filled_size (not status), so zeroing filled_size is what returns the net base
-/// to 0 — preventing the manual-close drift from re-firing on every subsequent
-/// pass (flapping). Returns the number of rows changed.
+/// 'externally_closed' after a client manually closed the whole position in the
+/// Bitget UI. The historical filled_size stays intact for audit; current exposure
+/// is zero because system_net_base_for_symbol excludes externally_closed rows.
+/// Returns the number of rows changed.
 pub fn mark_system_orders_externally_closed(conn: &Connection, symbol: &str) -> Result<usize> {
     let changed = conn.execute(
-        "update orders set status = 'externally_closed', filled_size = 0, updated_at = datetime('now')
+        "update orders set status = 'externally_closed', updated_at = datetime('now')
          where symbol = ? and intent_id is not null and filled_size > 0",
         params![symbol],
     )?;
@@ -1018,18 +993,22 @@ mod tests {
         let changed = mark_system_orders_externally_closed(&conn, "ETH/USDT:USDT").unwrap();
         assert!(changed >= 1, "expected at least one system order retired");
 
-        // Net base is now 0 (externally_closed no longer counts as a live fill).
+        // Net base is now 0 because externally_closed no longer counts as current
+        // exposure, but historical filled_size remains intact for audit.
         let (net_after, side_after) = system_net_base_for_symbol(&conn, "ETH/USDT:USDT").unwrap();
         assert!(
             net_after.abs() < 1e-9 && side_after.is_empty(),
             "system net must be flat after external close, got {net_after}/{side_after}"
         );
-        let status: String = conn
-            .query_row("select status from orders where order_id = 'o1'", [], |r| {
-                r.get(0)
-            })
+        let (status, filled_size): (String, f64) = conn
+            .query_row(
+                "select status, filled_size from orders where order_id = 'o1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
             .unwrap();
         assert_eq!(status, "externally_closed");
+        assert!((filled_size - 0.05).abs() < 1e-9);
     }
 
     #[test]

@@ -83,16 +83,32 @@ async fn ensure_one_way_mode(rest: &BitgetRestClient, cfg: &ExecutorConfig) {
 
 /// Read the exchange position size (total) for the configured symbol, or 0.0.
 async fn position_size(rest: &BitgetRestClient, cfg: &ExecutorConfig) -> f64 {
-    let positions = rest
-        .get(
-            "/api/v2/mix/position/all-position",
-            &[
-                ("productType", cfg.product_type.clone()),
-                ("marginCoin", cfg.margin_coin.clone()),
-            ],
-        )
-        .await
-        .unwrap();
+    let mut positions = None;
+    let mut last_err = None;
+    for _ in 0..5 {
+        match rest
+            .get(
+                "/api/v2/mix/position/all-position",
+                &[
+                    ("productType", cfg.product_type.clone()),
+                    ("marginCoin", cfg.margin_coin.clone()),
+                ],
+            )
+            .await
+        {
+            Ok(value) => {
+                positions = Some(value);
+                break;
+            }
+            Err(err) => {
+                last_err = Some(err);
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+        }
+    }
+    let positions = positions.unwrap_or_else(|| {
+        panic!("position query failed after retries: {last_err:?}");
+    });
     positions
         .get("data")
         .and_then(|d| d.as_array())

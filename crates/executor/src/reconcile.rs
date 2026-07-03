@@ -4,32 +4,15 @@ use std::collections::HashSet;
 
 use crate::bitget::BitgetRestClient;
 use crate::db;
-use crate::manual_override::{apply_exchange_intervention, ExchangeIntervention, InterventionKind};
+use crate::manual_override::{apply_exchange_intervention, ExchangeIntervention};
 use crate::notify;
 use crate::types::{OrderRecord, PositionRecord};
 
-pub fn classify_position(
-    mut exchange_position: PositionRecord,
-    local_order_intents: &HashSet<String>,
-    now: &str,
-) -> PositionRecord {
-    // System-owned if we can trace it to a local order/intent. The exchange
-    // all-position response doesn't carry our source_intent_id, so reconcile
-    // sets it before calling this (from the local orders table). If it's set
-    // and matches a local intent, it's system; otherwise imported.
-    if exchange_position
-        .source_intent_id
-        .as_ref()
-        .map(|id| local_order_intents.contains(id))
-        .unwrap_or(false)
-    {
-        exchange_position.ownership = "system".to_string();
-    } else {
-        exchange_position.ownership = "imported".to_string();
-        exchange_position.adopted_at = Some(now.to_string());
-        exchange_position.opened_at = Some(now.to_string());
-    }
-    exchange_position
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InterventionKind {
+    Add,
+    Reduce,
+    Close,
 }
 
 /// Classify a single exchange position as system vs imported, tracing ownership
@@ -80,7 +63,8 @@ pub fn system_ownership_intent(
     let intent_id: Option<String> = conn
         .query_row(
             "select intent_id from orders
-             where symbol = ? and intent_id is not null and action = 'open'
+             where symbol = ? and intent_id is not null and action = 'open' and filled_size > 0
+               and status != 'externally_closed'
              order by updated_at desc limit 1",
             params![symbol],
             |row| row.get(0),
@@ -256,11 +240,10 @@ pub async fn reconcile_once(
     telegram_token: Option<&str>,
     telegram_chat: Option<&str>,
 ) -> Result<()> {
-    // ponytail: WS is the fast path; this REST pass repairs anything it missed.
-    // Exchange state wins on conflict (spec). We INSERT missing orders/positions
-    // and refresh position fields from exchange truth; we do not delete local rows
-    // the exchange no longer lists (a filled/cancelled order's terminal state is
-    // already persisted by the execution loop).
+    // ponytail: M3 has no long-running WS cache; this REST pass is the
+    // exchange-truth repair path. Exchange state wins on conflict: insert missing
+    // rows, refresh positions, and retire/clear local state only in the explicit
+    // manual-intervention cases below.
     let local_oids = db::local_order_client_oids(conn)?;
     let mut repaired_orders = 0u32;
     let mut repaired_positions = 0u32;
@@ -314,7 +297,6 @@ pub async fn reconcile_once(
         // intervention. Enter per-symbol override (persisted) so auto-open pauses.
         // Skipped in test-reset mode (system cleanup, not user intervention).
         if detect_override && !override_active {
-            let kind = intervention_kind_for_side(&str_field(&row, "side"));
             let mut state = override_state_from(override_active);
             if let crate::manual_override::ManualOverrideDecision::Entered(sym) =
                 apply_exchange_intervention(
@@ -322,7 +304,6 @@ pub async fn reconcile_once(
                     ExchangeIntervention {
                         symbol: symbol.clone(),
                         matched_local_client_oid: false,
-                        kind,
                     },
                 )
             {
@@ -801,15 +782,6 @@ fn str_field(value: &serde_json::Value, key: &str) -> String {
         .to_string()
 }
 
-/// Map an exchange order side to a manual-intervention kind for the override gate.
-fn intervention_kind_for_side(side: &str) -> InterventionKind {
-    match side {
-        "buy" => InterventionKind::Open,
-        "sell" => InterventionKind::Close,
-        _ => InterventionKind::Open,
-    }
-}
-
 /// Build the in-memory override state from the persisted flag. The detection
 /// functions need a ManualOverrideState; we seed it from executor_state so the
 /// "already blocked → NoChange" path holds across restarts.
@@ -828,7 +800,7 @@ mod tests {
 
     #[test]
     fn exchange_position_without_local_order_is_imported() {
-        let local_order_intents = std::collections::HashSet::new();
+        let conn = exec_db();
         let exchange = PositionRecord {
             symbol: "ETH/USDT:USDT".to_string(),
             side: "long".to_string(),
@@ -842,7 +814,7 @@ mod tests {
             raw_json: "{}".to_string(),
         };
 
-        let adopted = classify_position(exchange, &local_order_intents, "2026-07-01T00:00:00Z");
+        let adopted = classify_exchange_position(&conn, exchange, "2026-07-01T00:00:00Z").unwrap();
 
         assert_eq!(adopted.ownership, "imported");
         assert_eq!(adopted.adopted_at.as_deref(), Some("2026-07-01T00:00:00Z"));
@@ -1159,6 +1131,22 @@ mod tests {
     }
 
     #[test]
+    fn ownership_source_ignores_newer_unfilled_open_order() {
+        let conn = exec_db();
+        insert_intent(&conn, "i-filled", "open");
+        insert_intent(&conn, "i-empty", "open");
+        insert_order(&conn, "o1", "i-filled", "buy", "open", "filled", 0.10);
+        insert_order(&conn, "o2", "i-empty", "buy", "open", "submitted", 0.0);
+
+        assert_eq!(
+            system_ownership_intent(&conn, "ETH/USDT:USDT")
+                .unwrap()
+                .as_deref(),
+            Some("i-filled")
+        );
+    }
+
+    #[test]
     fn missing_pending_order_second_confirmed_via_detail() {
         // D2: a 'submitted' system order missing from the exchange pending list is
         // NOT assumed cancelled — the fillList can lag/truncate, so a just-filled
@@ -1283,32 +1271,5 @@ mod tests {
             classify_position_drift(0.10, 0.02, "long", "short"),
             Some(InterventionKind::Close)
         );
-    }
-
-    #[test]
-    fn exchange_position_matching_local_intent_is_system() {
-        // Positive branch: an exchange position whose source_intent_id is in the
-        // local set is system-owned (NOT imported). Catches a regression toward
-        // unwrap_or(true)/is_some() that would silently reclassify everything.
-        let mut local_order_intents = std::collections::HashSet::new();
-        local_order_intents.insert("intent-7".to_string());
-        let exchange = PositionRecord {
-            symbol: "ETH/USDT:USDT".to_string(),
-            side: "long".to_string(),
-            notional: 1000.0,
-            entry_price: 3000.0,
-            unrealized_pnl: 0.0,
-            ownership: "system".to_string(),
-            opened_at: Some("2026-06-01T00:00:00Z".to_string()),
-            adopted_at: None,
-            source_intent_id: Some("intent-7".to_string()),
-            raw_json: "{}".to_string(),
-        };
-
-        let adopted = classify_position(exchange, &local_order_intents, "2026-07-01T00:00:00Z");
-
-        assert_eq!(adopted.ownership, "system");
-        // system-owned keeps its prior opened_at; adoption timestamp not overwritten.
-        assert_eq!(adopted.adopted_at, None);
     }
 }
