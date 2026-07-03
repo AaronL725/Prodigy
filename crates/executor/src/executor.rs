@@ -16,16 +16,24 @@ use crate::types::{MarketUpdate, OrderRecord, TradeIntent};
 #[derive(Debug, Clone, Default)]
 pub struct MarketCache {
     latest: Option<MarketUpdate>,
+    local_received_at_ms: Option<i64>,
 }
 
 impl MarketCache {
     pub fn update(&mut self, update: MarketUpdate) {
+        let now_ms = crate::bitget::now_ms().parse::<i64>().unwrap_or(0);
+        self.update_at(update, now_ms);
+    }
+
+    pub fn update_at(&mut self, update: MarketUpdate, local_received_at_ms: i64) {
         self.latest = Some(update);
+        self.local_received_at_ms = Some(local_received_at_ms);
     }
 
     pub fn latest_fresh(&self, now_ms: i64, stale_after_secs: u64) -> Option<MarketUpdate> {
         let update = self.latest.clone()?;
-        let age_ms = now_ms.saturating_sub(update.exchange_ts_ms);
+        let received_at = self.local_received_at_ms?;
+        let age_ms = now_ms.saturating_sub(received_at);
         if age_ms <= (stale_after_secs as i64) * 1000 {
             Some(update)
         } else {
@@ -1427,20 +1435,30 @@ mod tests {
     }
 
     #[test]
-    fn stale_market_cache_returns_none() {
+    fn market_cache_uses_local_received_time_for_freshness() {
         let mut cache = MarketCache::default();
-        cache.update(MarketUpdate {
-            symbol: "ETHUSDT".to_string(),
-            best_bid: 3000.0,
-            best_ask: 3000.5,
-            exchange_ts_ms: 1,
-        });
+        cache.update_at(
+            MarketUpdate {
+                symbol: "ETHUSDT".to_string(),
+                best_bid: 100.0,
+                best_ask: 101.0,
+                exchange_ts_ms: 10,
+            },
+            1_000,
+        );
 
-        // units are ms: stale_after_secs(3) -> 3000ms threshold.
-        // age 3999ms (now 4000 - ts 1) exceeds it -> stale -> None.
-        assert!(cache.latest_fresh(4_000, 3).is_none());
-        // age 999ms (now 1000 - ts 1) is under it -> fresh -> Some.
-        assert!(cache.latest_fresh(1_000, 3).is_some());
+        // Freshness is judged by LOCAL-received time, not exchange time: the WS
+        // loop stamps when it receives the message locally, so the staleness
+        // window (stale_after_secs=3 -> 3000ms) measures now - local_received.
+        assert!(cache.latest_fresh(3_999, 3).is_some());
+        assert!(cache.latest_fresh(4_001, 3).is_none());
+    }
+
+    #[test]
+    fn market_cache_rejects_missing_snapshot() {
+        let cache = MarketCache::default();
+
+        assert!(cache.latest_fresh(1_000, 3).is_none());
     }
 
     #[test]
