@@ -60,7 +60,7 @@ The M3 fast path is:
 3. Rust polls pending SQLite intents, one run through.
 4. For each intent the risk gate runs on a freshly-fetched REST account snapshot and the seeded market snapshot; market data older than `stale_market_data_secs` blocks new openings.
 5. REST sends place/cancel requests through the local state machine (maker → retry maker → taker); the market snapshot is refreshed from REST before the maker retry and the taker fallback so neither places on a stale price.
-6. The local state machine records the order lifecycle, including fills (queried from REST order-detail for real price/fee/trade_id).
+6. The local state machine records the order lifecycle and filled size; per-trade fills are repaired from Bitget's REST fillList.
 7. REST reconciliation repairs any local state the one-shot processing missed.
 
 SQLite is the durable command queue and audit log. The in-memory market snapshot is a short-lived freshness check, not a continuously-maintained WS cache.
