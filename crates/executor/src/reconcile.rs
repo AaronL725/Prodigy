@@ -310,6 +310,49 @@ pub async fn reconcile_once(
         repaired_orders += 1;
     }
 
+    // Fills: repair any exchange fill for one of our orders we haven't recorded
+    // yet (the execution loop records fills as it polls, but a crash/restart or a
+    // missed WS event can leave a fill un-persisted). Source = the exchange
+    // fillList (GET /api/v2/mix/order/fills); join on orderId (the fillList has
+    // no clientOid), dedup by trade_id, insert-or-ignore. This runs BEFORE the
+    // position/drift loop below so a repaired fill's order sync is visible to
+    // same-pass drift detection (else the system net still reads 0 and drift
+    // mis-fires manual override on our own already-filled position).
+    let existing_trade_ids = db::local_fill_trade_ids(conn)?;
+    let local_order_ids = db::local_order_id_to_client_oid(conn)?;
+    let local_order_id_set: HashSet<String> = local_order_ids.keys().cloned().collect();
+    let mut repaired_fills = 0u32;
+    let fills = rest
+        .get(
+            "/api/v2/mix/order/fills",
+            &[
+                ("productType", rest.product_type().to_string()),
+                ("symbol", rest.bitget_symbol().to_string()),
+                ("limit", "50".to_string()),
+            ],
+        )
+        .await?;
+    for row in fills
+        .get("data")
+        .and_then(|d| d.get("fillList"))
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+    {
+        if let Some(fill) = fill_to_repair(&row, &local_order_id_set, &existing_trade_ids, |oid| {
+            local_order_ids.get(oid).cloned()
+        }) {
+            let order_id = fill.order_id.clone();
+            db::insert_fill(conn, &fill)?;
+            // Sync the parent order's status/filled_size so system_net_base sees
+            // the repaired fill. Without this a crash-then-repair leaves the order
+            // 'submitted'/filled_size=0, the system net stays 0, and reconcile
+            // mis-fires manual-override drift on our own (already-filled) position.
+            db::sync_order_fill_state(conn, &order_id)?;
+            repaired_fills += 1;
+        }
+    }
+
     // Positions: classify (system vs imported) and upsert exchange truth.
     let positions = rest
         .get(
@@ -426,40 +469,6 @@ pub async fn reconcile_once(
                 .await
                 .ok();
             }
-        }
-    }
-
-    // Fills: repair any exchange fill for one of our orders we haven't recorded
-    // yet (the execution loop records fills as it polls, but a crash/restart or a
-    // missed WS event can leave a fill un-persisted). Source = the exchange
-    // fillList (GET /api/v2/mix/order/fills); join on orderId (the fillList has
-    // no clientOid), dedup by trade_id, insert-or-ignore.
-    let existing_trade_ids = db::local_fill_trade_ids(conn)?;
-    let local_order_ids = db::local_order_id_to_client_oid(conn)?;
-    let local_order_id_set: HashSet<String> = local_order_ids.keys().cloned().collect();
-    let mut repaired_fills = 0u32;
-    let fills = rest
-        .get(
-            "/api/v2/mix/order/fills",
-            &[
-                ("productType", rest.product_type().to_string()),
-                ("symbol", rest.bitget_symbol().to_string()),
-                ("limit", "50".to_string()),
-            ],
-        )
-        .await?;
-    for row in fills
-        .get("data")
-        .and_then(|d| d.get("fillList"))
-        .and_then(serde_json::Value::as_array)
-        .cloned()
-        .unwrap_or_default()
-    {
-        if let Some(fill) = fill_to_repair(&row, &local_order_id_set, &existing_trade_ids, |oid| {
-            local_order_ids.get(oid).cloned()
-        }) {
-            db::insert_fill(conn, &fill)?;
-            repaired_fills += 1;
         }
     }
 

@@ -239,6 +239,49 @@ pub fn local_order_id_to_client_oid(
     Ok(map)
 }
 
+/// Sync an order's status/filled_size from the fills recorded against it. Called
+/// after reconcile inserts a missing fill so the order row reflects exchange
+/// truth: filled_size = sum of its fills' base size; status flips to 'filled'
+/// once that sum reaches the ordered size (minus a dust epsilon). A partial sum
+/// updates filled_size but leaves the status untouched (still working). Without
+/// this, a crash-then-repair leaves the order 'submitted'/filled_size=0, so the
+/// system net base stays 0 and reconcile mis-fires manual-override drift.
+pub fn sync_order_fill_state(conn: &Connection, order_id: &str) -> Result<()> {
+    const DUST_BASE: f64 = 1e-6;
+    let filled: f64 = conn
+        .query_row(
+            "select coalesce(sum(size), 0) from fills where order_id = ?",
+            params![order_id],
+            |row| row.get(0),
+        )
+        .unwrap_or(0.0);
+    if filled <= 0.0 {
+        return Ok(());
+    }
+    let ordered: f64 = conn
+        .query_row(
+            "select coalesce(size, 0) from orders where order_id = ?",
+            params![order_id],
+            |row| row.get(0),
+        )
+        .unwrap_or(0.0);
+    // Reached the ordered size (within dust) → terminal fill; else partial.
+    if ordered > 0.0 && filled + DUST_BASE >= ordered {
+        conn.execute(
+            "update orders set status = 'filled', filled_size = ?, updated_at = datetime('now')
+             where order_id = ?",
+            params![filled, order_id],
+        )?;
+    } else {
+        conn.execute(
+            "update orders set filled_size = ?, updated_at = datetime('now')
+             where order_id = ?",
+            params![filled, order_id],
+        )?;
+    }
+    Ok(())
+}
+
 /// Insert a fill record. Idempotent by fill_id (PK) via insert-or-ignore.
 pub fn insert_fill(conn: &Connection, fill: &FillRecord) -> Result<()> {
     conn.execute(
@@ -584,5 +627,111 @@ mod tests {
             net.abs() < 1e-9 && side.is_empty(),
             "manual order (no intent_id) must not count toward system net, got {net}/{side}"
         );
+    }
+
+    #[test]
+    fn sync_order_fill_state_marks_filled_and_sums_base() {
+        // After reconcile inserts a missing fill, the parent order must be updated
+        // so system_net_base sees it: a 'submitted' order whose fills now sum to
+        // its ordered size flips to 'filled' with filled_size = summed base. Before
+        // this sync, a crash-then-repair leaves the order 'submitted'/filled_size=0,
+        // so the system net stays 0 and reconcile mis-fires manual-override drift.
+        let conn = memory_db();
+        conn.execute(
+            "insert into trade_intents (intent_id, created_at, symbol, side, action,
+               target_notional, max_order_notional, status, source)
+             values ('i1','2026-07-01T00:00:00Z','ETH/USDT:USDT','long','open',100,100,'accepted','t')",
+            [],
+        )
+        .unwrap();
+        // Order was placed (submitted) but its fill was never recorded locally.
+        conn.execute(
+            "insert into orders (order_id, client_oid, intent_id, symbol, side, action,
+               order_type, status, price, size, filled_size, created_at, updated_at)
+             values ('o1','o1','i1','ETH/USDT:USDT','buy','open','limit','submitted',
+               3000, 0.05, 0.0, '2026-07-01T00:00:00Z', '2026-07-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        // system net is 0 (order still submitted) — the bug reconcile must fix.
+        let (net_before, _) = system_net_base_for_symbol(&conn, "ETH/USDT:USDT").unwrap();
+        assert!(net_before.abs() < 1e-9);
+
+        // Reconcile inserts the missing fill (0.05), then syncs the order.
+        let fill = FillRecord {
+            fill_id: "f1".to_string(),
+            order_id: "o1".to_string(),
+            trade_id: Some("t1".to_string()),
+            client_oid: Some("o1".to_string()),
+            symbol: "ETH/USDT:USDT".to_string(),
+            side: "buy".to_string(),
+            price: 3000.0,
+            size: 0.05,
+            fee: 0.03,
+            created_at: "2026-07-01T00:00:00Z".to_string(),
+            raw_json: "{}".to_string(),
+        };
+        insert_fill(&conn, &fill).unwrap();
+        sync_order_fill_state(&conn, "o1").unwrap();
+
+        let (status, filled): (String, f64) = conn
+            .query_row(
+                "select status, filled_size from orders where order_id = 'o1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "filled");
+        assert!((filled - 0.05).abs() < 1e-9);
+        // system net now reflects the repaired fill.
+        let (net_after, side) = system_net_base_for_symbol(&conn, "ETH/USDT:USDT").unwrap();
+        assert!((net_after - 0.05).abs() < 1e-9 && side == "long");
+    }
+
+    #[test]
+    fn sync_order_fill_state_leaves_partial_as_submitted() {
+        // A partial repair (fills sum below ordered size) must update filled_size
+        // but NOT prematurely mark the order 'filled'.
+        let conn = memory_db();
+        conn.execute(
+            "insert into trade_intents (intent_id, created_at, symbol, side, action,
+               target_notional, max_order_notional, status, source)
+             values ('i1','2026-07-01T00:00:00Z','ETH/USDT:USDT','long','open',100,100,'accepted','t')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "insert into orders (order_id, client_oid, intent_id, symbol, side, action,
+               order_type, status, price, size, filled_size, created_at, updated_at)
+             values ('o1','o1','i1','ETH/USDT:USDT','buy','open','limit','submitted',
+               3000, 0.05, 0.0, '2026-07-01T00:00:00Z', '2026-07-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        let fill = FillRecord {
+            fill_id: "f1".to_string(),
+            order_id: "o1".to_string(),
+            trade_id: Some("t1".to_string()),
+            client_oid: Some("o1".to_string()),
+            symbol: "ETH/USDT:USDT".to_string(),
+            side: "buy".to_string(),
+            price: 3000.0,
+            size: 0.02,
+            fee: 0.0,
+            created_at: "2026-07-01T00:00:00Z".to_string(),
+            raw_json: "{}".to_string(),
+        };
+        insert_fill(&conn, &fill).unwrap();
+        sync_order_fill_state(&conn, "o1").unwrap();
+
+        let (status, filled): (String, f64) = conn
+            .query_row(
+                "select status, filled_size from orders where order_id = 'o1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "submitted");
+        assert!((filled - 0.02).abs() < 1e-9);
     }
 }
