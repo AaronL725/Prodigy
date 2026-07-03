@@ -47,8 +47,47 @@ impl MarketCache {
 /// up to 15s while the cache's freshness window is 3s, so re-placing on the
 /// pre-timeout price would post a stale limit. None (stale or unavailable) must
 /// FAIL the intent rather than place on a price we can't trust.
-fn require_fresh_market(market: Option<MarketUpdate>) -> Result<MarketUpdate> {
+pub(crate) fn require_fresh_market(market: Option<MarketUpdate>) -> Result<MarketUpdate> {
     market.ok_or_else(|| anyhow::anyhow!("market data is stale; cannot place on stale price"))
+}
+
+/// Process every pending intent in DB order using the same code path the
+/// one-shot `run_once_or_loop` uses. Extracted so the daemon (Task 7) can drive
+/// the loop on its own cadence without duplicating the per-intent wiring
+/// (account snapshot, equity row, freshness gate, process_one_intent, event).
+/// Behavior is identical to the prior inline loop; it returns the count only so
+/// a caller may log it.
+pub async fn process_pending_intents_once(
+    conn: &rusqlite::Connection,
+    cfg: &ExecutorConfig,
+    rest: &BitgetRestClient,
+    market_cache: &mut MarketCache,
+) -> Result<usize> {
+    let intents = db::pending_intents(conn)?;
+    let mut processed = 0usize;
+    for intent in intents {
+        // Fetch a FRESH account snapshot per intent. A run can carry multiple
+        // opening intents; if the first fills, its gross notional/equity have
+        // moved by the time the second is risk-checked. Sharing one snapshot
+        // across the loop would let a later intent pass the cap on stale equity
+        // or double-count the headroom the first fill already consumed.
+        let account = fetch_account_snapshot(rest).await?;
+        db::insert_equity_snapshot(
+            conn,
+            account.equity,
+            account.available_margin,
+            account.unrealized_pnl_24h,
+            0.0,
+        )?;
+        let now_ms = crate::bitget::now_ms().parse::<i64>().unwrap_or(0);
+        let market =
+            require_fresh_market(market_cache.latest_fresh(now_ms, cfg.stale_market_data_secs))?;
+        process_one_intent(conn, cfg, rest, intent.clone(), market, account, market_cache).await?;
+        db::write_event(conn, "info", "executor", "processed intent", "{}")?;
+        println!("processed {}", intent.intent_id);
+        processed += 1;
+    }
+    Ok(processed)
 }
 
 pub async fn run_once_or_loop(cfg: ExecutorConfig) -> Result<()> {
@@ -85,42 +124,12 @@ pub async fn run_once_or_loop(cfg: ExecutorConfig) -> Result<()> {
     )
     .await?;
 
-    let intents = db::pending_intents(&conn)?;
     // ponytail: seed the market cache once with a real ticker (not the WS stream
     // yet); latest_fresh per intent rejects openings when the cached price is
     // older than cfg.stale_market_data_secs.
     let mut market_cache = MarketCache::default();
     market_cache.update(fetch_market_snapshot(&cfg, &rest).await?);
-    for intent in intents {
-        // Fetch a FRESH account snapshot per intent. A run can carry multiple
-        // opening intents; if the first fills, its gross notional/equity have
-        // moved by the time the second is risk-checked. Sharing one snapshot
-        // across the loop would let a later intent pass the cap on stale equity
-        // or double-count the headroom the first fill already consumed.
-        let account = fetch_account_snapshot(&rest).await?;
-        db::insert_equity_snapshot(
-            &conn,
-            account.equity,
-            account.available_margin,
-            account.unrealized_pnl_24h,
-            0.0,
-        )?;
-        let now_ms = crate::bitget::now_ms().parse::<i64>().unwrap_or(0);
-        let market =
-            require_fresh_market(market_cache.latest_fresh(now_ms, cfg.stale_market_data_secs))?;
-        process_one_intent(
-            &conn,
-            &cfg,
-            &rest,
-            intent.clone(),
-            market,
-            account,
-            &mut market_cache,
-        )
-        .await?;
-        db::write_event(&conn, "info", "executor", "processed intent", "{}")?;
-        println!("processed {}", intent.intent_id);
-    }
+    process_pending_intents_once(&conn, &cfg, &rest, &mut market_cache).await?;
     Ok(())
 }
 
@@ -1490,6 +1499,17 @@ mod tests {
         };
         let got = require_fresh_market(Some(fresh.clone())).unwrap();
         assert_eq!(got.best_bid, fresh.best_bid);
+    }
+
+    #[test]
+    fn shared_market_requirement_rejects_stale_cache() {
+        // The daemon (Task 7) reuses this helper through the shared
+        // process_pending_intents_once path; a None (stale/unavailable) snapshot
+        // must surface the "market data is stale" diagnostic so the caller fails
+        // loudly instead of placing on a price it can't trust.
+        let err = require_fresh_market(None).unwrap_err();
+
+        assert!(err.to_string().contains("market data is stale"));
     }
 
     #[test]
