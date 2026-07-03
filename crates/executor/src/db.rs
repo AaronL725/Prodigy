@@ -248,6 +248,47 @@ pub fn local_order_id_to_client_oid(
     Ok(map)
 }
 
+/// Set an order's filled_size/status directly from the exchange order-detail's
+/// CUMULATIVE baseVolume (as observed by the caller), WITHOUT writing a fills row.
+/// Used by reconcile's missing-pending-order second-confirm: order detail's
+/// baseVolume is cumulative (not a single trade), so it must NOT be inserted into
+/// the per-trade fills ledger (that would double-count once the real fillList
+/// arrives and mask partials). The fills table stays the per-trade record from
+/// fillList repair; only orders.filled_size/status are synced here so
+/// system_net_base sees the position. Flips to 'filled' once filled reaches the
+/// ordered size (within dust); a partial keeps the order working (not 'filled').
+pub fn set_order_filled_from_detail(
+    conn: &Connection,
+    order_id: &str,
+    filled_size: f64,
+) -> Result<()> {
+    const DUST_BASE: f64 = 1e-6;
+    if filled_size <= 0.0 {
+        return Ok(());
+    }
+    let ordered: f64 = conn
+        .query_row(
+            "select coalesce(size, 0) from orders where order_id = ?",
+            params![order_id],
+            |row| row.get(0),
+        )
+        .unwrap_or(0.0);
+    if ordered > 0.0 && filled_size + DUST_BASE >= ordered {
+        conn.execute(
+            "update orders set status = 'filled', filled_size = ?, updated_at = datetime('now')
+             where order_id = ?",
+            params![filled_size, order_id],
+        )?;
+    } else {
+        conn.execute(
+            "update orders set filled_size = ?, updated_at = datetime('now')
+             where order_id = ?",
+            params![filled_size, order_id],
+        )?;
+    }
+    Ok(())
+}
+
 /// Sync an order's status/filled_size from the fills recorded against it. Called
 /// after reconcile inserts a missing fill so the order row reflects exchange
 /// truth: filled_size = sum of its fills' base size; status flips to 'filled'
@@ -961,5 +1002,94 @@ mod tests {
             )
             .unwrap();
         assert_eq!(after, 0, "local position row must be removed on full-close");
+    }
+
+    #[test]
+    fn set_order_filled_from_detail_updates_order_without_writing_a_fill() {
+        // E3: when reconcile second-confirms a missing-pending order via order
+        // detail, the detail's baseVolume is CUMULATIVE (not a single trade).
+        // Writing it as one fills row would pollute the ledger — sync_order_fill_state
+        // sums fills, so a later real partial+full would double-count. Instead set
+        // orders.filled_size/status directly from the cumulative base and leave the
+        // fills table untouched (it stays the per-trade record from fillList repair).
+        let conn = memory_db();
+        conn.execute(
+            "insert into trade_intents (intent_id, created_at, symbol, side, action,
+               target_notional, max_order_notional, status, source)
+             values ('i1','2026-07-01T00:00:00Z','ETH/USDT:USDT','long','open',100,100,'accepted','t')",
+            [],
+        )
+        .unwrap();
+        // A submitted system order, ordered 0.05, exchange detail says 0.05 filled.
+        conn.execute(
+            "insert into orders (order_id, client_oid, intent_id, symbol, side, action,
+               order_type, status, price, size, filled_size, created_at, updated_at)
+             values ('o1','c1','i1','ETH/USDT:USDT','buy','open','limit','submitted',
+               3000, 0.05, 0.0, '2026-07-01T00:00:00Z', '2026-07-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        set_order_filled_from_detail(&conn, "o1", 0.05).unwrap();
+
+        let (status, filled): (String, f64) = conn
+            .query_row(
+                "select status, filled_size from orders where order_id = 'o1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "filled");
+        assert!((filled - 0.05).abs() < 1e-9);
+        // CRITICAL: no fills row was fabricated from the cumulative detail.
+        let fills: i64 = conn
+            .query_row(
+                "select count(*) from fills where order_id = 'o1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            fills, 0,
+            "must not write a synthetic fill from cumulative detail"
+        );
+
+        // system_net_base still sees the filled order (it reads orders.filled_size).
+        let (net, side) = system_net_base_for_symbol(&conn, "ETH/USDT:USDT").unwrap();
+        assert!((net - 0.05).abs() < 1e-9 && side == "long");
+    }
+
+    #[test]
+    fn set_order_filled_from_detail_partial_keeps_submitted() {
+        // A partial cumulative fill (< ordered size) updates filled_size but does
+        // NOT prematurely mark the order 'filled'.
+        let conn = memory_db();
+        conn.execute(
+            "insert into trade_intents (intent_id, created_at, symbol, side, action,
+               target_notional, max_order_notional, status, source)
+             values ('i1','2026-07-01T00:00:00Z','ETH/USDT:USDT','long','open',100,100,'accepted','t')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "insert into orders (order_id, client_oid, intent_id, symbol, side, action,
+               order_type, status, price, size, filled_size, created_at, updated_at)
+             values ('o1','c1','i1','ETH/USDT:USDT','buy','open','limit','submitted',
+               3000, 0.05, 0.0, '2026-07-01T00:00:00Z', '2026-07-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        set_order_filled_from_detail(&conn, "o1", 0.02).unwrap();
+
+        let (status, filled): (String, f64) = conn
+            .query_row(
+                "select status, filled_size from orders where order_id = 'o1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "submitted");
+        assert!((filled - 0.02).abs() < 1e-9);
     }
 }

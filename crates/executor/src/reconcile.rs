@@ -433,44 +433,12 @@ pub async fn reconcile_once(
             };
             match verdict {
                 MissingOrderVerdict::Filled(filled) => {
-                    // The order actually filled — repair the fill/order, not a cancel.
-                    // Best-effort fill row from order detail (price/fee may be absent;
-                    // reconcile owns enrichment later).
-                    let d = detail.as_ref();
-                    let f_price = d
-                        .and_then(|x| x.get("priceAvg").or_else(|| x.get("averageFillPrice")))
-                        .and_then(serde_json::Value::as_str)
-                        .and_then(|v| v.parse::<f64>().ok())
-                        .unwrap_or(0.0);
-                    let f_fee = d
-                        .and_then(|x| x.get("fee"))
-                        .and_then(serde_json::Value::as_str)
-                        .and_then(|v| v.parse::<f64>().ok())
-                        .map(|f| f.abs())
-                        .unwrap_or(0.0);
-                    let f_side = d
-                        .and_then(|x| x.get("side"))
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("")
-                        .to_string();
-                    db::insert_fill(
-                        conn,
-                        &crate::types::FillRecord {
-                            fill_id: format!("fill-{order_id}-reconcile"),
-                            order_id: order_id.clone(),
-                            trade_id: None,
-                            client_oid: Some(client_oid.clone()),
-                            symbol: symbol.clone(),
-                            side: f_side,
-                            price: f_price,
-                            size: filled,
-                            fee: f_fee,
-                            created_at: "reconciled".to_string(),
-                            raw_json: "{}".to_string(),
-                        },
-                    )
-                    .ok();
-                    db::sync_order_fill_state(conn, &order_id)?;
+                    // The order actually filled — sync the order, NOT a cancel. The
+                    // detail's baseVolume is CUMULATIVE, so it must NOT be written as a
+                    // fills row (that would pollute the per-trade ledger and double-count
+                    // once the real fillList arrives). Set orders.filled_size/status
+                    // directly; the fills table is repaired separately from fillList.
+                    db::set_order_filled_from_detail(conn, &order_id, filled)?;
                 }
                 MissingOrderVerdict::Cancelled => {
                     db::mark_order_externally_cancelled(conn, &client_oid)?;
