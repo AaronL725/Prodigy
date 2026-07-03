@@ -10,7 +10,9 @@ use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::ExecutorConfig;
-use crate::types::{MarketUpdate, OrderRecord, PrivateWsUpdate};
+use crate::types::{
+    AccountSnapshotUpdate, MarketUpdate, OrderRecord, PositionRecord, PrivateWsUpdate,
+};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -420,7 +422,7 @@ pub fn parse_public_ws_message(text: &str) -> Result<Option<MarketUpdate>> {
     }))
 }
 
-pub fn parse_private_ws_message(text: &str) -> Result<PrivateWsUpdate> {
+pub fn parse_private_ws_message(text: &str, cfg: &ExecutorConfig) -> Result<PrivateWsUpdate> {
     if text == "pong" {
         return Ok(PrivateWsUpdate::default());
     }
@@ -445,7 +447,7 @@ pub fn parse_private_ws_message(text: &str) -> Result<PrivateWsUpdate> {
                 exchange_order_id: Some(order_id),
                 client_oid,
                 intent_id: None,
-                symbol: "ETH/USDT:USDT".to_string(),
+                symbol: resolve_symbol(cfg, &str_field(&row, "instId")),
                 side: str_field(&row, "side"),
                 action: str_field(&row, "tradeSide"),
                 order_type: str_field(&row, "orderType"),
@@ -469,9 +471,72 @@ pub fn parse_private_ws_message(text: &str) -> Result<PrivateWsUpdate> {
                 last_error: None,
             });
         }
+    } else if channel == "positions" {
+        for row in data {
+            let size = row.get("total").and_then(num_or_str_f64).unwrap_or(0.0);
+            if size.abs() < 1e-12 {
+                continue; // no open position
+            }
+            let entry_price = row
+                .get("openPriceAvg")
+                .and_then(num_or_str_f64)
+                .unwrap_or(0.0);
+            update.positions.push(PositionRecord {
+                symbol: resolve_symbol(cfg, &str_field(&row, "instId")),
+                side: str_field(&row, "holdSide"),
+                notional: size.abs() * entry_price,
+                entry_price,
+                unrealized_pnl: row
+                    .get("unrealizedPL")
+                    .and_then(num_or_str_f64)
+                    .unwrap_or(0.0),
+                ownership: "system".to_string(),
+                opened_at: None,
+                adopted_at: None,
+                source_intent_id: None,
+                raw_json: row.to_string(),
+            });
+        }
+    } else if channel == "account" {
+        // ponytail: a single account message can carry multiple marginCoin rows;
+        // the configured marginCoin is the one the risk gate cares about. Take the
+        // first matching row, fall back to the first row if none matches. equity is
+        // accountEquity on REST and either equity/accountEquity on WS — accept both.
+        let row = data
+            .iter()
+            .find(|r| str_field(r, "marginCoin") == cfg.margin_coin)
+            .or_else(|| data.first());
+        if let Some(row) = row {
+            let equity = row
+                .get("accountEquity")
+                .and_then(num_or_str_f64)
+                .or_else(|| row.get("equity").and_then(num_or_str_f64));
+            let available = row.get("available").and_then(num_or_str_f64);
+            if let (Some(equity), Some(available)) = (equity, available) {
+                update.account = Some(AccountSnapshotUpdate {
+                    equity,
+                    available_margin: available,
+                    unrealized_pnl: row
+                        .get("unrealizedPL")
+                        .and_then(num_or_str_f64)
+                        .unwrap_or(0.0),
+                });
+            }
+        }
     }
 
     Ok(update)
+}
+
+/// Map a private-WS message instId (e.g. "ETHUSDT") to the configured display
+/// symbol (e.g. "ETH/USDT:USDT"). A foreign instId falls through to the raw
+/// string — never silently relabel a non-configured symbol as ETH.
+fn resolve_symbol(cfg: &ExecutorConfig, inst_id: &str) -> String {
+    if inst_id == cfg.bitget_symbol {
+        cfg.symbol.clone()
+    } else {
+        inst_id.to_string()
+    }
 }
 
 fn str_field(value: &Value, key: &str) -> String {
@@ -502,6 +567,21 @@ pub fn private_login_message(cfg: &ExecutorConfig, timestamp: &str) -> serde_jso
             "timestamp": timestamp,
             "sign": websocket_sign(&cfg.secrets.api_secret, timestamp)
         }]
+    })
+}
+
+/// Private WS subscribe payload for orders/positions/account (orders+positions
+/// key on instId, account keys on coin; "default" carries every symbol for the
+/// product type). Pure so the one-shot verify and the long-running WS loop build
+/// the identical subscription. Sent after login.
+pub fn private_subscribe_message(cfg: &ExecutorConfig) -> serde_json::Value {
+    serde_json::json!({
+        "op": "subscribe",
+        "args": [
+            {"instType": cfg.product_type, "channel": "orders", "instId": "default"},
+            {"instType": cfg.product_type, "channel": "positions", "instId": "default"},
+            {"instType": cfg.product_type, "channel": "account", "coin": "default"}
+        ]
     })
 }
 
@@ -626,11 +706,75 @@ mod tests {
           }]
         }"#;
 
-        let update = parse_private_ws_message(raw).unwrap();
+        let cfg = ExecutorConfig::demo_for_tests();
+        let update = parse_private_ws_message(raw, &cfg).unwrap();
 
         assert_eq!(update.orders.len(), 1);
         assert_eq!(update.orders[0].client_oid, "client-1");
         assert_eq!(update.orders[0].status, "live");
+        // de-hardcoded symbol: instId ETHUSDT resolves to the configured display symbol.
+        assert_eq!(update.orders[0].symbol, "ETH/USDT:USDT");
+    }
+
+    #[test]
+    fn private_subscribe_message_covers_orders_positions_account() {
+        let cfg = ExecutorConfig::demo_for_tests();
+        let msg = private_subscribe_message(&cfg);
+        let text = msg.to_string();
+
+        assert!(text.contains("\"op\":\"subscribe\""));
+        assert!(text.contains("\"channel\":\"orders\""));
+        assert!(text.contains("\"channel\":\"positions\""));
+        assert!(text.contains("\"channel\":\"account\""));
+        assert!(text.contains("\"instType\":\"USDT-FUTURES\""));
+    }
+
+    #[test]
+    fn parses_private_position_message() {
+        let raw = r#"{
+          "action":"snapshot",
+          "arg":{"instType":"USDT-FUTURES","instId":"default","channel":"positions"},
+          "data":[{
+            "instId":"ETHUSDT",
+            "holdSide":"long",
+            "total":"0.05",
+            "openPriceAvg":"3000",
+            "unrealizedPL":"1.5"
+          }]
+        }"#;
+
+        let cfg = ExecutorConfig::demo_for_tests();
+        let update = parse_private_ws_message(raw, &cfg).unwrap();
+
+        assert_eq!(update.positions.len(), 1);
+        let pos = &update.positions[0];
+        assert_eq!(pos.symbol, "ETH/USDT:USDT");
+        assert_eq!(pos.side, "long");
+        assert!((pos.entry_price - 3000.0).abs() < 1e-9);
+        assert!((pos.notional - 150.0).abs() < 1e-9);
+        assert!((pos.unrealized_pnl - 1.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn parses_private_account_message() {
+        let raw = r#"{
+          "action":"snapshot",
+          "arg":{"instType":"USDT-FUTURES","instId":"default","channel":"account"},
+          "data":[{
+            "marginCoin":"USDT",
+            "available":"500",
+            "accountEquity":"1000",
+            "unrealizedPL":"-2"
+          }]
+        }"#;
+
+        let cfg = ExecutorConfig::demo_for_tests();
+        let update = parse_private_ws_message(raw, &cfg).unwrap();
+
+        let acct = update.account.expect("account snapshot parsed");
+        assert!((acct.equity - 1000.0).abs() < 1e-9);
+        assert!((acct.available_margin - 500.0).abs() < 1e-9);
+        assert!((acct.unrealized_pnl - (-2.0)).abs() < 1e-9);
     }
 
     #[test]

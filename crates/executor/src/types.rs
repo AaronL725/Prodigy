@@ -64,9 +64,19 @@ pub struct MarketUpdate {
     pub exchange_ts_ms: i64,
 }
 
+/// Equity snapshot parsed from a private-WS `account` event. A fast cache update;
+/// the REST reconcile path remains the source of truth.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AccountSnapshotUpdate {
+    pub equity: f64,
+    pub available_margin: f64,
+    pub unrealized_pnl: f64,
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct PrivateWsUpdate {
     pub orders: Vec<OrderRecord>,
     pub fills: Vec<FillRecord>,
     pub positions: Vec<PositionRecord>,
+    pub account: Option<AccountSnapshotUpdate>,
 }

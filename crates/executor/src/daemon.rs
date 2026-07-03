@@ -48,6 +48,15 @@ pub fn apply_private_ws_update(
     for position in update.positions {
         crate::db::upsert_position(conn, &position)?;
     }
+    if let Some(account) = update.account {
+        crate::db::insert_equity_snapshot(
+            conn,
+            account.equity,
+            account.available_margin,
+            account.unrealized_pnl,
+            0.0,
+        )?;
+    }
     Ok(())
 }
 
@@ -143,6 +152,14 @@ pub async fn run_private_ws_loop(
                         crate::bitget::private_login_message(&cfg, &timestamp).to_string(),
                     ))
                     .await?;
+                // Subscribe to orders/positions/account after login. A production
+                // client waits for the login ack; for this demo daemon sending both
+                // immediately is acceptable and matches the existing verify style.
+                socket
+                    .send(Message::Text(
+                        crate::bitget::private_subscribe_message(&cfg).to_string(),
+                    ))
+                    .await?;
                 loop {
                     tokio::select! {
                         _ = shutdown.changed() => {
@@ -154,7 +171,7 @@ pub async fn run_private_ws_loop(
                             let Some(msg) = msg else { break; };
                             let Ok(msg) = msg else { break; };
                             let Ok(text) = msg.into_text() else { continue; };
-                            let update = match crate::bitget::parse_private_ws_message(&text) {
+                            let update = match crate::bitget::parse_private_ws_message(&text, &cfg) {
                                 Ok(update) => update,
                                 Err(err) => {
                                     eprintln!("private ws parse error: {err}");
@@ -164,6 +181,7 @@ pub async fn run_private_ws_loop(
                             if update.orders.is_empty()
                                 && update.fills.is_empty()
                                 && update.positions.is_empty()
+                                && update.account.is_none()
                             {
                                 continue;
                             }
@@ -282,6 +300,7 @@ mod tests {
                 raw_json: "{}".to_string(),
             }],
             fills: vec![],
+            account: None,
         };
 
         apply_private_ws_update(&conn, update).unwrap();
@@ -294,5 +313,38 @@ mod tests {
             .unwrap();
         assert_eq!(order_count, 1);
         assert_eq!(position_count, 1);
+    }
+
+    #[test]
+    fn private_ws_account_update_writes_equity_snapshot() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(include_str!("../../../schema/001_initial.sql"))
+            .unwrap();
+        conn.execute_batch(include_str!("../../../schema/002_execution.sql"))
+            .unwrap();
+
+        let update = crate::types::PrivateWsUpdate {
+            account: Some(crate::types::AccountSnapshotUpdate {
+                equity: 1000.0,
+                available_margin: 500.0,
+                unrealized_pnl: -2.0,
+            }),
+            ..Default::default()
+        };
+
+        apply_private_ws_update(&conn, update).unwrap();
+
+        let count: i64 = conn
+            .query_row("select count(*) from equity_snapshots", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+        let equity: f64 = conn
+            .query_row(
+                "select equity from equity_snapshots order by created_at desc limit 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!((equity - 1000.0).abs() < 1e-9);
     }
 }
