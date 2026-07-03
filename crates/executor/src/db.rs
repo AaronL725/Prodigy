@@ -109,6 +109,15 @@ pub fn reject_intent(conn: &Connection, intent_id: &str, reason: &str) -> Result
     Ok(())
 }
 
+/// Remove the local positions row for a symbol. Called by reconcile when the
+/// exchange no longer lists a position for it (manual full-close): exchange state
+/// wins, so the local row must not keep reporting a position Bitget no longer
+/// holds. Idempotent (no-op when no row exists).
+pub fn clear_local_position(conn: &Connection, symbol: &str) -> Result<()> {
+    conn.execute("delete from positions where symbol = ?", params![symbol])?;
+    Ok(())
+}
+
 /// Upsert a position row by symbol (PK). Reconciliation writes exchange-truth
 /// positions here; system-owned keeps its source_intent_id, imported gets the
 /// adoption timestamp set by classify_position before this call.
@@ -906,5 +915,46 @@ mod tests {
             )
             .unwrap();
         assert_eq!(status, "externally_cancelled");
+    }
+
+    #[test]
+    fn clear_local_position_removes_the_row() {
+        // D1: when the exchange fully closes a system position, the exchange no
+        // longer lists a position for the symbol. Exchange state wins, so the
+        // local positions row must be removed — otherwise local /positions and
+        // PnL queries keep reporting a position Bitget no longer holds.
+        let conn = memory_db();
+        let pos = PositionRecord {
+            symbol: "ETH/USDT:USDT".to_string(),
+            side: "long".to_string(),
+            notional: 150.0,
+            entry_price: 3000.0,
+            unrealized_pnl: 5.0,
+            ownership: "system".to_string(),
+            opened_at: Some("2026-07-01T00:00:00Z".to_string()),
+            adopted_at: None,
+            source_intent_id: Some("i1".to_string()),
+            raw_json: "{}".to_string(),
+        };
+        upsert_position(&conn, &pos).unwrap();
+        let before: i64 = conn
+            .query_row(
+                "select count(*) from positions where symbol='ETH/USDT:USDT'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(before, 1);
+
+        clear_local_position(&conn, "ETH/USDT:USDT").unwrap();
+
+        let after: i64 = conn
+            .query_row(
+                "select count(*) from positions where symbol='ETH/USDT:USDT'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(after, 0, "local position row must be removed on full-close");
     }
 }

@@ -545,6 +545,10 @@ pub async fn reconcile_once(
             override_active = true;
             entered_this_run = true;
             db::mark_system_orders_externally_closed(conn, &symbol)?;
+            // Exchange state wins: the exchange no longer holds this position, so
+            // remove the local positions row too — otherwise local /positions and
+            // PnL queries keep reporting a position Bitget closed.
+            db::clear_local_position(conn, &symbol)?;
             db::write_event(
                 conn,
                 "warning",
