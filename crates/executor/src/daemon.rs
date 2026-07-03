@@ -57,6 +57,7 @@ pub async fn run_daemon(cfg: ExecutorConfig, options: DaemonOptions) -> Result<(
         shutdown_rx.clone(),
     ));
     let mut private_task = tokio::spawn(run_private_ws_loop(cfg.clone(), shutdown_rx.clone()));
+    let mut telegram_task = tokio::spawn(run_telegram_query_loop(cfg.clone(), shutdown_rx.clone()));
 
     // ponytail: monotonic Instant for the bounded-runtime check — immune to
     // wall-clock skew that SystemTime would inject mid-loop.
@@ -143,11 +144,12 @@ pub async fn run_daemon(cfg: ExecutorConfig, options: DaemonOptions) -> Result<(
     let _ = shutdown_tx.send(true);
     let _ = tokio::time::timeout(
         Duration::from_millis(200),
-        futures_util::future::join(&mut public_task, &mut private_task),
+        futures_util::future::join3(&mut public_task, &mut private_task, &mut telegram_task),
     )
     .await;
     public_task.abort();
     private_task.abort();
+    telegram_task.abort();
     crate::db::write_event(&conn, "info", "daemon", "daemon stopped", "{}")?;
     Ok(())
 }
@@ -299,6 +301,126 @@ pub async fn run_public_ws_loop(
         // the endpoint and risk a temporary IP block). Shutdown exits return
         // above before reaching here, so they aren't delayed.
         tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+/// Optional read-only Telegram polling loop (M4). Runs ONLY when both
+/// `telegram_bot_token` and `telegram_chat_id` are configured — otherwise it
+/// returns immediately, since Telegram is not an execution dependency. It
+/// long-polls `getUpdates`, filters to the operator's chat_id only (other
+/// chats get no reply), and answers recognized `/status /positions /orders
+/// /pnl /risk` commands via `telegram_query::query_response`. `/stop /resume
+/// /close_all` are refused by the query layer (M4 forbids remote trading
+/// control).
+///
+/// Error isolation: EVERY network/parse/SQLite error here is logged and the
+/// loop continues — a flaky getUpdates or a transient DB lock must NEVER crash
+/// the daemon. Uses the same hoisted-shutdown `select!` pattern as the WS
+/// loops so the 1s throttle never blocks a shutdown. Open its own SQLite
+/// connection per update batch (rusqlite Connection is not Sync).
+pub async fn run_telegram_query_loop(
+    cfg: ExecutorConfig,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) -> Result<()> {
+    let (Some(token), Some(chat_id)) =
+        (cfg.telegram_bot_token.clone(), cfg.telegram_chat_id.clone())
+    else {
+        return Ok(());
+    };
+    let client = reqwest::Client::new();
+    let mut offset: i64 = 0;
+    let mut shutdown = shutdown;
+    loop {
+        if *shutdown.borrow() {
+            return Ok(());
+        }
+        let get_url = format!("https://api.telegram.org/bot{token}/getUpdates");
+        // ponytail: a failed long-poll (network blip, 5xx) is logged and we
+        // back off via the shutdown-aware sleep below — never propagated, the
+        // daemon must not die on a Telegram outage.
+        let response = client
+            .get(&get_url)
+            .query(&[
+                ("timeout", "10".to_string()),
+                ("offset", offset.to_string()),
+            ])
+            .send()
+            .await;
+        if let Ok(resp) = response {
+            if let Ok(value) = resp.json::<serde_json::Value>().await {
+                if let Some(updates) = value.get("result").and_then(serde_json::Value::as_array) {
+                    for update in updates {
+                        if let Some(id) =
+                            update.get("update_id").and_then(serde_json::Value::as_i64)
+                        {
+                            offset = id + 1;
+                        }
+                        let message = update.get("message").unwrap_or(&serde_json::Value::Null);
+                        let chat = message
+                            .get("chat")
+                            .and_then(|c| c.get("id"))
+                            .and_then(serde_json::Value::as_i64)
+                            .map(|v| v.to_string());
+                        // Security gate: only the operator's configured chat
+                        // gets any reply; messages from any other chat are
+                        // ignored (offset still advances so they aren't redelivered).
+                        if chat.as_deref() != Some(chat_id.as_str()) {
+                            continue;
+                        }
+                        let Some(text) = message.get("text").and_then(serde_json::Value::as_str)
+                        else {
+                            continue;
+                        };
+                        match rusqlite::Connection::open(&cfg.db_path) {
+                            Ok(conn) => {
+                                if let Err(err) = conn
+                                    .busy_timeout(std::time::Duration::from_secs(5))
+                                    .map_err(anyhow::Error::from)
+                                {
+                                    eprintln!("telegram sqlite busy_timeout error: {err}");
+                                    continue;
+                                }
+                                let reply = match crate::telegram_query::query_response(&conn, text)
+                                {
+                                    Ok(reply) => reply,
+                                    Err(err) => {
+                                        eprintln!("telegram query error: {err}");
+                                        continue;
+                                    }
+                                };
+                                if let Some(reply) = reply {
+                                    let send_url =
+                                        format!("https://api.telegram.org/bot{token}/sendMessage");
+                                    // ponytail: best-effort send — a failed
+                                    // sendMessage is dropped on the floor; the
+                                    // operator can re-issue the command.
+                                    let _ = client
+                                        .post(send_url)
+                                        .form(&[
+                                            ("chat_id", chat_id.as_str()),
+                                            ("text", reply.as_str()),
+                                        ])
+                                        .send()
+                                        .await;
+                                }
+                            }
+                            Err(err) => eprintln!("telegram sqlite open error: {err}"),
+                        }
+                    }
+                }
+            }
+        }
+        // ponytail: hoisted shutdown-aware throttle — same pattern as the WS
+        // loops, so a shutdown observed mid-throttle returns promptly instead
+        // of sleeping the full 1s (the Task 4 backoff-bug fix applied here too).
+        tokio::select! {
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() {
+                    return Ok(());
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+        }
     }
 }
 

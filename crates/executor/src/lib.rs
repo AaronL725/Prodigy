@@ -8,4 +8,5 @@ pub mod notify;
 pub mod reconcile;
 pub mod risk;
 pub mod state;
+pub mod telegram_query;
 pub mod types;
