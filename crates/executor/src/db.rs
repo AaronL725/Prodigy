@@ -178,10 +178,15 @@ pub fn local_order_intent_ids(conn: &Connection) -> Result<std::collections::Has
 /// exchange position size to detect a client manually adding, reducing, or
 /// closing a system-owned position. Returns (signed_base, side): e.g.
 /// +0.10/"long", -0.10/"short", or 0.0/"" when the system holds nothing.
+///
+/// Only counts orders WE placed (intent_id is not null): a manual/imported order
+/// repaired into the orders table from the exchange has no intent_id and must not
+/// pollute the system's expected position.
 pub fn system_net_base_for_symbol(conn: &Connection, symbol: &str) -> Result<(f64, &'static str)> {
     let mut stmt = conn.prepare(
         "select side, filled_size from orders
-         where symbol = ? and status = 'filled' and filled_size > 0",
+         where symbol = ? and status = 'filled' and filled_size > 0
+           and intent_id is not null",
     )?;
     let rows = stmt.query_map(params![symbol], |row| {
         let side: String = row.get(0)?;
@@ -556,5 +561,28 @@ mod tests {
         .unwrap();
         let (net3, _) = system_net_base_for_symbol(&conn, "ETH/USDT:USDT").unwrap();
         assert!((net3 - 0.06).abs() < 1e-9);
+    }
+
+    #[test]
+    fn system_net_base_ignores_orders_without_intent_id() {
+        // "System-expected base" must only count orders WE placed (intent_id set).
+        // An imported/manual order (no intent_id) that reconcile inserted must not
+        // pollute the system net — else drift detection compares against a base
+        // that includes manual size and mis-classifies.
+        let conn = memory_db();
+        // A filled order with NO intent_id (e.g. a manual/imported order row).
+        conn.execute(
+            "insert into orders (order_id, client_oid, symbol, side, action, order_type,
+               status, price, size, filled_size, created_at, updated_at)
+             values ('m1','m1','ETH/USDT:USDT','buy','open','market','filled',
+               3000, 0.20, 0.20, '2026-07-01T00:00:00Z', '2026-07-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        let (net, side) = system_net_base_for_symbol(&conn, "ETH/USDT:USDT").unwrap();
+        assert!(
+            net.abs() < 1e-9 && side.is_empty(),
+            "manual order (no intent_id) must not count toward system net, got {net}/{side}"
+        );
     }
 }

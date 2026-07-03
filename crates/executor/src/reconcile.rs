@@ -61,55 +61,34 @@ fn classify_exchange_position(
 }
 
 /// Determine whether an exchange position for this symbol is system-owned.
-/// Checks if the executor has any OPENING orders (filled or submitted) for this
-/// symbol that don't have a matching CLOSED order — i.e. an open exposure cycle
-/// that hasn't been closed. This prevents old filled orders from a position that
-/// was already closed from polluting ownership of a new manual position.
-/// Returns the intent_id of the most recent open-cycle order if found.
+/// Uses the SIGNED NET BASE our filled system orders imply (buy +, sell −): if
+/// the net is non-zero the system still holds exposure it opened, so the current
+/// exchange position is system-owned. Order-count heuristics (opens > closes)
+/// misjudge partial closes and multi-open/single-close cycles; net base is the
+/// only reliable signal. Returns the intent_id of the most recent open order (to
+/// backfill source_intent_id) when the net is non-zero, else None.
 pub fn system_ownership_intent(
     conn: &rusqlite::Connection,
     symbol: &str,
 ) -> Result<Option<String>> {
     use rusqlite::params;
-    // Count opening orders (action='open') that are filled/submitted.
-    let open_count: i64 = conn
-        .query_row(
-            "select count(*) from orders
-             where symbol = ? and intent_id is not null
-               and action = 'open' and status in ('filled', 'submitted')",
-            params![symbol],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
-    // Count closing orders (action='close') that are filled.
-    let close_count: i64 = conn
-        .query_row(
-            "select count(*) from orders
-             where symbol = ? and intent_id is not null
-               and action = 'close' and status = 'filled'",
-            params![symbol],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
-    // If opens > closes, there's at least one unclosed system opening cycle →
-    // the current position is likely system-owned. Otherwise the system has
-    // closed everything it opened; a current position is imported/manual.
-    if open_count > close_count {
-        let intent_id: Option<String> = conn
-            .query_row(
-                "select intent_id from orders
-                 where symbol = ? and intent_id is not null
-                   and action = 'open' and status in ('filled', 'submitted')
-                 order by updated_at desc limit 1",
-                params![symbol],
-                |row| row.get(0),
-            )
-            .ok()
-            .flatten();
-        Ok(intent_id)
-    } else {
-        Ok(None)
+    // System-owned iff our filled orders net to a non-zero base for this symbol.
+    let (net_base, _side) = db::system_net_base_for_symbol(conn, symbol)?;
+    if net_base.abs() <= DUST_BASE {
+        return Ok(None);
     }
+    let intent_id: Option<String> = conn
+        .query_row(
+            "select intent_id from orders
+             where symbol = ? and intent_id is not null
+               and action = 'open' and status in ('filled', 'submitted')
+             order by updated_at desc limit 1",
+            params![symbol],
+            |row| row.get(0),
+        )
+        .ok()
+        .flatten();
+    Ok(intent_id)
 }
 
 /// Classify a manual change to a SYSTEM-owned position by comparing the net base
@@ -730,6 +709,83 @@ mod tests {
         assert_eq!(classified.ownership, "system");
         assert_eq!(classified.source_intent_id.as_deref(), Some("intent-7"));
         assert_eq!(classified.adopted_at, None);
+    }
+
+    fn exec_db() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(include_str!("../../../schema/001_initial.sql"))
+            .unwrap();
+        conn.execute_batch(include_str!("../../../schema/002_execution.sql"))
+            .unwrap();
+        conn
+    }
+
+    fn insert_intent(conn: &rusqlite::Connection, intent_id: &str, action: &str) {
+        conn.execute(
+            "insert into trade_intents (intent_id, created_at, symbol, side, action,
+               target_notional, max_order_notional, status, source)
+             values (?1, '2026-07-01T00:00:00Z', 'ETH/USDT:USDT', 'long', ?2, 100, 100,
+               'executed', 't')",
+            rusqlite::params![intent_id, action],
+        )
+        .unwrap();
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn insert_order(
+        conn: &rusqlite::Connection,
+        order_id: &str,
+        intent_id: &str,
+        side: &str,
+        action: &str,
+        status: &str,
+        filled: f64,
+    ) {
+        conn.execute(
+            "insert into orders (order_id, client_oid, intent_id, symbol, side, action,
+               order_type, status, price, size, filled_size, created_at, updated_at)
+             values (?1, ?1, ?2, 'ETH/USDT:USDT', ?3, ?4, 'limit', ?5,
+               3000, ?6, ?6, '2026-07-01T00:00:00Z', '2026-07-01T00:00:00Z')",
+            rusqlite::params![order_id, intent_id, side, action, status, filled],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn ownership_uses_net_base_not_order_count() {
+        // Old bug: system_ownership_intent used open_count > close_count. Two filled
+        // opens then a single filled close that zeroes the net base would be judged
+        // system-owned (2 opens > 1 close) even though the system holds nothing —
+        // and conversely a partial close (1 open, 1 close, net still positive) would
+        // be judged NOT system (1 == 1) even though a position remains. Ownership
+        // must follow the signed net base, not the order counts.
+        let conn = exec_db();
+        insert_intent(&conn, "i-open", "open");
+        insert_intent(&conn, "i-close", "close");
+
+        // Two opens (0.05 + 0.05 = 0.10) and one close (0.10) → net 0 → NOT system.
+        insert_order(&conn, "o1", "i-open", "buy", "open", "filled", 0.05);
+        insert_order(&conn, "o2", "i-open", "buy", "open", "filled", 0.05);
+        insert_order(&conn, "o3", "i-close", "sell", "close", "filled", 0.10);
+        assert_eq!(
+            system_ownership_intent(&conn, "ETH/USDT:USDT").unwrap(),
+            None,
+            "net base is zero, so the position is not system-owned"
+        );
+
+        // Partial close: reopen 0.10, close only 0.04 → net +0.06 → system-owned.
+        let conn = exec_db();
+        insert_intent(&conn, "i-open", "open");
+        insert_intent(&conn, "i-close", "close");
+        insert_order(&conn, "o1", "i-open", "buy", "open", "filled", 0.10);
+        insert_order(&conn, "o2", "i-close", "sell", "close", "filled", 0.04);
+        assert_eq!(
+            system_ownership_intent(&conn, "ETH/USDT:USDT")
+                .unwrap()
+                .as_deref(),
+            Some("i-open"),
+            "net base is still positive after a partial close, so system-owned"
+        );
     }
 
     #[test]
