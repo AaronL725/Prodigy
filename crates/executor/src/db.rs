@@ -142,6 +142,42 @@ pub fn upsert_position(conn: &Connection, position: &PositionRecord) -> Result<(
     Ok(())
 }
 
+/// Refresh a position's live market fields from a private-WS update WITHOUT
+/// overwriting reconcile's authoritative ownership classification. REST
+/// reconcile owns ownership/adopted_at/source_intent_id; the WS feed only
+/// refreshes side/notional/entry_price/unrealized_pnl/raw_json (the fast cache).
+/// If no local row exists yet, insert with WS-supplied ownership ("system")
+/// pending the next reconcile reclassification. (Spec: if WS and REST disagree,
+/// REST wins — so we never let a WS push downgrade an existing classification.)
+pub fn refresh_position_from_ws(conn: &Connection, position: &PositionRecord) -> Result<()> {
+    conn.execute(
+        "insert into positions (
+           symbol, side, notional, entry_price, unrealized_pnl, updated_at,
+           ownership, opened_at, adopted_at, source_intent_id, raw_json
+         ) values (?, ?, ?, ?, ?, datetime('now'), ?, ?, ?, ?, ?)
+         on conflict(symbol) do update set
+           side = excluded.side,
+           notional = excluded.notional,
+           entry_price = excluded.entry_price,
+           unrealized_pnl = excluded.unrealized_pnl,
+           updated_at = datetime('now'),
+           raw_json = excluded.raw_json",
+        params![
+            position.symbol,
+            position.side,
+            position.notional,
+            position.entry_price,
+            position.unrealized_pnl,
+            position.ownership,
+            position.opened_at,
+            position.adopted_at,
+            position.source_intent_id,
+            position.raw_json,
+        ],
+    )?;
+    Ok(())
+}
+
 /// client_oids of orders we already have locally (used to detect exchange orders
 /// we're missing → repair). Reconciliation inserts the missing ones.
 pub fn local_order_client_oids(conn: &Connection) -> Result<std::collections::HashSet<String>> {
@@ -1186,6 +1222,81 @@ mod tests {
         // system_net_base still sees the filled order (it reads orders.filled_size).
         let (net, side) = system_net_base_for_symbol(&conn, "ETH/USDT:USDT").unwrap();
         assert!((net - 0.05).abs() < 1e-9 && side == "long");
+    }
+
+    #[test]
+    fn refresh_position_from_ws_preserves_reconcile_ownership() {
+        // Finding 1 regression: a private-WS positions push must NOT clobber the
+        // ownership classification (imported/system), adopted_at, or source_intent_id
+        // that REST reconcile authoritatively wrote. WS only refreshes market-movement
+        // fields (side/notional/entry_price/unrealized_pnl/raw_json); reconcile's
+        // ownership stays put until the next reconcile reclassifies. Spec: REST wins.
+        use crate::types::PositionRecord;
+        let conn = memory_db();
+        // Reconcile's authoritative write: position classified imported + adopted.
+        let reconciled = PositionRecord {
+            symbol: "ETH/USDT:USDT".to_string(),
+            side: "long".to_string(),
+            notional: 1000.0,
+            entry_price: 3000.0,
+            unrealized_pnl: 12.0,
+            ownership: "imported".to_string(),
+            opened_at: Some("2026-07-01T00:00:00Z".to_string()),
+            adopted_at: Some("2026-07-01T00:00:00Z".to_string()),
+            source_intent_id: Some("intent-9".to_string()),
+            raw_json: "{\"src\":\"reconcile\"}".to_string(),
+        };
+        upsert_position(&conn, &reconciled).unwrap();
+
+        // Private-WS push for the same symbol: WS parser hardcodes ownership "system"
+        // and different market fields.
+        let ws = PositionRecord {
+            notional: 1100.0,
+            unrealized_pnl: 50.0,
+            ownership: "system".to_string(),
+            adopted_at: None,
+            source_intent_id: None,
+            raw_json: "{\"src\":\"ws\"}".to_string(),
+            ..reconciled.clone()
+        };
+        refresh_position_from_ws(&conn, &ws).unwrap();
+
+        let row = conn
+            .query_row(
+                "select notional, unrealized_pnl, ownership, adopted_at, source_intent_id, raw_json
+                 from positions where symbol='ETH/USDT:USDT'",
+                [],
+                |r| {
+                    Ok((
+                        r.get::<_, f64>(0)?,
+                        r.get::<_, f64>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, Option<String>>(3)?,
+                        r.get::<_, Option<String>>(4)?,
+                        r.get::<_, String>(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        // Market fields refreshed from WS.
+        assert!((row.0 - 1100.0).abs() < 1e-9, "notional should refresh");
+        assert!((row.1 - 50.0).abs() < 1e-9, "unrealized_pnl should refresh");
+        // Ownership authority preserved.
+        assert_eq!(
+            row.2, "imported",
+            "ownership must stay reconcile-authoritative"
+        );
+        assert_eq!(
+            row.3.as_deref(),
+            Some("2026-07-01T00:00:00Z"),
+            "adopted_at must be preserved"
+        );
+        assert_eq!(
+            row.4.as_deref(),
+            Some("intent-9"),
+            "source_intent_id must be preserved"
+        );
+        assert_eq!(row.5, "{\"src\":\"ws\"}", "raw_json should refresh");
     }
 
     #[test]

@@ -225,17 +225,16 @@ pub fn apply_private_ws_update(
         crate::db::insert_fill(conn, &fill)?;
     }
     for position in update.positions {
-        crate::db::upsert_position(conn, &position)?;
+        // ponytail: WS positions refresh market fields only — REST reconcile owns
+        // ownership classification (refresh_position_from_ws preserves
+        // ownership/adopted_at/source_intent_id on conflict; upsert_position would
+        // clobber them). Spec: if WS and REST disagree, REST wins.
+        crate::db::refresh_position_from_ws(conn, &position)?;
     }
-    if let Some(account) = update.account {
-        crate::db::insert_equity_snapshot(
-            conn,
-            account.equity,
-            account.available_margin,
-            account.unrealized_pnl,
-            0.0,
-        )?;
-    }
+    // The private-WS `account` event is parsed (PrivateWsUpdate.account) but NOT
+    // persisted: equity_snapshots is REST reconcile's authoritative table
+    // (telegram /pnl and /risk read it). Writing WS-derived equity there would
+    // let the display disagree with the last REST reconcile. REST wins.
     Ok(())
 }
 
@@ -633,7 +632,12 @@ mod tests {
     }
 
     #[test]
-    fn private_ws_account_update_writes_equity_snapshot() {
+    fn apply_private_ws_update_does_not_persist_account_snapshot() {
+        // Finding 2 regression: a private-WS `account` event must NOT be written
+        // into the REST-authoritative equity_snapshots table (reconcile owns it;
+        // telegram /pnl and /risk read it). WS is only a fast cache. The account
+        // event is still PARSED (PrivateWsUpdate.account is populated here), but
+        // not persisted. Spec: REST wins.
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch(include_str!("../../../schema/001_initial.sql"))
             .unwrap();
@@ -642,7 +646,7 @@ mod tests {
 
         let update = crate::types::PrivateWsUpdate {
             account: Some(crate::types::AccountSnapshotUpdate {
-                equity: 1000.0,
+                equity: 999.0,
                 available_margin: 500.0,
                 unrealized_pnl: -2.0,
             }),
@@ -654,14 +658,6 @@ mod tests {
         let count: i64 = conn
             .query_row("select count(*) from equity_snapshots", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(count, 1);
-        let equity: f64 = conn
-            .query_row(
-                "select equity from equity_snapshots order by created_at desc limit 1",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert!((equity - 1000.0).abs() < 1e-9);
+        assert_eq!(count, 0, "WS account events must not be persisted");
     }
 }
