@@ -705,6 +705,22 @@ fn set_local_order_filled(conn: &Connection, client_oid: &str, filled_size: f64)
     Ok(())
 }
 
+/// Record the observed filled base on an order WITHOUT flipping its status — used
+/// when a maker order partially fills then is cancelled: the partial base is real
+/// exposure, so filled_size must be persisted, but the order is gone (cancelled),
+/// not 'filled'. The caller sets the terminal status separately.
+fn set_local_order_filled_size(
+    conn: &Connection,
+    client_oid: &str,
+    filled_size: f64,
+) -> Result<()> {
+    conn.execute(
+        "update orders set filled_size = ?, updated_at = datetime('now') where client_oid = ?",
+        rusqlite::params![filled_size, client_oid],
+    )?;
+    Ok(())
+}
+
 /// Record a fill row for the audit trail. Queries the exchange order-detail for
 /// the real average fill price, fee, and trade_id so the fills table can support
 /// PnL/fee calculations. Called whenever the execution loop detects a confirmed
@@ -1143,8 +1159,21 @@ pub async fn process_one_intent(
                     live_order_request = None;
                 } else if confirmed {
                     // Order is gone (cancelled); record any partial fill it left so
-                    // the next attempt sizes to the remainder.
+                    // the next attempt sizes to the remainder AND the partial base is
+                    // persisted (a partial-fill-then-cancel is real system exposure).
+                    // The cancel-confirm poll reports the cumulative baseVolume, so set
+                    // the order's filled_size from it WITHOUT flipping status to
+                    // 'filled' (the order is gone). When a partial fill is present we
+                    // also record_fill so the fills audit trail + the test invariant
+                    // (filled order ⇒ fills row) hold, sized to the observed partial.
                     cumulative_filled_base += confirm_filled;
+                    if confirm_filled > 0.0 {
+                        let live_order = live_order_request.clone().ok_or_else(|| {
+                            anyhow::anyhow!("cancel-confirm partial fill with no live order")
+                        })?;
+                        record_fill(conn, rest, &intent, &live_order, confirm_filled).await?;
+                        set_local_order_filled_size(conn, &client_oid, confirm_filled)?;
+                    }
                     set_local_order_status(conn, &client_oid, "cancelled")?;
                     state.on_order_cancelled();
                     live_client_oid = None;

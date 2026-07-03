@@ -80,8 +80,7 @@ pub fn system_ownership_intent(
     let intent_id: Option<String> = conn
         .query_row(
             "select intent_id from orders
-             where symbol = ? and intent_id is not null
-               and action = 'open' and status in ('filled', 'submitted')
+             where symbol = ? and intent_id is not null and action = 'open'
              order by updated_at desc limit 1",
             params![symbol],
             |row| row.get(0),
@@ -133,9 +132,14 @@ pub enum MissingOrderVerdict {
     /// The order actually filled (fully or partially) — reconcile the fill/order,
     /// this is NOT a manual cancel. Carries the observed filled base.
     Filled(f64),
-    /// Confirmed cancelled/rejected on the exchange — mark externally_cancelled
-    /// and enter override.
+    /// Confirmed cancelled/rejected on the exchange with NO fill — mark
+    /// externally_cancelled and enter override.
     Cancelled,
+    /// Cancelled/rejected AFTER a partial fill (baseVolume > 0). The partial base
+    /// is REAL system exposure and must be synced (filled_size) before the order
+    /// is retired — treating it as a pure Cancelled would drop the partial
+    /// position and break ownership tracking. Carries the observed filled base.
+    CancelledWithPartialFill(f64),
     /// Neither filled nor confirmed cancelled (still live, or detail unreadable).
     /// Do NOT mark cancelled — leave the order needs_reconcile and emit an event
     /// so a later pass / human reconciles it.
@@ -154,7 +158,16 @@ pub fn classify_missing_pending_order(
     let (status, filled) = crate::executor::read_detail_fields(detail);
     match crate::executor::classify_order_poll(&status, filled, order_size) {
         crate::executor::OrderPollOutcome::Filled => MissingOrderVerdict::Filled(filled),
-        crate::executor::OrderPollOutcome::Vanished => MissingOrderVerdict::Cancelled,
+        crate::executor::OrderPollOutcome::Vanished => {
+            // Cancelled/rejected. If it parted-filled first (baseVolume > 0), that
+            // partial base is real system exposure — sync it before retiring, don't
+            // treat as a pure cancel.
+            if filled > 0.0 {
+                MissingOrderVerdict::CancelledWithPartialFill(filled)
+            } else {
+                MissingOrderVerdict::Cancelled
+            }
+        }
         crate::executor::OrderPollOutcome::Live => {
             // Some base filled but still working, OR no readable status/fill.
             if filled > 0.0 {
@@ -431,6 +444,17 @@ pub async fn reconcile_once(
                 Some(d) => classify_missing_pending_order(d, ordered_size),
                 None => MissingOrderVerdict::Unknown,
             };
+            // Helper: enter the per-symbol override once (idempotent within a pass).
+            // Returns true iff this call actually transitioned inactive→active.
+            let mut enter_override = || -> Result<bool> {
+                if override_active {
+                    return Ok(false);
+                }
+                db::set_executor_state(conn, &override_key, "active")?;
+                override_active = true;
+                entered_this_run = true;
+                Ok(true)
+            };
             match verdict {
                 MissingOrderVerdict::Filled(filled) => {
                     // The order actually filled — sync the order, NOT a cancel. The
@@ -440,19 +464,48 @@ pub async fn reconcile_once(
                     // directly; the fills table is repaired separately from fillList.
                     db::set_order_filled_from_detail(conn, &order_id, filled)?;
                 }
+                MissingOrderVerdict::CancelledWithPartialFill(filled) => {
+                    // Partially filled THEN cancelled: the partial base (e.g. 0.02 of
+                    // 0.05) is REAL system exposure. Sync filled_size FIRST so
+                    // system_net_base/system_ownership_intent track it, then retire the
+                    // order as externally_cancelled and enter override. The fills table
+                    // is still only written by fillList (no synthetic row here).
+                    db::set_order_filled_from_detail(conn, &order_id, filled)?;
+                    db::mark_order_externally_cancelled(conn, &client_oid)?;
+                    let did_enter = enter_override()?;
+                    db::write_event(
+                        conn,
+                        "warning",
+                        "executor",
+                        "manual override entered (order externally cancelled after partial fill)",
+                        &format!(
+                            "{{\"symbol\":\"{symbol}\",\"client_oid\":\"{client_oid}\",\"filled\":{filled}}}"
+                        ),
+                    )?;
+                    if did_enter {
+                        notify::send_telegram(
+                            telegram_token,
+                            telegram_chat,
+                            "manual_override_entered",
+                            &format!(
+                                "manual override entered for {symbol} (order externally cancelled)"
+                            ),
+                        )
+                        .await
+                        .ok();
+                    }
+                }
                 MissingOrderVerdict::Cancelled => {
                     db::mark_order_externally_cancelled(conn, &client_oid)?;
-                    if !override_active {
-                        db::set_executor_state(conn, &override_key, "active")?;
-                        override_active = true;
-                        entered_this_run = true;
-                        db::write_event(
-                            conn,
-                            "warning",
-                            "executor",
-                            "manual override entered (order externally cancelled)",
-                            &format!("{{\"symbol\":\"{symbol}\",\"client_oid\":\"{client_oid}\"}}"),
-                        )?;
+                    let did_enter = enter_override()?;
+                    db::write_event(
+                        conn,
+                        "warning",
+                        "executor",
+                        "manual override entered (order externally cancelled)",
+                        &format!("{{\"symbol\":\"{symbol}\",\"client_oid\":\"{client_oid}\"}}"),
+                    )?;
+                    if did_enter {
                         notify::send_telegram(
                             telegram_token,
                             telegram_chat,
@@ -856,6 +909,40 @@ mod tests {
     }
 
     #[test]
+    fn fill_to_repair_skips_trades_already_recorded_by_execution_path() {
+        // Issue 3: the execution loop records a fill via record_fill (one row keyed
+        // by the exchange tradeId it read from order detail). Later, when the
+        // exchange fillList arrives, fill_to_repair must NOT re-insert that same
+        // trade — otherwise sync_order_fill_state (SUM(fills)) would double-count
+        // and over-state the position. Dedup is by tradeId in the existing set.
+        use std::collections::HashSet;
+        let mut local_order_ids = HashSet::new();
+        local_order_ids.insert("oid-7".to_string());
+        // The execution path already recorded trade "T-exec" for this order.
+        let mut existing = HashSet::new();
+        existing.insert("T-exec".to_string());
+        let client_oid_for = |_: &str| Some("client-7".to_string());
+
+        // fillList arrives with the SAME tradeId the execution path already wrote → skip.
+        let same_trade = serde_json::json!({
+            "tradeId": "T-exec", "orderId": "oid-7",
+            "symbol": "ETHUSDT", "side": "buy", "price": "1800", "baseVolume": "0.05",
+            "cTime": "1",
+        });
+        assert!(fill_to_repair(&same_trade, &local_order_ids, &existing, client_oid_for).is_none());
+
+        // A DIFFERENT tradeId the execution path didn't see → repair it.
+        let new_trade = serde_json::json!({
+            "tradeId": "T-new", "orderId": "oid-7",
+            "symbol": "ETHUSDT", "side": "buy", "price": "1800", "baseVolume": "0.03",
+            "cTime": "2",
+        });
+        let rec = fill_to_repair(&new_trade, &local_order_ids, &existing, client_oid_for)
+            .expect("a new trade should be repaired");
+        assert_eq!(rec.trade_id.as_deref(), Some("T-new"));
+    }
+
+    #[test]
     fn exchange_position_traced_from_local_order_is_system_without_position_row() {
         // The bug this guards: reconcile used to build the classify set from
         // positions.source_intent_id. But the exchange all-position response
@@ -1006,6 +1093,23 @@ mod tests {
             MissingOrderVerdict::Cancelled
         );
 
+        // PARTIAL fill THEN cancelled (baseVolume 0.02 < ordered 0.05, status
+        // canceled): the 0.02 is REAL system exposure — must NOT be treated as a
+        // pure Cancelled (that would drop the partial position). Returns the
+        // partial base so the caller syncs filled_size before retiring the order.
+        let partial_cancelled = serde_json::json!({"state":"canceled","baseVolume":"0.02"});
+        assert_eq!(
+            classify_missing_pending_order(&partial_cancelled, 0.05),
+            MissingOrderVerdict::CancelledWithPartialFill(0.02)
+        );
+
+        // Same but with the "status" spelling instead of "state".
+        let partial_cancelled2 = serde_json::json!({"status":"cancelled","baseVolume":"0.02"});
+        assert_eq!(
+            classify_missing_pending_order(&partial_cancelled2, 0.05),
+            MissingOrderVerdict::CancelledWithPartialFill(0.02)
+        );
+
         // Actually filled (status filled, full base) → Filled, NOT Cancelled.
         let filled = serde_json::json!({"state":"filled","baseVolume":"0.05"});
         assert_eq!(
@@ -1032,6 +1136,39 @@ mod tests {
         assert_eq!(
             classify_missing_pending_order(&unreadable, 0.05),
             MissingOrderVerdict::Unknown
+        );
+    }
+
+    #[test]
+    fn partial_fill_then_cancel_is_tracked_in_system_net_base() {
+        // Issues 1+2: an order that partially filled (0.02) then was cancelled
+        // ends up 'externally_cancelled' with filled_size 0.02. That partial base
+        // is REAL system exposure — system_net_base must count it (keyed on
+        // filled_size, status-agnostic) so ownership tracking and drift detection
+        // see the position, instead of dropping it as if it never filled.
+        let conn = exec_db();
+        insert_intent(&conn, "i1", "open");
+        conn.execute(
+            "insert into orders (order_id, client_oid, intent_id, symbol, side, action,
+               order_type, status, price, size, filled_size, created_at, updated_at)
+             values ('o1','o1','i1','ETH/USDT:USDT','buy','open','limit','externally_cancelled',
+               3000, 0.05, 0.02, '2026-07-01T00:00:00Z', '2026-07-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        let (net, side) = db::system_net_base_for_symbol(&conn, "ETH/USDT:USDT").unwrap();
+        assert!(
+            (net - 0.02).abs() < 1e-9 && side == "long",
+            "partial-fill-then-cancel must still count toward system net, got {net}/{side}"
+        );
+
+        // And system_ownership_intent must still see the symbol as system-owned
+        // (nonzero net) so the position isn't mis-classified imported.
+        assert_eq!(
+            system_ownership_intent(&conn, "ETH/USDT:USDT")
+                .unwrap()
+                .as_deref(),
+            Some("i1")
         );
     }
 
