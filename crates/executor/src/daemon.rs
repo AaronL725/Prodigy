@@ -1,4 +1,5 @@
 use anyhow::Result;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -7,6 +8,31 @@ use crate::config::ExecutorConfig;
 #[derive(Debug, Clone, Default)]
 pub struct DaemonOptions {
     pub max_runtime: Option<Duration>,
+}
+
+/// Cross-task "please run a REST reconcile on the next tick" signal. The WS loops
+/// set it after a successful (re)connect (spec: reconcile after WS reconnect); the
+/// daemon main loop takes it on each tick. Arc-shared so the WS tasks and the main
+/// loop can reach it without channel plumbing. Pure accessors so the set/take
+/// semantics are unit-testable without a network round-trip.
+#[derive(Debug, Clone, Default)]
+pub struct ReconcileSignal {
+    pending: Arc<AtomicBool>,
+}
+
+impl ReconcileSignal {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    /// WS loop calls this after a successful (re)connect.
+    pub fn request(&self) {
+        self.pending.store(true, Ordering::SeqCst);
+    }
+    /// Main loop calls this each tick; returns true iff a reconcile was requested,
+    /// and clears the flag (so one reconnect triggers exactly one reconcile).
+    pub fn take(&self) -> bool {
+        self.pending.swap(false, Ordering::SeqCst)
+    }
 }
 
 pub async fn run_daemon(cfg: ExecutorConfig, options: DaemonOptions) -> Result<()> {
@@ -51,12 +77,22 @@ pub async fn run_daemon(cfg: ExecutorConfig, options: DaemonOptions) -> Result<(
     ));
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
+    // Cross-task signal: a WS (re)connect sets it, the main loop consumes it on
+    // each tick to run a REST reconcile immediately (spec: reconcile after WS
+    // reconnect) instead of waiting for the periodic interval.
+    let reconcile_signal = ReconcileSignal::new();
+
     let mut public_task = tokio::spawn(run_public_ws_loop(
         cfg.clone(),
         market_cache.clone(),
         shutdown_rx.clone(),
+        reconcile_signal.clone(),
     ));
-    let mut private_task = tokio::spawn(run_private_ws_loop(cfg.clone(), shutdown_rx.clone()));
+    let mut private_task = tokio::spawn(run_private_ws_loop(
+        cfg.clone(),
+        shutdown_rx.clone(),
+        reconcile_signal.clone(),
+    ));
     let mut telegram_task = tokio::spawn(run_telegram_query_loop(cfg.clone(), shutdown_rx.clone()));
 
     // ponytail: monotonic Instant for the bounded-runtime check — immune to
@@ -83,6 +119,31 @@ pub async fn run_daemon(cfg: ExecutorConfig, options: DaemonOptions) -> Result<(
                     break;
                 }
                 let now_ms = crate::bitget::now_ms().parse::<i64>().unwrap_or(0);
+                // Reconnect-triggered reconcile takes priority over the periodic
+                // interval: a WS (re)connect set the signal, so run the SAME
+                // error-isolated reconcile immediately and reset the interval
+                // clock (so the next periodic pass is a full interval away).
+                if reconcile_signal.take() {
+                    if let Err(err) = crate::reconcile::reconcile_once(
+                        &conn,
+                        &rest,
+                        "daemon-ws-reconnect",
+                        !cfg.test_reset_demo_state,
+                        cfg.telegram_bot_token.as_deref(),
+                        cfg.telegram_chat_id.as_deref(),
+                    )
+                    .await
+                    {
+                        crate::db::write_event(
+                            &conn,
+                            "warning",
+                            "reconcile",
+                            &format!("reconcile failed: {err}"),
+                            "{}",
+                        )?;
+                    }
+                    last_reconcile_ms = now_ms;
+                }
                 if should_run_reconcile(now_ms, last_reconcile_ms, cfg.reconcile_interval_secs) {
                     // Periodic reconcile errors are LOGGED, not propagated: a single
                     // flaky REST pass must not bring the daemon down (the next tick
@@ -256,6 +317,7 @@ pub async fn run_public_ws_loop(
     cfg: ExecutorConfig,
     market_cache: Arc<tokio::sync::Mutex<crate::executor::MarketCache>>,
     shutdown: tokio::sync::watch::Receiver<bool>,
+    reconcile_signal: ReconcileSignal,
 ) -> Result<()> {
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;
@@ -268,11 +330,25 @@ pub async fn run_public_ws_loop(
         }
         match tokio_tungstenite::connect_async(&cfg.public_ws_url).await {
             Ok((mut socket, _)) => {
-                socket
+                // ponytail: a failed subscribe send is recoverable — log and
+                // break to the outer reconnect loop (1s backoff) instead of
+                // killing the WS task with `?`. A dead WS loop is undetectable
+                // (the main loop never monitors the JoinHandle), so we keep it
+                // alive via reconnect until shutdown.
+                if let Err(err) = socket
                     .send(Message::Text(
                         crate::bitget::public_books5_subscribe_message(&cfg).to_string(),
                     ))
-                    .await?;
+                    .await
+                {
+                    eprintln!("public ws subscribe send failed: {err}; reconnecting");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    continue;
+                }
+                // (Re)connect succeeded and we're subscribed: request a REST
+                // reconcile on the next main-loop tick (spec: reconcile after
+                // WS reconnect) so any books5 / cache gap is repaired promptly.
+                reconcile_signal.request();
                 'inner: loop {
                     tokio::select! {
                         _ = shutdown.changed() => {
@@ -442,6 +518,7 @@ pub async fn run_telegram_query_loop(
 pub async fn run_private_ws_loop(
     cfg: ExecutorConfig,
     shutdown: tokio::sync::watch::Receiver<bool>,
+    reconcile_signal: ReconcileSignal,
 ) -> Result<()> {
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;
@@ -455,19 +532,37 @@ pub async fn run_private_ws_loop(
         match tokio_tungstenite::connect_async(&cfg.private_ws_url).await {
             Ok((mut socket, _)) => {
                 let timestamp = crate::bitget::now_seconds();
-                socket
+                // ponytail: failed login/subscribe sends are recoverable — log
+                // and break to the outer reconnect loop (1s backoff) instead of
+                // killing the WS task with `?`. A dead WS loop is undetectable,
+                // so we keep it alive via reconnect until shutdown.
+                if let Err(err) = socket
                     .send(Message::Text(
                         crate::bitget::private_login_message(&cfg, &timestamp).to_string(),
                     ))
-                    .await?;
+                    .await
+                {
+                    eprintln!("private ws login send failed: {err}; reconnecting");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    continue;
+                }
                 // Subscribe to orders/positions/account after login. A production
                 // client waits for the login ack; for this demo daemon sending both
                 // immediately is acceptable and matches the existing verify style.
-                socket
+                if let Err(err) = socket
                     .send(Message::Text(
                         crate::bitget::private_subscribe_message(&cfg).to_string(),
                     ))
-                    .await?;
+                    .await
+                {
+                    eprintln!("private ws subscribe send failed: {err}; reconnecting");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    continue;
+                }
+                // (Re)connect succeeded and we're subscribed: request a REST
+                // reconcile on the next main-loop tick (spec: reconcile after
+                // WS reconnect) so any orders/fills/positions gap is repaired.
+                reconcile_signal.request();
                 loop {
                     tokio::select! {
                         _ = shutdown.changed() => {
@@ -495,7 +590,13 @@ pub async fn run_private_ws_loop(
                             }
                             match rusqlite::Connection::open(&cfg.db_path) {
                                 Ok(conn) => {
-                                    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+                                    // ponytail: busy_timeout failure is benign
+                                    // (sqlite3_busy_timeout essentially never errors);
+                                    // skip this batch instead of killing the WS task.
+                                    if let Err(err) = conn.busy_timeout(std::time::Duration::from_secs(5)) {
+                                        eprintln!("private ws sqlite busy_timeout error: {err}");
+                                        continue;
+                                    }
                                     if let Err(err) = apply_private_ws_update(&conn, update) {
                                         eprintln!("private ws sqlite apply error: {err}");
                                     }
@@ -545,6 +646,29 @@ mod tests {
     fn should_run_reconcile_when_interval_elapsed() {
         assert!(should_run_reconcile(10_000, 0, 10));
         assert!(!should_run_reconcile(9_999, 0, 10));
+    }
+
+    #[test]
+    fn reconcile_signal_request_then_take() {
+        let sig = ReconcileSignal::new();
+        assert!(!sig.take(), "fresh signal should not request reconcile");
+        sig.request();
+        assert!(sig.take(), "after request, take is true");
+        assert!(
+            !sig.take(),
+            "take clears the flag (one reconnect → one reconcile)"
+        );
+    }
+
+    #[test]
+    fn reconcile_signal_shared_between_clones() {
+        let sig = ReconcileSignal::new();
+        let clone = sig.clone();
+        clone.request(); // WS task sets via its clone
+        assert!(
+            sig.take(),
+            "main loop sees the request through its own handle"
+        );
     }
 
     #[test]
