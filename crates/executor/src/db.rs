@@ -181,21 +181,24 @@ pub fn local_order_intent_ids(conn: &Connection) -> Result<std::collections::Has
     Ok(set)
 }
 
-/// Signed net base the system expects to hold for a symbol, summed across ALL
-/// filled orders by direction (buy = +, sell = −): a filled open-long adds, a
-/// filled close-long (a sell) subtracts. Reconcile compares this against the
-/// exchange position size to detect a client manually adding, reducing, or
-/// closing a system-owned position. Returns (signed_base, side): e.g.
-/// +0.10/"long", -0.10/"short", or 0.0/"" when the system holds nothing.
+/// Signed net base the system expects to hold for a symbol, summed across all
+/// SYSTEM orders with any filled base, by direction (buy = +, sell = −): a filled
+/// open-long adds, a filled close-long (a sell) subtracts. Reconcile compares this
+/// against the exchange position size to detect a client manually adding,
+/// reducing, or closing a system-owned position. Returns (signed_base, side):
+/// e.g. +0.10/"long", -0.10/"short", or 0.0/"" when the system holds nothing.
 ///
-/// Only counts orders WE placed (intent_id is not null): a manual/imported order
-/// repaired into the orders table from the exchange has no intent_id and must not
-/// pollute the system's expected position.
+/// Counts by filled_size, NOT status: a PARTIAL fill keeps the order 'submitted'
+/// (set_order_fill_state / set_order_filled_from_detail only flip to 'filled' at
+/// the full ordered size) but its filled base is real position the system holds.
+/// Keying on status='filled' would zero-out partials and mis-classify the
+/// position as imported. Only counts orders WE placed (intent_id is not null): a
+/// manual/imported order repaired into the orders table has no intent_id and must
+/// not pollute the system's expected position.
 pub fn system_net_base_for_symbol(conn: &Connection, symbol: &str) -> Result<(f64, &'static str)> {
     let mut stmt = conn.prepare(
         "select side, filled_size from orders
-         where symbol = ? and status = 'filled' and filled_size > 0
-           and intent_id is not null",
+         where symbol = ? and filled_size > 0 and intent_id is not null",
     )?;
     let rows = stmt.query_map(params![symbol], |row| {
         let side: String = row.get(0)?;
@@ -332,15 +335,16 @@ pub fn sync_order_fill_state(conn: &Connection, order_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Retire the symbol's filled system orders (intent_id set) to 'externally_closed'
-/// after a client manually closed the whole position in the Bitget UI. Since
-/// system_net_base_for_symbol only counts status='filled', this returns the net
-/// base to 0 so the manual-close drift is detected exactly once, not re-fired on
-/// every subsequent reconcile pass (flapping). Returns the number of rows changed.
+/// Retire the symbol's filled system orders (intent_id set, filled_size > 0) to
+/// 'externally_closed' AND zero their filled_size, after a client manually closed
+/// the whole position in the Bitget UI. system_net_base_for_symbol counts by
+/// filled_size (not status), so zeroing filled_size is what returns the net base
+/// to 0 — preventing the manual-close drift from re-firing on every subsequent
+/// pass (flapping). Returns the number of rows changed.
 pub fn mark_system_orders_externally_closed(conn: &Connection, symbol: &str) -> Result<usize> {
     let changed = conn.execute(
-        "update orders set status = 'externally_closed', updated_at = datetime('now')
-         where symbol = ? and intent_id is not null and status = 'filled'",
+        "update orders set status = 'externally_closed', filled_size = 0, updated_at = datetime('now')
+         where symbol = ? and intent_id is not null and filled_size > 0",
         params![symbol],
     )?;
     Ok(changed)
@@ -730,6 +734,65 @@ mod tests {
         assert!(
             net.abs() < 1e-9 && side.is_empty(),
             "manual order (no intent_id) must not count toward system net, got {net}/{side}"
+        );
+    }
+
+    #[test]
+    fn system_net_base_counts_partial_fills_still_in_submitted() {
+        // F1: a partial fill keeps the order 'submitted' (set_order_fill_state /
+        // set_order_filled_from_detail only flip to 'filled' at the full ordered
+        // size). That partial base is REAL position the system holds, so net base
+        // must count it — otherwise reconcile mis-classifies the position as
+        // imported and mis-fires manual override, or skips local cleanup on a
+        // manual full-close (sys_base wrongly reads 0).
+        let conn = memory_db();
+        conn.execute(
+            "insert into trade_intents (intent_id, created_at, symbol, side, action,
+               target_notional, max_order_notional, status, source)
+             values ('i1','2026-07-01T00:00:00Z','ETH/USDT:USDT','long','open',100,100,'executed','t')",
+            [],
+        )
+        .unwrap();
+        // Ordered 0.05 but only 0.02 filled → stays 'submitted' with filled_size 0.02.
+        conn.execute(
+            "insert into orders (order_id, client_oid, intent_id, symbol, side, action,
+               order_type, status, price, size, filled_size, created_at, updated_at)
+             values ('o1','o1','i1','ETH/USDT:USDT','buy','open','limit','submitted',
+               3000, 0.05, 0.02, '2026-07-01T00:00:00Z', '2026-07-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        let (net, side) = system_net_base_for_symbol(&conn, "ETH/USDT:USDT").unwrap();
+        assert!(
+            (net - 0.02).abs() < 1e-9 && side == "long",
+            "partial fill in 'submitted' must count toward system net, got {net}/{side}"
+        );
+
+        // A full fill ('filled', filled_size = ordered) still counts as before.
+        conn.execute(
+            "insert into orders (order_id, client_oid, intent_id, symbol, side, action,
+               order_type, status, price, size, filled_size, created_at, updated_at)
+             values ('o2','o2','i1','ETH/USDT:USDT','buy','open','limit','filled',
+               3000, 0.03, 0.03, '2026-07-01T00:00:00Z', '2026-07-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        let (net2, side2) = system_net_base_for_symbol(&conn, "ETH/USDT:USDT").unwrap();
+        assert!((net2 - 0.05).abs() < 1e-9 && side2 == "long");
+
+        // A 'submitted' order with NO fill (filled_size 0) still contributes nothing.
+        conn.execute(
+            "insert into orders (order_id, client_oid, intent_id, symbol, side, action,
+               order_type, status, price, size, filled_size, created_at, updated_at)
+             values ('o3','o3','i1','ETH/USDT:USDT','buy','open','limit','submitted',
+               3000, 0.10, 0.0, '2026-07-01T00:00:00Z', '2026-07-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        let (net3, _) = system_net_base_for_symbol(&conn, "ETH/USDT:USDT").unwrap();
+        assert!(
+            (net3 - 0.05).abs() < 1e-9,
+            "unfilled submitted order must not count"
         );
     }
 
