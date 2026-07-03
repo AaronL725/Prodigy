@@ -368,6 +368,41 @@ pub async fn reconcile_once(
         }
     }
 
+    // Manual CANCEL detection: a system order we still hold as 'submitted' that the
+    // exchange no longer lists as pending was cancelled outside the executor (the
+    // client cancelled it in the Bitget UI). Fills repair ran above, so an order
+    // that actually filled is already 'filled' (not 'submitted') and won't be seen
+    // here. Mark each such order externally_cancelled and enter override. Skipped in
+    // test-reset mode (system cleanup, not user intervention).
+    if detect_override {
+        for (client_oid, _order_id) in db::local_working_system_orders(conn, &symbol)? {
+            if exchange_pending_client_oids.contains(&client_oid) {
+                continue; // still live on the exchange — not cancelled.
+            }
+            db::mark_order_externally_cancelled(conn, &client_oid)?;
+            if !override_active {
+                db::set_executor_state(conn, &override_key, "active")?;
+                override_active = true;
+                entered_this_run = true;
+                db::write_event(
+                    conn,
+                    "warning",
+                    "executor",
+                    "manual override entered (order externally cancelled)",
+                    &format!("{{\"symbol\":\"{symbol}\",\"client_oid\":\"{client_oid}\"}}"),
+                )?;
+                notify::send_telegram(
+                    telegram_token,
+                    telegram_chat,
+                    "manual_override_entered",
+                    &format!("manual override entered for {symbol} (order externally cancelled)"),
+                )
+                .await
+                .ok();
+            }
+        }
+    }
+
     // Positions: classify (system vs imported) and upsert exchange truth.
     let positions = rest
         .get(

@@ -296,6 +296,42 @@ pub fn mark_system_orders_externally_closed(conn: &Connection, symbol: &str) -> 
     Ok(changed)
 }
 
+/// System orders (intent_id set) still in a working ('submitted') state for a
+/// symbol. Reconcile compares these against the exchange pending list: a working
+/// system order the exchange no longer lists (and that never filled) was cancelled
+/// outside the executor (manual cancel in the Bitget UI). Returns (client_oid,
+/// order_id) pairs so the caller can match against exchange pending client_oids
+/// and mark the vanished ones externally_cancelled.
+pub fn local_working_system_orders(
+    conn: &Connection,
+    symbol: &str,
+) -> Result<Vec<(String, String)>> {
+    let mut stmt = conn.prepare(
+        "select client_oid, order_id from orders
+         where symbol = ? and intent_id is not null and status = 'submitted'",
+    )?;
+    let rows = stmt.query_map(params![symbol], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// Mark a system order externally_cancelled after the client cancelled it in the
+/// Bitget UI (it vanished from the exchange pending list without filling). The
+/// spec requires system orders manually cancelled to be recorded as such.
+pub fn mark_order_externally_cancelled(conn: &Connection, client_oid: &str) -> Result<()> {
+    conn.execute(
+        "update orders set status = 'externally_cancelled', updated_at = datetime('now')
+         where client_oid = ?",
+        params![client_oid],
+    )?;
+    Ok(())
+}
+
 /// Insert a fill record. Idempotent by fill_id (PK) via insert-or-ignore.
 pub fn insert_fill(conn: &Connection, fill: &FillRecord) -> Result<()> {
     conn.execute(
@@ -790,5 +826,85 @@ mod tests {
             })
             .unwrap();
         assert_eq!(status, "externally_closed");
+    }
+
+    #[test]
+    fn working_system_orders_lists_only_submitted_system_orders() {
+        // C2: a system pending order the client cancels in the Bitget UI vanishes
+        // from the exchange pending list. Reconcile finds our still-'submitted'
+        // system orders and, if they're no longer pending on the exchange, marks
+        // them externally_cancelled. This lister returns the candidates: system
+        // (intent_id set) orders still in a working ('submitted') state.
+        let conn = memory_db();
+        conn.execute(
+            "insert into trade_intents (intent_id, created_at, symbol, side, action,
+               target_notional, max_order_notional, status, source)
+             values ('i1','2026-07-01T00:00:00Z','ETH/USDT:USDT','long','open',100,100,'accepted','t')",
+            [],
+        )
+        .unwrap();
+        // A working system order (submitted) → candidate.
+        conn.execute(
+            "insert into orders (order_id, client_oid, intent_id, symbol, side, action,
+               order_type, status, price, size, filled_size, created_at, updated_at)
+             values ('o1','c1','i1','ETH/USDT:USDT','buy','open','limit','submitted',
+               3000, 0.05, 0.0, '2026-07-01T00:00:00Z', '2026-07-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        // A filled system order → NOT a candidate (terminal).
+        conn.execute(
+            "insert into orders (order_id, client_oid, intent_id, symbol, side, action,
+               order_type, status, price, size, filled_size, created_at, updated_at)
+             values ('o2','c2','i1','ETH/USDT:USDT','buy','open','limit','filled',
+               3000, 0.05, 0.05, '2026-07-01T00:00:00Z', '2026-07-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        // A working NON-system order (no intent_id) → NOT a candidate.
+        conn.execute(
+            "insert into orders (order_id, client_oid, symbol, side, action,
+               order_type, status, price, size, filled_size, created_at, updated_at)
+             values ('o3','c3','ETH/USDT:USDT','buy','open','limit','submitted',
+               3000, 0.05, 0.0, '2026-07-01T00:00:00Z', '2026-07-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        let working = local_working_system_orders(&conn, "ETH/USDT:USDT").unwrap();
+        assert_eq!(working.len(), 1);
+        assert_eq!(working[0].0, "c1"); // client_oid
+        assert_eq!(working[0].1, "o1"); // order_id
+    }
+
+    #[test]
+    fn mark_order_externally_cancelled_sets_status() {
+        let conn = memory_db();
+        conn.execute(
+            "insert into trade_intents (intent_id, created_at, symbol, side, action,
+               target_notional, max_order_notional, status, source)
+             values ('i1','2026-07-01T00:00:00Z','ETH/USDT:USDT','long','open',100,100,'accepted','t')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "insert into orders (order_id, client_oid, intent_id, symbol, side, action,
+               order_type, status, price, size, filled_size, created_at, updated_at)
+             values ('o1','c1','i1','ETH/USDT:USDT','buy','open','limit','submitted',
+               3000, 0.05, 0.0, '2026-07-01T00:00:00Z', '2026-07-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        mark_order_externally_cancelled(&conn, "c1").unwrap();
+
+        let status: String = conn
+            .query_row(
+                "select status from orders where client_oid = 'c1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "externally_cancelled");
     }
 }
