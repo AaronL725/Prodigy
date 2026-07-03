@@ -84,7 +84,7 @@ impl ExecutorConfig {
 
     pub fn validate_demo_only(&self) -> Result<()> {
         if self.mode != TradingMode::Demo {
-            bail!("third milestone executor only supports Bitget demo mode");
+            bail!("prodigy executor only supports Bitget demo mode");
         }
         if self.secrets.api_key.trim().is_empty()
             || self.secrets.api_secret.trim().is_empty()
@@ -149,7 +149,7 @@ mod tests {
     }
 
     #[test]
-    fn live_mode_is_rejected_for_third_milestone() {
+    fn live_mode_is_rejected() {
         let cfg = ExecutorConfig {
             mode: TradingMode::Live,
             ..ExecutorConfig::demo_for_tests()

@@ -103,8 +103,13 @@ fn pnl_response(conn: &Connection) -> Result<String> {
             |r| r.get(0),
         )
         .ok();
+    // ponytail: M4 /pnl is unrealized-only — it does NOT report realized PnL. Realized
+    // PnL per closed trade is a future-milestone concern (it needs the per-trade fills
+    // ledger aggregated by close intent); M4 surfaces only live unrealized PnL + the
+    // last REST equity snapshot. Saying so explicitly so an operator isn't misled into
+    // treating this as total account PnL.
     Ok(format!(
-        "pnl:\nunrealized={unrealized}\nequity={}",
+        "pnl (unrealized-only, M4):\nunrealized={unrealized}\nequity={}\nrealized=n/a (not tracked in M4)",
         equity.unwrap_or(0.0)
     ))
 }

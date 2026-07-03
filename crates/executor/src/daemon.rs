@@ -38,6 +38,11 @@ impl ReconcileSignal {
 pub async fn run_daemon(cfg: ExecutorConfig, options: DaemonOptions) -> Result<()> {
     cfg.validate_demo_only()?;
     let conn = rusqlite::Connection::open(&cfg.db_path)?;
+    // ponytail: WAL persists in the DB file header (idempotent; matches src/prodigy/db.py).
+    // M4 has Python writing intents, the daemon R/W, the private WS writing, and Telegram
+    // reading — all concurrent. WAL lets those readers/writers proceed in parallel instead of
+    // serializing on a single rollback journal; busy_timeout makes them wait out SQLITE_BUSY.
+    let _ = conn.pragma_update(None, "journal_mode", "wal");
     conn.busy_timeout(Duration::from_secs(5))?;
     let rest = crate::bitget::BitgetRestClient::new(cfg.clone())?;
 

@@ -113,7 +113,7 @@ where
             "--mode" => {
                 let value = args.next().unwrap_or_else(|| "demo".to_string());
                 if value != "demo" {
-                    bail!("third milestone executor only supports --mode demo");
+                    bail!("prodigy executor only supports --mode demo");
                 }
             }
             other => bail!("unknown argument: {other}"),
