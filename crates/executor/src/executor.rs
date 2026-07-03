@@ -593,8 +593,9 @@ pub fn classify_order_poll(status: &str, filled_size: f64, order_size: f64) -> O
 }
 
 /// Read (status, filled_size) out of a detail `data` object, tolerating both the
-/// `status` and `state` key spellings and the `baseVolume` fill field.
-fn read_detail_fields(data: &serde_json::Value) -> (String, f64) {
+/// `status` and `state` key spellings and the `baseVolume` fill field. `pub(crate)`
+/// so reconcile's missing-pending-order classifier reuses the same parse.
+pub(crate) fn read_detail_fields(data: &serde_json::Value) -> (String, f64) {
     let status = data
         .get("status")
         .or_else(|| data.get("state"))

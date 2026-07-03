@@ -307,20 +307,24 @@ pub fn mark_system_orders_externally_closed(conn: &Connection, symbol: &str) -> 
 
 /// System orders (intent_id set) still in a working ('submitted') state for a
 /// symbol. Reconcile compares these against the exchange pending list: a working
-/// system order the exchange no longer lists (and that never filled) was cancelled
-/// outside the executor (manual cancel in the Bitget UI). Returns (client_oid,
-/// order_id) pairs so the caller can match against exchange pending client_oids
-/// and mark the vanished ones externally_cancelled.
+/// system order the exchange no longer lists was either cancelled outside the
+/// executor (manual cancel) OR filled but briefly absent from pending. Reconcile
+/// second-confirms via order detail, using the returned ordered size to tell full
+/// vs partial fill. Returns (client_oid, order_id, ordered_size) triples.
 pub fn local_working_system_orders(
     conn: &Connection,
     symbol: &str,
-) -> Result<Vec<(String, String)>> {
+) -> Result<Vec<(String, String, f64)>> {
     let mut stmt = conn.prepare(
-        "select client_oid, order_id from orders
+        "select client_oid, order_id, coalesce(size, 0) from orders
          where symbol = ? and intent_id is not null and status = 'submitted'",
     )?;
     let rows = stmt.query_map(params![symbol], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, f64>(2)?,
+        ))
     })?;
     let mut out = Vec::new();
     for row in rows {
@@ -884,6 +888,7 @@ mod tests {
         assert_eq!(working.len(), 1);
         assert_eq!(working[0].0, "c1"); // client_oid
         assert_eq!(working[0].1, "o1"); // order_id
+        assert!((working[0].2 - 0.05).abs() < 1e-9); // ordered size
     }
 
     #[test]

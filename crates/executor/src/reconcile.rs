@@ -124,6 +124,48 @@ fn classify_position_drift(
 
 const DUST_BASE: f64 = 1e-6;
 
+/// Verdict for a local 'submitted' system order that the exchange no longer lists
+/// as pending. Reconcile second-confirms via GET /api/v2/mix/order/detail before
+/// acting: the fillList can lag/truncate, so a just-filled order may briefly look
+/// "gone from pending" and must NOT be misjudged as a manual cancel.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum MissingOrderVerdict {
+    /// The order actually filled (fully or partially) — reconcile the fill/order,
+    /// this is NOT a manual cancel. Carries the observed filled base.
+    Filled(f64),
+    /// Confirmed cancelled/rejected on the exchange — mark externally_cancelled
+    /// and enter override.
+    Cancelled,
+    /// Neither filled nor confirmed cancelled (still live, or detail unreadable).
+    /// Do NOT mark cancelled — leave the order needs_reconcile and emit an event
+    /// so a later pass / human reconciles it.
+    Unknown,
+}
+
+/// Classify a missing-from-pending system order from its exchange order-detail
+/// `data` object (GET /api/v2/mix/order/detail). Pure wrapper over the same
+/// status/filled parse the execution loop uses, so a filled-but-not-pending order
+/// is honored instead of misjudged as a manual cancel. `order_size` is the local
+/// ordered size (to tell full vs partial fill); passes 0.0 to skip the size check.
+pub fn classify_missing_pending_order(
+    detail: &serde_json::Value,
+    order_size: f64,
+) -> MissingOrderVerdict {
+    let (status, filled) = crate::executor::read_detail_fields(detail);
+    match crate::executor::classify_order_poll(&status, filled, order_size) {
+        crate::executor::OrderPollOutcome::Filled => MissingOrderVerdict::Filled(filled),
+        crate::executor::OrderPollOutcome::Vanished => MissingOrderVerdict::Cancelled,
+        crate::executor::OrderPollOutcome::Live => {
+            // Some base filled but still working, OR no readable status/fill.
+            if filled > 0.0 {
+                MissingOrderVerdict::Filled(filled)
+            } else {
+                MissingOrderVerdict::Unknown
+            }
+        }
+    }
+}
+
 /// Decide whether a single fillList row from GET /api/v2/mix/order/fills is a
 /// missing local fill worth repairing, and if so build its FillRecord. The
 /// exchange fillList carries `orderId` (the exchange order id) but NOT our
@@ -368,37 +410,108 @@ pub async fn reconcile_once(
         }
     }
 
-    // Manual CANCEL detection: a system order we still hold as 'submitted' that the
-    // exchange no longer lists as pending was cancelled outside the executor (the
-    // client cancelled it in the Bitget UI). Fills repair ran above, so an order
-    // that actually filled is already 'filled' (not 'submitted') and won't be seen
-    // here. Mark each such order externally_cancelled and enter override. Skipped in
-    // test-reset mode (system cleanup, not user intervention).
+    // Manual CANCEL detection: a system order we still hold as 'submitted' that
+    // the exchange no longer lists as pending was EITHER cancelled outside the
+    // executor (manual cancel in the Bitget UI) OR filled but briefly absent from
+    // the pending list (the fillList can lag/truncate). Second-confirm via order
+    // detail before acting, so a just-filled order is honored, not misjudged as a
+    // manual cancel:
+    //   Filled/partial → record the fill + sync the order (no override).
+    //   Cancelled      → externally_cancelled + enter override.
+    //   Unknown        → needs_reconcile + event, do NOT mark cancelled.
+    // Skipped in test-reset mode (system cleanup, not user intervention).
     if detect_override {
-        for (client_oid, _order_id) in db::local_working_system_orders(conn, &symbol)? {
+        for (client_oid, order_id, ordered_size) in db::local_working_system_orders(conn, &symbol)?
+        {
             if exchange_pending_client_oids.contains(&client_oid) {
                 continue; // still live on the exchange — not cancelled.
             }
-            db::mark_order_externally_cancelled(conn, &client_oid)?;
-            if !override_active {
-                db::set_executor_state(conn, &override_key, "active")?;
-                override_active = true;
-                entered_this_run = true;
-                db::write_event(
-                    conn,
-                    "warning",
-                    "executor",
-                    "manual override entered (order externally cancelled)",
-                    &format!("{{\"symbol\":\"{symbol}\",\"client_oid\":\"{client_oid}\"}}"),
-                )?;
-                notify::send_telegram(
-                    telegram_token,
-                    telegram_chat,
-                    "manual_override_entered",
-                    &format!("manual override entered for {symbol} (order externally cancelled)"),
-                )
-                .await
-                .ok();
+            let detail = rest.get_order_detail(&client_oid).await.ok();
+            let verdict = match &detail {
+                Some(d) => classify_missing_pending_order(d, ordered_size),
+                None => MissingOrderVerdict::Unknown,
+            };
+            match verdict {
+                MissingOrderVerdict::Filled(filled) => {
+                    // The order actually filled — repair the fill/order, not a cancel.
+                    // Best-effort fill row from order detail (price/fee may be absent;
+                    // reconcile owns enrichment later).
+                    let d = detail.as_ref();
+                    let f_price = d
+                        .and_then(|x| x.get("priceAvg").or_else(|| x.get("averageFillPrice")))
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(|v| v.parse::<f64>().ok())
+                        .unwrap_or(0.0);
+                    let f_fee = d
+                        .and_then(|x| x.get("fee"))
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(|v| v.parse::<f64>().ok())
+                        .map(|f| f.abs())
+                        .unwrap_or(0.0);
+                    let f_side = d
+                        .and_then(|x| x.get("side"))
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    db::insert_fill(
+                        conn,
+                        &crate::types::FillRecord {
+                            fill_id: format!("fill-{order_id}-reconcile"),
+                            order_id: order_id.clone(),
+                            trade_id: None,
+                            client_oid: Some(client_oid.clone()),
+                            symbol: symbol.clone(),
+                            side: f_side,
+                            price: f_price,
+                            size: filled,
+                            fee: f_fee,
+                            created_at: "reconciled".to_string(),
+                            raw_json: "{}".to_string(),
+                        },
+                    )
+                    .ok();
+                    db::sync_order_fill_state(conn, &order_id)?;
+                }
+                MissingOrderVerdict::Cancelled => {
+                    db::mark_order_externally_cancelled(conn, &client_oid)?;
+                    if !override_active {
+                        db::set_executor_state(conn, &override_key, "active")?;
+                        override_active = true;
+                        entered_this_run = true;
+                        db::write_event(
+                            conn,
+                            "warning",
+                            "executor",
+                            "manual override entered (order externally cancelled)",
+                            &format!("{{\"symbol\":\"{symbol}\",\"client_oid\":\"{client_oid}\"}}"),
+                        )?;
+                        notify::send_telegram(
+                            telegram_token,
+                            telegram_chat,
+                            "manual_override_entered",
+                            &format!(
+                                "manual override entered for {symbol} (order externally cancelled)"
+                            ),
+                        )
+                        .await
+                        .ok();
+                    }
+                }
+                MissingOrderVerdict::Unknown => {
+                    // Don't claim a cancel — flag it for a later pass / human.
+                    let _ = conn.execute(
+                        "update orders set status = 'needs_reconcile', updated_at = datetime('now')
+                         where client_oid = ?",
+                        rusqlite::params![client_oid],
+                    );
+                    db::write_event(
+                        conn,
+                        "warning",
+                        "executor",
+                        "system order missing from exchange pending; left to reconcile",
+                        &format!("{{\"symbol\":\"{symbol}\",\"client_oid\":\"{client_oid}\"}}"),
+                    )?;
+                }
             }
         }
     }
@@ -892,6 +1005,50 @@ mod tests {
                 .as_deref(),
             Some("i-open"),
             "net base is still positive after a partial close, so system-owned"
+        );
+    }
+
+    #[test]
+    fn missing_pending_order_second_confirmed_via_detail() {
+        // D2: a 'submitted' system order missing from the exchange pending list is
+        // NOT assumed cancelled — the fillList can lag/truncate, so a just-filled
+        // order may briefly look "gone". Reconcile second-confirms via order detail:
+        // filled/partial → honor the fill; cancelled → externally_cancelled;
+        // live/unknown → needs_reconcile, never marked cancelled.
+
+        // Confirmed cancelled on the exchange → Cancelled.
+        let cancelled = serde_json::json!({"state":"canceled","baseVolume":"0"});
+        assert_eq!(
+            classify_missing_pending_order(&cancelled, 0.05),
+            MissingOrderVerdict::Cancelled
+        );
+
+        // Actually filled (status filled, full base) → Filled, NOT Cancelled.
+        let filled = serde_json::json!({"state":"filled","baseVolume":"0.05"});
+        assert_eq!(
+            classify_missing_pending_order(&filled, 0.05),
+            MissingOrderVerdict::Filled(0.05)
+        );
+
+        // Partial fill but still 'live' with base>0 → honor the partial fill.
+        let partial = serde_json::json!({"state":"live","baseVolume":"0.02"});
+        assert_eq!(
+            classify_missing_pending_order(&partial, 0.05),
+            MissingOrderVerdict::Filled(0.02)
+        );
+
+        // Still live, no fill, not cancelled → Unknown (leave to reconcile).
+        let live = serde_json::json!({"state":"live","baseVolume":"0"});
+        assert_eq!(
+            classify_missing_pending_order(&live, 0.05),
+            MissingOrderVerdict::Unknown
+        );
+
+        // Unreadable detail (no status/fill) → Unknown, not a silent cancel.
+        let unreadable = serde_json::json!({});
+        assert_eq!(
+            classify_missing_pending_order(&unreadable, 0.05),
+            MissingOrderVerdict::Unknown
         );
     }
 
