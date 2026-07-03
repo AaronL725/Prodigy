@@ -244,7 +244,7 @@ async fn bitget_demo_can_open_and_reduce_only_close_market_order() {
     // one that flags an un-runnable demo environment.
     eprintln!("market open filled (size {opened_size}); reduceOnly closing");
     let mut cleared = false;
-    for attempt in 1..=6 {
+    for attempt in 1..=8 {
         let close_oid = format!(
             "pdgy-test-close-{}-{attempt}",
             prodigy_executor::bitget::now_ms()
@@ -279,8 +279,10 @@ async fn bitget_demo_can_open_and_reduce_only_close_market_order() {
             break;
         }
         eprintln!("reduceOnly close attempt {attempt} did not clear the position; retrying");
-        // Brief pause between attempts so the volatile demo book can refresh.
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        // Pause between attempts so the volatile demo book can refresh its bid
+        // liquidity (the close is a market SELL crossing to the bid, which can be
+        // phantom even when the open's BUY crossed the ask).
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
     }
     assert!(
         cleared,
