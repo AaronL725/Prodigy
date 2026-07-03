@@ -215,7 +215,18 @@ pub async fn reconcile_once(
         db::get_executor_state(conn, &override_key)?.as_deref(),
         Some("active")
     );
+    // Guard: an override entered on THIS pass must not be undone by the same-pass
+    // auto-clear (a manual full-close leaves position=0 and orders=0, which would
+    // otherwise clear the override we just entered for that very close).
+    let mut entered_this_run = false;
     let mut exchange_open_count: usize = 0;
+    // Whether the exchange returned a position row for our symbol this pass. If it
+    // did NOT but our local orders still imply a nonzero net, the position was
+    // fully closed outside the executor (manual full-close) → manual override.
+    let mut exchange_has_position = false;
+    // client_oids the exchange still lists as pending — a local system pending
+    // order NOT in this set was cancelled outside the executor (manual cancel).
+    let mut exchange_pending_client_oids: HashSet<String> = HashSet::new();
 
     // Open orders: insert any exchange order we don't already have locally.
     let open_orders = rest
@@ -238,6 +249,9 @@ pub async fn reconcile_once(
             continue;
         }
         exchange_open_count += 1;
+        if !client_oid.is_empty() {
+            exchange_pending_client_oids.insert(client_oid.clone());
+        }
         if client_oid.is_empty() || local_oids.contains(&client_oid) {
             continue;
         }
@@ -259,6 +273,7 @@ pub async fn reconcile_once(
             {
                 db::set_executor_state(conn, &override_key, "active")?;
                 override_active = true;
+                entered_this_run = true;
                 db::write_event(
                     conn,
                     "warning",
@@ -404,6 +419,12 @@ pub async fn reconcile_once(
             raw_json: row.to_string(),
         };
         let record = classify_exchange_position(conn, record, now)?;
+        // Remember the exchange returned a live position for our symbol, so the
+        // post-loop manual-full-close check (which fires when NO row comes back)
+        // knows this symbol still has exposure on the exchange.
+        if record.symbol == rest.display_symbol() && size.abs() > DUST_BASE {
+            exchange_has_position = true;
+        }
         db::upsert_position(conn, &record)?;
         repaired_positions += 1;
 
@@ -413,6 +434,7 @@ pub async fn reconcile_once(
         if detect_override && record.ownership == "imported" && !override_active {
             db::set_executor_state(conn, &override_key, "active")?;
             override_active = true;
+            entered_this_run = true;
             db::write_event(
                 conn,
                 "warning",
@@ -447,6 +469,7 @@ pub async fn reconcile_once(
             {
                 db::set_executor_state(conn, &override_key, "active")?;
                 override_active = true;
+                entered_this_run = true;
                 db::write_event(
                     conn,
                     "warning",
@@ -472,9 +495,45 @@ pub async fn reconcile_once(
         }
     }
 
+    // Manual FULL-CLOSE detection: when a client fully closes a system position in
+    // the Bitget UI, the exchange stops returning a position row for the symbol, so
+    // the per-row drift check above never runs. Detect it here: our local orders
+    // still imply a nonzero system net base, but the exchange returned no position
+    // for the symbol → the position was closed out from under us. Enter override
+    // and retire the contributing system orders (externally_closed) so the net base
+    // returns to zero and this doesn't re-fire on every subsequent pass. Skipped in
+    // test-reset mode (system cleanup, not user intervention).
+    if detect_override && !override_active && !exchange_has_position {
+        let (sys_base, _sys_side) = db::system_net_base_for_symbol(conn, &symbol)?;
+        if sys_base.abs() > f64::EPSILON {
+            db::set_executor_state(conn, &override_key, "active")?;
+            override_active = true;
+            entered_this_run = true;
+            db::mark_system_orders_externally_closed(conn, &symbol)?;
+            db::write_event(
+                conn,
+                "warning",
+                "executor",
+                "manual override entered (position externally closed)",
+                &format!("{{\"symbol\":\"{symbol}\"}}"),
+            )?;
+            notify::send_telegram(
+                telegram_token,
+                telegram_chat,
+                "manual_override_entered",
+                &format!("manual override entered for {symbol} (position externally closed)"),
+            )
+            .await
+            .ok();
+        }
+    }
+
     // Auto-clear the per-symbol override once the exchange has no position and no
-    // open orders for it (spec: resume auto-open when pos+orders reach zero).
-    if override_active {
+    // open orders for it (spec: resume auto-open when pos+orders reach zero). Skip
+    // when we ENTERED override this same pass: a manual full-close/cancel leaves
+    // pos+orders at zero, which would otherwise clear the override we just set
+    // before the operator ever sees it. It clears on a later pass instead.
+    if override_active && !entered_this_run {
         let exchange_position_notional: f64 = {
             let pos = rest
                 .get(

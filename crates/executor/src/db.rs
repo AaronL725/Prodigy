@@ -282,6 +282,20 @@ pub fn sync_order_fill_state(conn: &Connection, order_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Retire the symbol's filled system orders (intent_id set) to 'externally_closed'
+/// after a client manually closed the whole position in the Bitget UI. Since
+/// system_net_base_for_symbol only counts status='filled', this returns the net
+/// base to 0 so the manual-close drift is detected exactly once, not re-fired on
+/// every subsequent reconcile pass (flapping). Returns the number of rows changed.
+pub fn mark_system_orders_externally_closed(conn: &Connection, symbol: &str) -> Result<usize> {
+    let changed = conn.execute(
+        "update orders set status = 'externally_closed', updated_at = datetime('now')
+         where symbol = ? and intent_id is not null and status = 'filled'",
+        params![symbol],
+    )?;
+    Ok(changed)
+}
+
 /// Insert a fill record. Idempotent by fill_id (PK) via insert-or-ignore.
 pub fn insert_fill(conn: &Connection, fill: &FillRecord) -> Result<()> {
     conn.execute(
@@ -733,5 +747,48 @@ mod tests {
             .unwrap();
         assert_eq!(status, "submitted");
         assert!((filled - 0.02).abs() < 1e-9);
+    }
+
+    #[test]
+    fn mark_system_orders_externally_closed_zeroes_system_net() {
+        // When a client manually closes a system position, the exchange stops
+        // returning a position row and our local filled opens still imply a
+        // nonzero net. Reconcile marks the contributing system orders
+        // 'externally_closed' so the net base returns to 0 and the manual-close
+        // drift doesn't re-fire on every subsequent pass (flapping).
+        let conn = memory_db();
+        conn.execute(
+            "insert into trade_intents (intent_id, created_at, symbol, side, action,
+               target_notional, max_order_notional, status, source)
+             values ('i1','2026-07-01T00:00:00Z','ETH/USDT:USDT','long','open',100,100,'executed','t')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "insert into orders (order_id, client_oid, intent_id, symbol, side, action,
+               order_type, status, price, size, filled_size, created_at, updated_at)
+             values ('o1','o1','i1','ETH/USDT:USDT','buy','open','limit','filled',
+               3000, 0.05, 0.05, '2026-07-01T00:00:00Z', '2026-07-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        let (net, side) = system_net_base_for_symbol(&conn, "ETH/USDT:USDT").unwrap();
+        assert!((net - 0.05).abs() < 1e-9 && side == "long");
+
+        let changed = mark_system_orders_externally_closed(&conn, "ETH/USDT:USDT").unwrap();
+        assert!(changed >= 1, "expected at least one system order retired");
+
+        // Net base is now 0 (externally_closed no longer counts as a live fill).
+        let (net_after, side_after) = system_net_base_for_symbol(&conn, "ETH/USDT:USDT").unwrap();
+        assert!(
+            net_after.abs() < 1e-9 && side_after.is_empty(),
+            "system net must be flat after external close, got {net_after}/{side_after}"
+        );
+        let status: String = conn
+            .query_row("select status from orders where order_id = 'o1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(status, "externally_closed");
     }
 }
