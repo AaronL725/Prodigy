@@ -381,8 +381,9 @@ pub async fn reconcile_once(
     }
 
     // Fills: repair any exchange fill for one of our orders we haven't recorded
-    // yet (the execution loop records fills as it polls, but a crash/restart or a
-    // missed WS event can leave a fill un-persisted). Source = the exchange
+    // yet (the execution loop syncs filled_size/status as it polls, but the
+    // per-trade fills ledger comes only from fillList here; a crash/restart or
+    // missed run can leave trades un-persisted). Source = the exchange
     // fillList (GET /api/v2/mix/order/fills); join on orderId (the fillList has
     // no clientOid), dedup by trade_id, insert-or-ignore. This runs BEFORE the
     // position/drift loop below so a repaired fill's order sync is visible to
@@ -429,7 +430,7 @@ pub async fn reconcile_once(
     // the pending list (the fillList can lag/truncate). Second-confirm via order
     // detail before acting, so a just-filled order is honored, not misjudged as a
     // manual cancel:
-    //   Filled/partial → record the fill + sync the order (no override).
+    //   Filled/partial → sync filled_size/status (no override).
     //   Cancelled      → externally_cancelled + enter override.
     //   Unknown        → needs_reconcile + event, do NOT mark cancelled.
     // Skipped in test-reset mode (system cleanup, not user intervention).

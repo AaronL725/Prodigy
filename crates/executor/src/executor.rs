@@ -447,7 +447,7 @@ pub enum OrderMode {
 /// Guards against the prior bug of marking filled_size=0 orders as "filled".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TakerVanishedOutcome {
-    /// The order filled (fully or partially) before vanishing: record the fill.
+    /// The order filled (fully or partially) before vanishing: sync filled_size/status.
     Filled,
     /// No fill observed: do NOT mark filled; leave it to reconcile.
     NeedsReconcile,
