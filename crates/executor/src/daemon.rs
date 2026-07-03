@@ -219,7 +219,17 @@ pub fn apply_private_ws_update(
     update: crate::types::PrivateWsUpdate,
 ) -> Result<()> {
     for order in update.orders {
-        crate::db::upsert_order(conn, &order)?;
+        // ponytail: the private WS is a fast cache, not the source of truth for
+        // order identity. Only refresh orders we already placed locally — never
+        // insert a new row (that would steal identity from the REST execution
+        // path: intent_id stays NULL and system_net_base ignores a real system
+        // position) and never adopt a manual/imported order before REST reconcile
+        // detects it (local_oids would then contain it and reconcile would skip
+        // imported/manual detection). REST reconcile remains the authority for
+        // discovering new orders; the executor owns intent_id.
+        if crate::db::order_exists(conn, &order.client_oid)? {
+            crate::db::refresh_order_from_ws(conn, &order)?;
+        }
     }
     for fill in update.fills {
         crate::db::insert_fill(conn, &fill)?;
@@ -515,6 +525,15 @@ mod tests {
     use super::*;
     use crate::config::{ExecutorConfig, TradingMode};
 
+    fn test_conn() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(include_str!("../../../schema/001_initial.sql"))
+            .unwrap();
+        conn.execute_batch(include_str!("../../../schema/002_execution.sql"))
+            .unwrap();
+        conn
+    }
+
     #[test]
     fn daemon_options_default_runs_forever() {
         let options = DaemonOptions::default();
@@ -579,29 +598,65 @@ mod tests {
 
     #[test]
     fn private_ws_update_upserts_orders_and_positions() {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        conn.execute_batch(include_str!("../../../schema/001_initial.sql"))
-            .unwrap();
-        conn.execute_batch(include_str!("../../../schema/002_execution.sql"))
-            .unwrap();
-
-        let update = crate::types::PrivateWsUpdate {
-            orders: vec![crate::types::OrderRecord {
+        let conn = test_conn();
+        // Fix-A: the private WS only refreshes orders we already placed locally —
+        // it no longer INSERTS orders. So pre-insert the order (as the executor
+        // would) with an intent_id, then assert the WS push refreshes it (status
+        // flips) and keeps the count at 1. The position assertion (count 1) still
+        // holds: refresh_position_from_ws inserts on first write.
+        // FK: orders.intent_id references trade_intents — seed the parent intent.
+        conn.execute(
+            "insert into trade_intents (intent_id, created_at, symbol, side, action,
+               target_notional, max_order_notional, status, source)
+             values ('intent-1','2026-07-01T00:00:00Z','ETHUSDT','long','open',100,100,'executed','t')",
+            [],
+        )
+        .unwrap();
+        crate::db::upsert_order(
+            &conn,
+            &crate::types::OrderRecord {
                 order_id: "local-order-1".to_string(),
-                exchange_order_id: Some("ex-1".to_string()),
+                exchange_order_id: None,
                 client_oid: "client-1".to_string(),
-                intent_id: None,
+                intent_id: Some("intent-1".to_string()),
                 symbol: "ETHUSDT".to_string(),
                 side: "buy".to_string(),
                 action: "open".to_string(),
                 order_type: "market".to_string(),
-                status: "filled".to_string(),
+                status: "submitted".to_string(),
                 price: Some(100.0),
                 size: 0.1,
-                filled_size: 0.1,
+                filled_size: 0.0,
                 attempt: 1,
                 raw_json: "{}".to_string(),
                 last_error: None,
+            },
+        )
+        .unwrap();
+
+        let update = crate::types::PrivateWsUpdate {
+            orders: vec![crate::types::OrderRecord {
+                exchange_order_id: Some("ex-1".to_string()),
+                status: "filled".to_string(),
+                filled_size: 0.1,
+                intent_id: None,
+                ..crate::types::OrderRecord {
+                    order_id: "local-order-1".to_string(),
+                    exchange_order_id: None,
+                    client_oid: "client-1".to_string(),
+                    intent_id: None,
+                    symbol: "ETHUSDT".to_string(),
+                    side: "buy".to_string(),
+                    action: "open".to_string(),
+                    order_type: "market".to_string(),
+                    status: "filled".to_string(),
+                    price: Some(100.0),
+                    size: 0.1,
+                    filled_size: 0.1,
+                    attempt: 1,
+                    raw_json: "{}".to_string(),
+                    last_error: None,
+                }
             }],
             positions: vec![crate::types::PositionRecord {
                 symbol: "ETH/USDT:USDT".to_string(),
@@ -629,6 +684,17 @@ mod tests {
             .unwrap();
         assert_eq!(order_count, 1);
         assert_eq!(position_count, 1);
+        // The known order was REFRESHED: status flipped submitted -> filled, and
+        // the executor's intent_id was preserved (not clobbered to NULL by WS).
+        let (status, intent_id): (String, Option<String>) = conn
+            .query_row(
+                "select status, intent_id from orders where client_oid = 'client-1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "filled");
+        assert_eq!(intent_id.as_deref(), Some("intent-1"));
     }
 
     #[test]
@@ -659,5 +725,122 @@ mod tests {
             .query_row("select count(*) from equity_snapshots", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 0, "WS account events must not be persisted");
+    }
+
+    #[test]
+    fn apply_private_ws_update_skips_unknown_orders() {
+        // Fix-A regression: the private WS is a fast cache, NOT the source of truth
+        // for order identity. apply_private_ws_update must only refresh orders we
+        // already placed locally — it must neither steal identity from the REST
+        // execution path (inserting a system order with intent_id NULL so
+        // system_net_base drops it) nor adopt a manual/imported order before REST
+        // reconcile detects it (local_oids would then contain it and reconcile
+        // would skip imported/manual detection).
+        let conn = test_conn();
+        // FK: orders.intent_id references trade_intents — seed the parent intent.
+        conn.execute(
+            "insert into trade_intents (intent_id, created_at, symbol, side, action,
+               target_notional, max_order_notional, status, source)
+             values ('intent-a','2026-07-01T00:00:00Z','ETH/USDT:USDT','long','open',100,100,'executed','t')",
+            [],
+        )
+        .unwrap();
+        // Pre-existing LOCAL system order (order-A) — known to us, with intent_id.
+        crate::db::upsert_order(
+            &conn,
+            &crate::types::OrderRecord {
+                order_id: "order-a".to_string(),
+                exchange_order_id: None,
+                client_oid: "client-a".to_string(),
+                intent_id: Some("intent-a".to_string()),
+                symbol: "ETH/USDT:USDT".to_string(),
+                side: "buy".to_string(),
+                action: "open".to_string(),
+                order_type: "limit".to_string(),
+                status: "submitted".to_string(),
+                price: Some(3000.0),
+                size: 0.05,
+                filled_size: 0.0,
+                attempt: 1,
+                raw_json: "{}".to_string(),
+                last_error: None,
+            },
+        )
+        .unwrap();
+
+        // WS update: order-A refresh (intent_id None, now filled) + order-B that has
+        // NO local row (a manual/unknown order the WS would otherwise adopt).
+        let update = crate::types::PrivateWsUpdate {
+            orders: vec![
+                crate::types::OrderRecord {
+                    exchange_order_id: Some("ex-a".to_string()),
+                    status: "filled".to_string(),
+                    filled_size: 0.05,
+                    intent_id: None,
+                    ..crate::types::OrderRecord {
+                        order_id: "order-a".to_string(),
+                        exchange_order_id: None,
+                        client_oid: "client-a".to_string(),
+                        intent_id: None,
+                        symbol: "ETH/USDT:USDT".to_string(),
+                        side: "buy".to_string(),
+                        action: "open".to_string(),
+                        order_type: "limit".to_string(),
+                        status: "filled".to_string(),
+                        price: Some(3000.0),
+                        size: 0.05,
+                        filled_size: 0.05,
+                        attempt: 1,
+                        raw_json: "{}".to_string(),
+                        last_error: None,
+                    }
+                },
+                crate::types::OrderRecord {
+                    order_id: "order-b".to_string(),
+                    exchange_order_id: Some("ex-b".to_string()),
+                    client_oid: "client-b".to_string(),
+                    intent_id: None,
+                    symbol: "ETH/USDT:USDT".to_string(),
+                    side: "buy".to_string(),
+                    action: "open".to_string(),
+                    order_type: "market".to_string(),
+                    status: "filled".to_string(),
+                    price: Some(3000.0),
+                    size: 0.02,
+                    filled_size: 0.02,
+                    attempt: 1,
+                    raw_json: "{}".to_string(),
+                    last_error: None,
+                },
+            ],
+            ..Default::default()
+        };
+
+        apply_private_ws_update(&conn, update).unwrap();
+
+        // order-A was refreshed: status flipped to filled, intent_id preserved.
+        let a: (String, f64, Option<String>) = conn
+            .query_row(
+                "select status, filled_size, intent_id from orders where client_oid = 'client-a'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(a.0, "filled");
+        assert!((a.1 - 0.05).abs() < 1e-9);
+        assert_eq!(
+            a.2.as_deref(),
+            Some("intent-a"),
+            "known order's intent_id must be preserved"
+        );
+        // order-B (unknown/manual) was NOT adopted: no row inserted.
+        let b: i64 = conn
+            .query_row(
+                "select count(*) from orders where client_oid = 'client-b'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(b, 0, "WS must not adopt an unknown/manual order");
     }
 }
