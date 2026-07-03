@@ -194,19 +194,21 @@ async fn bitget_demo_can_open_and_reduce_only_close_market_order() {
     let rest = BitgetRestClient::new(cfg.clone()).unwrap();
     ensure_one_way_mode(&rest, &cfg).await;
 
-    // Fetch the DEMO book (paptrading:1) as a DIAGNOSTIC only — book_tradable is
-    // not a guarantee. The demo ETHUSDT book is volatile: it can look tradable
-    // (tight spread) yet still not fill a market order, or look wide and fill.
-    // The test decides pass/fail on the OBSERVED fill (position increase vs a
-    // captured baseline), never on book_tradable, and never asserts a fill MUST
-    // happen.
+    // Fetch the DEMO book (paptrading:1). If the book is obviously phantom-wide,
+    // don't create new exposure: a market buy may fill while the reduce-only sell
+    // cannot, leaving demo residue. When the book is sane, pass/fail still depends
+    // on the OBSERVED fill (position increase vs a captured baseline), not on the
+    // diagnostic alone.
     let depth = rest.merge_depth().await.expect("demo merge-depth");
+    let tradable = book_tradable(&depth, 0.02);
     eprintln!(
         "demo depth best_bid={:?} best_ask={:?} tradable={}",
-        depth.best_bid,
-        depth.best_ask,
-        book_tradable(&depth, 0.02)
+        depth.best_bid, depth.best_ask, tradable
     );
+    if !tradable {
+        eprintln!("demo book is not tradable; skipping market open/close happy path");
+        return;
+    }
 
     // Capture any pre-existing position size so a residual position from a prior
     // session (which the phantom demo book can make impossible to clear) isn't
