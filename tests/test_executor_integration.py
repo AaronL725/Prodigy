@@ -89,13 +89,22 @@ def test_rust_demo_executor_processes_pending_intent(tmp_path):
         false_fills = conn.execute(
             "select count(*) from orders where status = 'filled' and filled_size <= 0"
         ).fetchone()[0]
-        # Every 'filled' order must have a matching fills row (real price/size/fee).
         filled_orders = conn.execute(
             "select count(*) from orders where status = 'filled'"
         ).fetchone()[0]
         fills_for_filled = conn.execute(
             "select count(*) from fills where client_oid in "
             "(select client_oid from orders where status = 'filled')"
+        ).fetchone()[0]
+        # Anti-double-count: the per-trade fills ledger (sourced from the exchange
+        # fillList by reconcile) must never SUM to more than the orders' filled_size
+        # total. The execution path no longer writes fills from order-detail
+        # cumulative baseVolume, so a later fillList repair can't inflate the base.
+        fills_size_total = conn.execute(
+            "select coalesce(sum(size), 0) from fills"
+        ).fetchone()[0]
+        orders_filled_total = conn.execute(
+            "select coalesce(sum(filled_size), 0) from orders"
         ).fetchone()[0]
         event_count = conn.execute("select count(*) from events").fetchone()[0]
 
@@ -113,7 +122,15 @@ def test_rust_demo_executor_processes_pending_intent(tmp_path):
         assert intent["error"], "a failed intent must record a diagnostic error"
     assert order_count >= 1, "expected at least one demo order to be attempted"
     assert false_fills == 0, "an order must not be marked filled with no fill"
-    assert fills_for_filled == filled_orders, (
-        "every filled order must have a matching real fills row"
+    # fills are populated per-trade from fillList by reconcile, which may run
+    # after an in-processing fill — so on a single run a filled order may not yet
+    # have its fills row. The invariant is fills never EXCEED filled orders, and
+    # the fills ledger never sums above the orders' filled_size (no double-count).
+    assert fills_for_filled <= filled_orders, (
+        "fills rows must not exceed filled orders (fills are reconcile-populated)"
+    )
+    assert fills_size_total <= orders_filled_total + 1e-9, (
+        f"fills ledger ({fills_size_total}) must not exceed orders filled_size "
+        f"total ({orders_filled_total}) — would indicate a double-count"
     )
     assert event_count >= 1

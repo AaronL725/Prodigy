@@ -721,85 +721,6 @@ fn set_local_order_filled_size(
     Ok(())
 }
 
-/// Record a fill row for the audit trail. Queries the exchange order-detail for
-/// the real average fill price, fee, and trade_id so the fills table can support
-/// PnL/fee calculations. Called whenever the execution loop detects a confirmed
-/// fill (maker poll, cancel-race, taker poll).
-async fn record_fill(
-    conn: &Connection,
-    rest: &BitgetRestClient,
-    intent: &TradeIntent,
-    order: &PlaceOrderRequest,
-    filled_size: f64,
-) -> Result<()> {
-    let real_order_id: String = conn
-        .query_row(
-            "select order_id from orders where client_oid = ?",
-            rusqlite::params![order.client_oid],
-            |row| row.get(0),
-        )
-        .unwrap_or_else(|_| order.client_oid.clone());
-
-    // Query the exchange for real fill data (price, fee, trade_id).
-    let (fill_price, fill_fee, trade_id) = match rest.get_order_detail(&order.client_oid).await {
-        Ok(detail) => {
-            let price = detail
-                .get("priceAvg")
-                .or_else(|| detail.get("averageFillPrice"))
-                .and_then(serde_json::Value::as_str)
-                .and_then(|v| v.parse::<f64>().ok())
-                .unwrap_or_else(|| {
-                    // Fall back to the order's limit price if exchange doesn't report avg.
-                    order
-                        .price
-                        .as_ref()
-                        .and_then(|p| p.parse().ok())
-                        .unwrap_or(0.0)
-                });
-            let fee = detail
-                .get("fee")
-                .or_else(|| detail.get("fillFee"))
-                .and_then(serde_json::Value::as_str)
-                .and_then(|v| v.parse::<f64>().ok())
-                .unwrap_or(0.0);
-            let tid = detail
-                .get("tradeId")
-                .and_then(serde_json::Value::as_str)
-                .map(|s| s.to_string());
-            (price, fee, tid)
-        }
-        Err(_) => {
-            // Exchange query failed — use order price as fallback. Reconcile
-            // owns exchange truth and can enrich later.
-            (
-                order
-                    .price
-                    .as_ref()
-                    .and_then(|p| p.parse().ok())
-                    .unwrap_or(0.0),
-                0.0,
-                None,
-            )
-        }
-    };
-
-    let fill = crate::types::FillRecord {
-        fill_id: format!("fill-{}-{}", order.client_oid, crate::bitget::now_ms()),
-        order_id: real_order_id,
-        trade_id,
-        client_oid: Some(order.client_oid.clone()),
-        symbol: intent.symbol.clone(),
-        side: order.side.clone(),
-        price: fill_price,
-        size: filled_size,
-        fee: fill_fee,
-        created_at: crate::bitget::now_ms(),
-        raw_json: "{}".to_string(),
-    };
-    db::insert_fill(conn, &fill)?;
-    Ok(())
-}
-
 fn format_price(value: f64) -> String {
     format!("{value:.2}")
         .trim_end_matches('0')
@@ -898,12 +819,9 @@ pub async fn process_one_intent(
     };
 
     // Track the client_oid of the current live order so timeout/cancel/poll all
-    // target the same placement. The PlaceOrderRequest is kept too so the
-    // cancel-race fill branch can reuse record_fill (real price/fee/trade_id)
-    // instead of hand-writing a side="unknown"/price=0 placeholder fill.
+    // target the same placement.
     let mut live_client_oid: Option<String> = None;
     let mut live_order_size: f64 = 0.0;
-    let mut live_order_request: Option<PlaceOrderRequest> = None;
 
     // Over-fill guard: the same intended base size was re-placed on every maker
     // retry and the taker, so a partial fill that timed out and cancelled was
@@ -1053,7 +971,6 @@ pub async fn process_one_intent(
                 )?;
                 live_order_size = order.size.parse().unwrap_or(0.0);
                 live_client_oid = Some(order.client_oid.clone());
-                live_order_request = Some(order.clone());
                 state.on_order_placed(&order.client_oid);
 
                 // Poll for fill up to the maker timeout (every ~500ms).
@@ -1067,7 +984,10 @@ pub async fn process_one_intent(
                     match poll_order(rest, &order.client_oid, live_order_size).await {
                         (OrderPollOutcome::Filled, filled) => {
                             cumulative_filled_base += filled;
-                            record_fill(conn, rest, &intent, &order, filled).await?;
+                            // fills ledger is sourced per-trade from the exchange
+                            // fillList by reconcile, NOT from order-detail here (that
+                            // would double-count once fillList arrives). Just persist
+                            // the order's filled_size/status below.
                             upsert_order_row(
                                 conn,
                                 &intent,
@@ -1079,7 +999,6 @@ pub async fn process_one_intent(
                             )?;
                             state.on_order_filled();
                             live_client_oid = None;
-                            live_order_request = None;
                             break;
                         }
                         // Already gone (rare: cancelled out from under us). Treat as
@@ -1149,35 +1068,26 @@ pub async fn process_one_intent(
                     // fee, and trade_id (queried from order detail) — the prior
                     // code hand-wrote side="unknown"/price=0/fee=0 here.
                     cumulative_filled_base += confirm_filled;
-                    let live_order = live_order_request
-                        .clone()
-                        .ok_or_else(|| anyhow::anyhow!("cancel-race fill with no live order"))?;
-                    record_fill(conn, rest, &intent, &live_order, confirm_filled).await?;
+                    // fills come from fillList via reconcile; here we only persist
+                    // the order's filled_size/status.
                     set_local_order_filled(conn, &client_oid, confirm_filled)?;
                     state.on_order_filled();
                     live_client_oid = None;
-                    live_order_request = None;
                 } else if confirmed {
                     // Order is gone (cancelled); record any partial fill it left so
                     // the next attempt sizes to the remainder AND the partial base is
                     // persisted (a partial-fill-then-cancel is real system exposure).
                     // The cancel-confirm poll reports the cumulative baseVolume, so set
                     // the order's filled_size from it WITHOUT flipping status to
-                    // 'filled' (the order is gone). When a partial fill is present we
-                    // also record_fill so the fills audit trail + the test invariant
-                    // (filled order ⇒ fills row) hold, sized to the observed partial.
+                    // 'filled' (the order is gone). fills come per-trade from
+                    // fillList via reconcile — no fills row here.
                     cumulative_filled_base += confirm_filled;
                     if confirm_filled > 0.0 {
-                        let live_order = live_order_request.clone().ok_or_else(|| {
-                            anyhow::anyhow!("cancel-confirm partial fill with no live order")
-                        })?;
-                        record_fill(conn, rest, &intent, &live_order, confirm_filled).await?;
                         set_local_order_filled_size(conn, &client_oid, confirm_filled)?;
                     }
                     set_local_order_status(conn, &client_oid, "cancelled")?;
                     state.on_order_cancelled();
                     live_client_oid = None;
-                    live_order_request = None;
                 } else {
                     // Could not confirm the order is gone — refuse to place another
                     // order on top of a possibly-live one. Fail loudly.
@@ -1284,7 +1194,8 @@ pub async fn process_one_intent(
                     match poll_order(rest, &order.client_oid, taker_size).await {
                         (OrderPollOutcome::Filled, filled) => {
                             cumulative_filled_base += filled;
-                            record_fill(conn, rest, &intent, &order, filled).await?;
+                            // fills come per-trade from fillList via reconcile; here
+                            // we only persist the order's filled_size/status.
                             upsert_order_row(
                                 conn, &intent, &order, &response, "filled", 1, filled,
                             )?;
@@ -1299,7 +1210,8 @@ pub async fn process_one_intent(
                             match taker_vanished_outcome(filled) {
                                 TakerVanishedOutcome::Filled => {
                                     cumulative_filled_base += filled;
-                                    record_fill(conn, rest, &intent, &order, filled).await?;
+                                    // fills come from fillList via reconcile; persist
+                                    // the order's filled_size/status only.
                                     set_local_order_filled(conn, &order.client_oid, filled)?;
                                     state.on_order_filled();
                                     break;

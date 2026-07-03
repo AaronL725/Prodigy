@@ -943,6 +943,84 @@ mod tests {
     }
 
     #[test]
+    fn no_double_count_when_fill_list_arrives_after_execution_set_filled_size() {
+        // G1/G2 unified rule: the execution path must NOT write a fills row from
+        // order-detail cumulative baseVolume — it only sets orders.filled_size.
+        // fills come per-trade from fillList via reconcile. Verify the full flow
+        // doesn't double-count: execution observes baseVolume 0.05 (no tradeId —
+        // detail is order-level), then fillList returns the two real trades
+        // (0.02 + 0.03). Final orders.filled_size must be 0.05 and sum(fills) 0.05,
+        // NOT 0.10 (which the old execution-writes-fills path produced).
+        let conn = exec_db();
+        insert_intent(&conn, "i1", "open");
+        // Execution path places an order then sets filled_size from detail (0.05),
+        // WITHOUT writing any fills row (the fixed behavior).
+        insert_order(&conn, "o1", "i1", "buy", "open", "submitted", 0.05);
+        db::set_order_filled_from_detail(&conn, "o1", 0.05).unwrap();
+        let filled_size: f64 = conn
+            .query_row(
+                "select filled_size from orders where order_id='o1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!((filled_size - 0.05).abs() < 1e-9);
+        // No fills row from the execution path.
+        assert_eq!(
+            conn.query_row::<i64, _, _>(
+                "select count(*) from fills where order_id='o1'",
+                [],
+                |r| { r.get(0) }
+            )
+            .unwrap(),
+            0
+        );
+
+        // Later, fillList arrives with the two real per-trade rows for this order.
+        let mut local_order_ids = std::collections::HashSet::new();
+        local_order_ids.insert("o1".to_string());
+        let existing = db::local_fill_trade_ids(&conn).unwrap();
+        for (tid, vol) in [("T1", 0.02), ("T2", 0.03)] {
+            let row = serde_json::json!({
+                "tradeId": tid, "orderId": "o1",
+                "symbol": "ETHUSDT", "side": "buy", "price": "1800",
+                "baseVolume": vol.to_string(), "cTime": "1",
+            });
+            let fill = fill_to_repair(&row, &local_order_ids, &existing, |_| {
+                Some("c1".to_string())
+            })
+            .expect("each trade should be repaired");
+            db::insert_fill(&conn, &fill).unwrap();
+        }
+        // sum(fills) reflects only the two real trades — the execution path added
+        // no cumulative row, so there's no double-count.
+        let sum_fills: f64 = conn
+            .query_row(
+                "select coalesce(sum(size),0) from fills where order_id='o1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            (sum_fills - 0.05).abs() < 1e-9,
+            "sum(fills) must be 0.05 (the two real trades), got {sum_fills}"
+        );
+        // And sync_order_fill_state keeps filled_size at 0.05, not 0.10.
+        db::sync_order_fill_state(&conn, "o1").unwrap();
+        let filled_size_after: f64 = conn
+            .query_row(
+                "select filled_size from orders where order_id='o1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            (filled_size_after - 0.05).abs() < 1e-9,
+            "filled_size must stay 0.05 after fillList repair, got {filled_size_after}"
+        );
+    }
+
+    #[test]
     fn exchange_position_traced_from_local_order_is_system_without_position_row() {
         // The bug this guards: reconcile used to build the classify set from
         // positions.source_intent_id. But the exchange all-position response
