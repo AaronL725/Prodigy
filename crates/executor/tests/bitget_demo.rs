@@ -81,36 +81,42 @@ async fn ensure_one_way_mode(rest: &BitgetRestClient, cfg: &ExecutorConfig) {
         .await;
 }
 
-// ponytail: a market open returns 00000 before Bitget's position store reflects
-// the fill, so an immediate reduceOnly close races and hits 22002 "no position".
-// Poll all-position until a non-zero size for the symbol appears (cap ~5s) rather
-// than a blind sleep. Returns the observed size (0.0 if it never appears).
-async fn wait_for_position(rest: &BitgetRestClient, cfg: &ExecutorConfig) -> f64 {
-    for _ in 0..25 {
-        let positions = rest
-            .get(
-                "/api/v2/mix/position/all-position",
-                &[
-                    ("productType", cfg.product_type.clone()),
-                    ("marginCoin", cfg.margin_coin.clone()),
-                ],
-            )
-            .await
-            .unwrap();
-        let size = positions
-            .get("data")
-            .and_then(|d| d.as_array())
-            .and_then(|rows| {
-                rows.iter().find(|r| {
-                    r.get("symbol").and_then(|s| s.as_str()) == Some(cfg.bitget_symbol.as_str())
-                })
+/// Read the exchange position size (total) for the configured symbol, or 0.0.
+async fn position_size(rest: &BitgetRestClient, cfg: &ExecutorConfig) -> f64 {
+    let positions = rest
+        .get(
+            "/api/v2/mix/position/all-position",
+            &[
+                ("productType", cfg.product_type.clone()),
+                ("marginCoin", cfg.margin_coin.clone()),
+            ],
+        )
+        .await
+        .unwrap();
+    positions
+        .get("data")
+        .and_then(|d| d.as_array())
+        .and_then(|rows| {
+            rows.iter().find(|r| {
+                r.get("symbol").and_then(|s| s.as_str()) == Some(cfg.bitget_symbol.as_str())
             })
-            .and_then(|r| r.get("total").or_else(|| r.get("available")))
-            .and_then(|v| v.as_str())
-            .and_then(|v| v.parse::<f64>().ok())
-            .unwrap_or(0.0);
-        if size > 0.0 {
-            return size;
+        })
+        .and_then(|r| r.get("total").or_else(|| r.get("available")))
+        .and_then(|v| v.as_str())
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(0.0)
+}
+
+// ponytail: poll until the symbol's position size exceeds `baseline`. A market
+// open returns 00000 before Bitget's position store reflects the fill, and the
+// demo account can carry a residual position from a prior session that no test
+// can clear (the phantom book won't fill a reduce-only close). Comparing against
+// a captured baseline means a stale residue isn't misread as our open filling.
+async fn wait_for_position(rest: &BitgetRestClient, cfg: &ExecutorConfig, baseline: f64) -> f64 {
+    for _ in 0..25 {
+        let size = position_size(rest, cfg).await;
+        if size > baseline + 1e-9 {
+            return size - baseline;
         }
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
@@ -185,6 +191,17 @@ async fn bitget_demo_can_open_and_reduce_only_close_market_order() {
         depth.best_bid, depth.best_ask
     );
 
+    // Capture any pre-existing position size so a residual position from a prior
+    // session (which the phantom demo book can make impossible to clear) isn't
+    // misread as our market open filling. We only count an INCREASE as our fill.
+    let baseline = position_size(&rest, &cfg).await;
+    if baseline > 0.0 {
+        eprintln!(
+            "note: demo account carries a residual {baseline} ETHUSDT position; \
+             comparing against it as the baseline"
+        );
+    }
+
     let open_oid = format!("pdgy-test-open-{}", prodigy_executor::bitget::now_ms());
     let open = PlaceOrderRequest {
         symbol: cfg.bitget_symbol.clone(),
@@ -207,7 +224,7 @@ async fn bitget_demo_can_open_and_reduce_only_close_market_order() {
     // demo PAPTRADING header, and one-way mode all work end to end.
     assert_eq!(opened.get("code").and_then(|v| v.as_str()), Some("00000"));
 
-    let position_size = wait_for_position(&rest, &cfg).await;
+    let position_size = wait_for_position(&rest, &cfg, baseline).await;
     if !tradable {
         // Phantom/illiquid book: the market open is accepted then cancelled by
         // Bitget with no fill. A real fill can't be asserted here; record the
