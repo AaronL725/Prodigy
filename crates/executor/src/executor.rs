@@ -82,7 +82,16 @@ pub async fn process_pending_intents_once(
         let now_ms = crate::bitget::now_ms().parse::<i64>().unwrap_or(0);
         let market =
             require_fresh_market(market_cache.latest_fresh(now_ms, cfg.stale_market_data_secs))?;
-        process_one_intent(conn, cfg, rest, intent.clone(), market, account, market_cache).await?;
+        process_one_intent(
+            conn,
+            cfg,
+            rest,
+            intent.clone(),
+            market,
+            account,
+            market_cache,
+        )
+        .await?;
         db::write_event(conn, "info", "executor", "processed intent", "{}")?;
         println!("processed {}", intent.intent_id);
         processed += 1;

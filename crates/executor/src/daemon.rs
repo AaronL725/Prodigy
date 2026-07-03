@@ -246,8 +246,10 @@ mod tests {
     #[test]
     fn private_ws_update_upserts_orders_and_positions() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
-        conn.execute_batch(include_str!("../../../schema/001_initial.sql")).unwrap();
-        conn.execute_batch(include_str!("../../../schema/002_execution.sql")).unwrap();
+        conn.execute_batch(include_str!("../../../schema/001_initial.sql"))
+            .unwrap();
+        conn.execute_batch(include_str!("../../../schema/002_execution.sql"))
+            .unwrap();
 
         let update = crate::types::PrivateWsUpdate {
             orders: vec![crate::types::OrderRecord {
@@ -284,8 +286,12 @@ mod tests {
 
         apply_private_ws_update(&conn, update).unwrap();
 
-        let order_count: i64 = conn.query_row("select count(*) from orders", [], |r| r.get(0)).unwrap();
-        let position_count: i64 = conn.query_row("select count(*) from positions", [], |r| r.get(0)).unwrap();
+        let order_count: i64 = conn
+            .query_row("select count(*) from orders", [], |r| r.get(0))
+            .unwrap();
+        let position_count: i64 = conn
+            .query_row("select count(*) from positions", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(order_count, 1);
         assert_eq!(position_count, 1);
     }
