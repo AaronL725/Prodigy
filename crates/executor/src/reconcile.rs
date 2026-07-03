@@ -909,21 +909,22 @@ mod tests {
     }
 
     #[test]
-    fn fill_to_repair_skips_trades_already_recorded_by_execution_path() {
-        // Issue 3: the execution loop records a fill via record_fill (one row keyed
-        // by the exchange tradeId it read from order detail). Later, when the
-        // exchange fillList arrives, fill_to_repair must NOT re-insert that same
-        // trade — otherwise sync_order_fill_state (SUM(fills)) would double-count
-        // and over-state the position. Dedup is by tradeId in the existing set.
+    fn fill_to_repair_skips_trades_already_recorded() {
+        // Dedup guard: when the same exchange fillList trade is seen across
+        // reconcile passes (re-fetch, or a trade that arrived earlier), fill_to_repair
+        // must NOT re-insert it — otherwise sync_order_fill_state (SUM(fills)) would
+        // double-count and over-state the position. Dedup is by tradeId in the
+        // existing set. (The execution path no longer writes fills at all — fills
+        // come only from fillList — so this guards reconcile-vs-reconcile re-runs.)
         use std::collections::HashSet;
         let mut local_order_ids = HashSet::new();
         local_order_ids.insert("oid-7".to_string());
-        // The execution path already recorded trade "T-exec" for this order.
+        // A prior reconcile pass already recorded trade "T-exec" for this order.
         let mut existing = HashSet::new();
         existing.insert("T-exec".to_string());
         let client_oid_for = |_: &str| Some("client-7".to_string());
 
-        // fillList arrives with the SAME tradeId the execution path already wrote → skip.
+        // fillList arrives again with the SAME tradeId already recorded → skip.
         let same_trade = serde_json::json!({
             "tradeId": "T-exec", "orderId": "oid-7",
             "symbol": "ETHUSDT", "side": "buy", "price": "1800", "baseVolume": "0.05",
@@ -931,7 +932,7 @@ mod tests {
         });
         assert!(fill_to_repair(&same_trade, &local_order_ids, &existing, client_oid_for).is_none());
 
-        // A DIFFERENT tradeId the execution path didn't see → repair it.
+        // A DIFFERENT tradeId not yet recorded → repair it.
         let new_trade = serde_json::json!({
             "tradeId": "T-new", "orderId": "oid-7",
             "symbol": "ETHUSDT", "side": "buy", "price": "1800", "baseVolume": "0.03",

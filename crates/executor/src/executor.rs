@@ -1064,12 +1064,10 @@ pub async fn process_one_intent(
 
                 if filled_instead {
                     // The maker filled during the cancel race: honor the fill.
-                    // Reuse record_fill so the fill row carries the REAL price,
-                    // fee, and trade_id (queried from order detail) — the prior
-                    // code hand-wrote side="unknown"/price=0/fee=0 here.
+                    // fills come per-trade from fillList via reconcile, so here we
+                    // only persist the order's filled_size/status (no fills row —
+                    // the prior code hand-wrote side="unknown"/price=0/fee=0 here).
                     cumulative_filled_base += confirm_filled;
-                    // fills come from fillList via reconcile; here we only persist
-                    // the order's filled_size/status.
                     set_local_order_filled(conn, &client_oid, confirm_filled)?;
                     state.on_order_filled();
                     live_client_oid = None;

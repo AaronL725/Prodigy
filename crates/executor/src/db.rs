@@ -294,30 +294,42 @@ pub fn set_order_filled_from_detail(
 
 /// Sync an order's status/filled_size from the fills recorded against it. Called
 /// after reconcile inserts a missing fill so the order row reflects exchange
-/// truth: filled_size = sum of its fills' base size; status flips to 'filled'
-/// once that sum reaches the ordered size (minus a dust epsilon). A partial sum
-/// updates filled_size but leaves the status untouched (still working). Without
-/// this, a crash-then-repair leaves the order 'submitted'/filled_size=0, so the
-/// system net base stays 0 and reconcile mis-fires manual-override drift.
+/// truth: filled_size = max(existing, sum of its fills' base size); status flips
+/// to 'filled' once that sum reaches the ordered size (minus a dust epsilon). A
+/// partial sum updates filled_size but leaves the status untouched (still
+/// working). Without this, a crash-then-repair leaves the order
+/// 'submitted'/filled_size=0, so the system net base stays 0 and reconcile
+/// mis-fires manual-override drift.
+///
+/// Takes max(existing, sum(fills)) — never reduces filled_size. The execution
+/// path / set_order_filled_from_detail may have already set filled_size from
+/// order detail (the full cumulative fill). If the exchange fillList temporarily
+/// returns only a subset of trades, sum(fills) would be smaller and blindly
+/// overwriting would UNDERCOUNT real exposure (breaks system_net_base / override
+/// detection). A lagging fillList can only ever raise filled_size as it catches
+/// up, never lower it.
 pub fn sync_order_fill_state(conn: &Connection, order_id: &str) -> Result<()> {
     const DUST_BASE: f64 = 1e-6;
-    let filled: f64 = conn
+    let sum_fills: f64 = conn
         .query_row(
             "select coalesce(sum(size), 0) from fills where order_id = ?",
             params![order_id],
             |row| row.get(0),
         )
         .unwrap_or(0.0);
-    if filled <= 0.0 {
+    if sum_fills <= 0.0 {
         return Ok(());
     }
-    let ordered: f64 = conn
+    let (existing_filled, ordered): (f64, f64) = conn
         .query_row(
-            "select coalesce(size, 0) from orders where order_id = ?",
+            "select coalesce(filled_size, 0), coalesce(size, 0) from orders where order_id = ?",
             params![order_id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
-        .unwrap_or(0.0);
+        .unwrap_or((0.0, 0.0));
+    // Never let a lagging fillList reduce filled_size below what execution/order
+    // detail already established.
+    let filled = existing_filled.max(sum_fills);
     // Reached the ordered size (within dust) → terminal fill; else partial.
     if ordered > 0.0 && filled + DUST_BASE >= ordered {
         conn.execute(
@@ -900,6 +912,81 @@ mod tests {
             .unwrap();
         assert_eq!(status, "submitted");
         assert!((filled - 0.02).abs() < 1e-9);
+    }
+
+    #[test]
+    fn sync_order_fill_state_never_reduces_filled_size() {
+        // Regression: the execution path / set_order_filled_from_detail may have
+        // already set orders.filled_size = 0.05 from order detail. If Bitget
+        // fillList temporarily returns only ONE trade (0.02) — a lagging/partial
+        // fillList — reconcile inserts it and calls sync_order_fill_state, which
+        // used to overwrite filled_size 0.05 → 0.02 (SUM(fills)). That undercounted
+        // real exposure and broke system_net_base / override detection. sync must
+        // take max(existing, sum(fills)) so it never goes backwards.
+        let conn = memory_db();
+        conn.execute(
+            "insert into trade_intents (intent_id, created_at, symbol, side, action,
+               target_notional, max_order_notional, status, source)
+             values ('i1','2026-07-01T00:00:00Z','ETH/USDT:USDT','long','open',100,100,'executed','t')",
+            [],
+        )
+        .unwrap();
+        // Order already reflects the full 0.05 fill from order detail.
+        conn.execute(
+            "insert into orders (order_id, client_oid, intent_id, symbol, side, action,
+               order_type, status, price, size, filled_size, created_at, updated_at)
+             values ('o1','o1','i1','ETH/USDT:USDT','buy','open','limit','filled',
+               3000, 0.05, 0.05, '2026-07-01T00:00:00Z', '2026-07-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        // fillList so far only carries one trade (0.02); reconcile inserts it.
+        let partial = FillRecord {
+            fill_id: "f1".to_string(),
+            order_id: "o1".to_string(),
+            trade_id: Some("t1".to_string()),
+            client_oid: Some("o1".to_string()),
+            symbol: "ETH/USDT:USDT".to_string(),
+            side: "buy".to_string(),
+            price: 3000.0,
+            size: 0.02,
+            fee: 0.0,
+            created_at: "2026-07-01T00:00:00Z".to_string(),
+            raw_json: "{}".to_string(),
+        };
+        insert_fill(&conn, &partial).unwrap();
+        sync_order_fill_state(&conn, "o1").unwrap();
+
+        let filled_size: f64 = conn
+            .query_row(
+                "select filled_size from orders where order_id = 'o1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            (filled_size - 0.05).abs() < 1e-9,
+            "sync must not reduce filled_size below the existing 0.05; got {filled_size}"
+        );
+
+        // When the rest of fillList arrives (0.03), the sum now matches 0.05 and
+        // filled_size stays 0.05 (the full truth), not regressed.
+        let rest = FillRecord {
+            fill_id: "f2".to_string(),
+            size: 0.03,
+            trade_id: Some("t2".to_string()),
+            ..partial
+        };
+        insert_fill(&conn, &rest).unwrap();
+        sync_order_fill_state(&conn, "o1").unwrap();
+        let filled_size_after: f64 = conn
+            .query_row(
+                "select filled_size from orders where order_id = 'o1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!((filled_size_after - 0.05).abs() < 1e-9);
     }
 
     #[test]
