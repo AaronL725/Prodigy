@@ -1,4 +1,5 @@
 import pandas as pd
+import sqlite3
 
 from prodigy.signals.daemon import (
     PositionState,
@@ -581,5 +582,44 @@ def test_run_once_rechecks_pending_intent_after_refresh(tmp_path):
     with connect(db_path) as conn:
         # Only the pre-existing pending intent; no new intent from this run.
         assert conn.execute("select count(*) from trade_intents").fetchone()[0] == 1
+        key = signal_processed_key("dummy-cycle", "ETHUSDT", "15m", "2026-07-04T10:00:00Z")
+        assert get_executor_state(conn, key) is None
+
+
+def test_run_once_does_not_crash_when_event_write_fails(tmp_path, monkeypatch):
+    # Spec error handling: the event write on a refresh/factor error is
+    # best-effort. If SQLite is busy/locked and the event write fails, the
+    # daemon must STILL return the skip string — not crash. Probe by making the
+    # event write raise.
+    import prodigy.signals.daemon as daemon_mod
+
+    db_path = tmp_path / "prodigy.sqlite"
+    _seed_fresh_equity(db_path)
+
+    def boom(_conn, _severity, _message):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(daemon_mod, "write_signal_event", boom)
+
+    def refresh_data() -> None:
+        raise RuntimeError("refresh failed")
+
+    result = run_once(
+        RunOnceConfig(
+            db_path=db_path,
+            data_root=tmp_path / "data",
+            research_symbol="ETH/USDT:USDT",
+            exchange_symbol="ETHUSDT",
+            source="dummy-cycle",
+            now=pd.Timestamp("2026-07-04T10:16:00Z"),
+            refresh_data=refresh_data,
+            score_loader=lambda: (1.0, "2026-07-04T10:00:00Z"),
+        )
+    )
+
+    # Must return the skip, not propagate the OperationalError.
+    assert result == "error_data_refresh"
+    with connect(db_path) as conn:
+        assert conn.execute("select count(*) from trade_intents").fetchone()[0] == 0
         key = signal_processed_key("dummy-cycle", "ETHUSDT", "15m", "2026-07-04T10:00:00Z")
         assert get_executor_state(conn, key) is None

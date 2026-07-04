@@ -10,14 +10,13 @@ import pandas as pd
 
 from prodigy.config import load_config
 from prodigy.data.backfill import run_backfill
-from prodigy.db import connect, init_db
 from prodigy.signals.daemon import (
     RunOnceConfig,
     SignalDaemonConfig,
     expected_closed_bar_ts,
     load_example_score,
     run_once,
-    write_signal_event,
+    try_write_signal_event,
 )
 
 
@@ -136,13 +135,9 @@ def run_daemon_loop(
 
 
 def _write_shutdown_event(db_path) -> None:
-    try:
-        with connect(db_path) as conn:
-            init_db(conn)
-            write_signal_event(conn, "info", "shutdown: signal daemon stopping")
-            conn.commit()
-    except Exception:  # noqa: BLE001 — shutdown logging must not mask the exit
-        pass
+    # try_write_signal_event opens its own connection and swallows any failure,
+    # so a SQLite lock here can't mask the clean exit.
+    try_write_signal_event(db_path, "info", "shutdown: signal daemon stopping")
 
 
 def main(argv: list[str] | None = None) -> int:

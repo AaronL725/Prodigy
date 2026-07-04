@@ -184,8 +184,6 @@ def write_signal_event(conn: sqlite3.Connection, severity: str, message: str) ->
     # ponytail: spec error handling requires writing a SQLite event on
     # refresh/factor errors and on shutdown. Inline insert keeps the daemon
     # dependency-free; events is the shared Rust/Python observability table.
-    # Best-effort: a failure here (e.g. DB locked) must not mask the skip the
-    # daemon already decided on, so the caller does not depend on this row.
     conn.execute(
         """
         insert into events (event_id, created_at, severity, component, message, payload_json)
@@ -198,6 +196,23 @@ def write_signal_event(conn: sqlite3.Connection, severity: str, message: str) ->
             message,
         ),
     )
+
+
+def try_write_signal_event(db_path: str | Path, severity: str, message: str) -> None:
+    # Best-effort event write on its OWN connection: opens, writes, commits, and
+    # swallows any failure (DB busy/locked/disk-full). The daemon's skip decision
+    # must NOT be undone by a logging failure — a transient SQLite lock here can't
+    # crash the daemon (which would defeat the spec's "write event, skip" rule).
+    # Logged to stderr so a chronic logging failure is still observable.
+    try:
+        with connect(db_path) as conn:
+            init_db(conn)
+            write_signal_event(conn, severity, message)
+            conn.commit()
+    except Exception as exc:  # noqa: BLE001 — best-effort logging must not raise
+        import sys
+
+        print(f"prodigy-signal: event write failed ({severity}): {exc}", file=sys.stderr)
 
 
 def _normalize_closed_ts(value: str, timeframe: str) -> str:
@@ -327,24 +342,18 @@ def run_once(cfg: RunOnceConfig) -> str:
     # and skip this run, NOT crash (the daemon must not crash the Rust executor;
     # SQLite is the only shared boundary). Neither skip writes the processed
     # marker, so the bar is re-evaluated next run once the data layer recovers.
-    # The event write is best-effort: a SQLite failure logging the event must
-    # not prevent the skip itself.
+    # The event write is best-effort via try_write_signal_event: a SQLite failure
+    # logging the event must not prevent the skip itself.
     try:
         cfg.refresh_data()
     except Exception as exc:  # noqa: BLE001 — daemon isolates any refresh failure
-        with connect(cfg.db_path) as conn:
-            init_db(conn)
-            write_signal_event(conn, "warning", f"data refresh error: {exc}")
-            conn.commit()
+        try_write_signal_event(cfg.db_path, "warning", f"data refresh error: {exc}")
         return "error_data_refresh"
 
     try:
         score, actual_closed_ts = cfg.score_loader()
     except Exception as exc:  # noqa: BLE001 — daemon isolates any factor/score failure
-        with connect(cfg.db_path) as conn:
-            init_db(conn)
-            write_signal_event(conn, "warning", f"factor compute error: {exc}")
-            conn.commit()
+        try_write_signal_event(cfg.db_path, "warning", f"factor compute error: {exc}")
         return "error_factor_compute"
 
     # The processed key is derived from `now` (the expected closed bar), but the
@@ -355,14 +364,11 @@ def run_once(cfg: RunOnceConfig) -> str:
     # skip without marking the bar and let the next run re-evaluate once data
     # catches up.
     if _normalize_closed_ts(actual_closed_ts, cfg.timeframe) != closed_ts:
-        with connect(cfg.db_path) as conn:
-            init_db(conn)
-            write_signal_event(
-                conn,
-                "warning",
-                f"stale data: expected closed bar {closed_ts}, latest available {actual_closed_ts}",
-            )
-            conn.commit()
+        try_write_signal_event(
+            cfg.db_path,
+            "warning",
+            f"stale data: expected closed bar {closed_ts}, latest available {actual_closed_ts}",
+        )
         return "skipped_stale_data"
 
     with connect(cfg.db_path) as conn:
