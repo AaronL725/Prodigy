@@ -681,8 +681,17 @@ pub async fn verify_private_ws_connects(cfg: &ExecutorConfig) -> Result<()> {
         .await?
         .ok_or_else(|| anyhow::anyhow!("private websocket closed"))??;
     let text = msg.into_text()?;
-    if text.contains("\"event\":\"error\"") || !text.contains("\"login\"") {
-        bail!("private websocket login failed: {text}");
+    // ponytail: reuse the daemon's parser instead of a string-contains probe so
+    // the one-shot verify and the long-running loop judge login the same way —
+    // including Bitget's NUMERIC login code ({"event":"login","code":0}), which
+    // a "contains \"login\"" check accepts but a future stricter check could
+    // diverge on. Surfaces the real code+msg on failure instead of raw text.
+    let update = parse_private_ws_message(&text, cfg)?;
+    if let Some(detail) = update.auth_error {
+        bail!("private websocket login failed: {detail}");
+    }
+    if !update.login_ack {
+        bail!("private websocket login not acked: {text}");
     }
     Ok(())
 }

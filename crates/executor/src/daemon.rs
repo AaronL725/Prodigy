@@ -566,6 +566,40 @@ pub async fn run_telegram_query_loop(
     }
 }
 
+/// Record a `websocket_auth_failed` event in SQLite and fire the demo Telegram
+/// notification for it (`notify::should_send_telegram` gates demo delivery).
+/// Best-effort throughout: a sqlite/telegram failure only logs to stderr — the
+/// private-WS loop must not die on a logging path (a dead WS loop is
+/// undetectable). Shared by the PRE-ready login-failure path and the POST-ready
+/// mid-session auth-error path so the operator sees the failure either way.
+/// ponytail: extracted so both auth-failure paths emit the identical event +
+/// notification instead of drifting apart.
+async fn emit_websocket_auth_failed(cfg: &ExecutorConfig, detail: &str) {
+    match rusqlite::Connection::open(&cfg.db_path) {
+        Ok(conn) => {
+            let _ = conn.busy_timeout(Duration::from_secs(5));
+            if let Err(err) = crate::db::write_event(
+                &conn,
+                "warning",
+                "private_ws",
+                &format!("websocket auth failed: {detail}"),
+                "{}",
+            ) {
+                eprintln!("websocket_auth_failed event write error: {err}");
+            }
+        }
+        Err(err) => eprintln!("websocket_auth_failed event sqlite open error: {err}"),
+    }
+    crate::notify::send_telegram(
+        cfg.telegram_bot_token.as_deref(),
+        cfg.telegram_chat_id.as_deref(),
+        "websocket_auth_failed",
+        &format!("private websocket login failed: {detail}"),
+    )
+    .await
+    .ok();
+}
+
 /// Long-running private-WS loop: connect, send the per-connection login (signed
 /// `GET /user/verify`), then parse every incoming message and apply orders/fills/
 /// positions to SQLite via `apply_private_ws_update`. A parse error or a SQLite
@@ -654,38 +688,24 @@ pub async fn run_private_ws_loop(
                     }
                 }
                 if let Some(detail) = auth_failure {
-                    // Auth failed: surface it as an important event (telegram-
-                    // delivered in demo mode via notify::should_send_telegram) and
-                    // stay not-ready. Reconnect backs off below; a corrected
-                    // key/timestamp re-acks on the next connect.
-                    match rusqlite::Connection::open(&cfg.db_path) {
-                        Ok(conn) => {
-                            let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
-                            let _ = crate::db::write_event(
-                                &conn,
-                                "warning",
-                                "private_ws",
-                                &format!("websocket auth failed: {detail}"),
-                                "{}",
-                            );
-                        }
-                        Err(err) => {
-                            eprintln!("websocket_auth_failed event sqlite open error: {err}")
-                        }
-                    }
-                    crate::notify::send_telegram(
-                        cfg.telegram_bot_token.as_deref(),
-                        cfg.telegram_chat_id.as_deref(),
-                        "websocket_auth_failed",
-                        &format!("private websocket login failed: {detail}"),
-                    )
-                    .await
-                    .ok();
+                    // Auth failed: surface it (event + demo Telegram) and stay
+                    // not-ready. A corrected key/timestamp re-acks on the next
+                    // connect. ponytail: sleep BEFORE continue so a bad key /
+                    // consistently-rejected login can't tight-loop reconnect and
+                    // flood the events table / Telegram — same 1s backoff every
+                    // other reconnect path takes below (the bare `continue` here
+                    // previously skipped the outer-loop sleep at the bottom).
+                    emit_websocket_auth_failed(&cfg, &detail).await;
                     eprintln!("private ws login rejected: {detail}; reconnecting");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
                     continue;
                 }
                 if !acked {
                     eprintln!("private ws login ack timed out; reconnecting");
+                    // ponytail: same 1s backoff — an ack that never comes (dead
+                    // socket, network blackhole) must not tight-loop the 10s ack
+                    // wait + immediate reconnect.
+                    tokio::time::sleep(Duration::from_secs(1)).await;
                     continue;
                 }
                 // Subscribe to orders/positions/account now that login is acked.
@@ -728,6 +748,23 @@ pub async fn run_private_ws_loop(
                                     continue;
                                 }
                             };
+                            // A post-ready {"event":"error",...} (subscribe args
+                            // rejected, key revoked mid-session, etc.) sets
+                            // auth_error but carries no orders/fills/positions/
+                            // account. Without this check the empty-skip below
+                            // would drop it and private state would stay READY
+                            // while the private channel is actually broken — new
+                            // opens would proceed on a dead feed. Surface it,
+                            // gate opens back out, and break to the outer
+                            // reconnect loop (1s backoff + fresh login).
+                            if let Some(detail) = &update.auth_error {
+                                private_ready.set(false);
+                                emit_websocket_auth_failed(&cfg, detail).await;
+                                eprintln!(
+                                    "private ws session error after ready: {detail}; reconnecting"
+                                );
+                                break;
+                            }
                             if update.orders.is_empty()
                                 && update.fills.is_empty()
                                 && update.positions.is_empty()
@@ -857,6 +894,50 @@ mod tests {
             options.max_runtime.unwrap(),
             std::time::Duration::from_millis(5)
         );
+    }
+
+    #[tokio::test]
+    async fn emit_websocket_auth_failed_writes_event_to_db() {
+        // Regression for Fix 1/2: the shared helper both auth-failure paths use
+        // must persist a websocket_auth_failed event so the operator sees a
+        // broken private channel. It opens its own connection from cfg.db_path,
+        // so point it at a temp file initialized with the schema.
+        let dir = std::env::temp_dir();
+        let db_path = dir.join(format!(
+            "prodigy-test-emit-auth-{}.sqlite",
+            std::process::id()
+        ));
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(include_str!("../../../schema/001_initial.sql"))
+                .unwrap();
+            conn.execute_batch(include_str!("../../../schema/002_execution.sql"))
+                .unwrap();
+        }
+        let cfg = ExecutorConfig {
+            db_path: db_path.clone(),
+            // telegram None → send_telegram is a no-op (helper stays best-effort).
+            telegram_bot_token: None,
+            telegram_chat_id: None,
+            ..ExecutorConfig::demo_for_tests()
+        };
+
+        emit_websocket_auth_failed(&cfg, "login code 30001: sign invalid").await;
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let row: (String, String, String) = conn
+            .query_row(
+                "select severity, component, message from events \
+                 where message like '%websocket auth failed%' order by created_at desc limit 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(row.0, "warning");
+        assert_eq!(row.1, "private_ws");
+        assert!(row.2.contains("sign invalid"));
+
+        let _ = std::fs::remove_file(&db_path);
     }
 
     #[tokio::test]
