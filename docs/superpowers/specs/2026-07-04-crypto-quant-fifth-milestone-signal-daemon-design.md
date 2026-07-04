@@ -249,17 +249,23 @@ signal_processed:example-factors:ETHUSDT:15m:2026-07-04T10:15:00Z
 
 The key is stored in existing SQLite `executor_state`; M5 does not add a new processed-bar table.
 
-The recorded value should include the decision outcome, such as:
+The processed-bar key is written only after a definitive decision for that bar:
 
 - `open_intent_written`;
 - `close_intent_written`;
-- `skipped_stale_state`;
-- `skipped_pending_intent`;
-- `skipped_pending_order`;
-- `skipped_manual_override`;
 - `no_signal`;
-- `error_data_refresh`;
-- `error_factor_compute`.
+
+Transient skips do not mark the bar as processed. This lets the daemon re-evaluate the same closed bar after Rust reconcile refreshes SQLite state or after a pending order/intent clears. Transient skips include:
+
+- stale SQLite authority state;
+- active `manual_override`;
+- pending or accepted intent;
+- unfinished system order;
+- data refresh error;
+- factor computation error;
+- ambiguous position state.
+
+Transient skips may write an event or a separate diagnostic executor_state key, but they must not write `signal_processed:{source}:{symbol}:{timeframe}:{closed_bar_ts}`.
 
 ## Transaction Boundary
 
@@ -270,7 +276,7 @@ This prevents inconsistent states such as:
 - intent written but processed-bar marker missing, causing duplicate writes after restart;
 - processed-bar marker written but intent missing, causing a missed trade.
 
-For skip/no-signal outcomes, writing only the processed-bar marker is acceptable. If the marker write fails, the next run may re-evaluate the bar.
+For `no_signal`, writing only the processed-bar marker is acceptable because the bar was evaluated with fresh state and no trade was needed. If the marker write fails, the next run may re-evaluate the bar.
 
 The existing Python `write_trade_intent` helper commits immediately. M5 must refactor it or add a no-commit insert helper so the signal daemon can commit:
 
@@ -335,10 +341,10 @@ M5 is complete when:
 10. Python has a no-commit intent insert path for transaction composition.
 11. Rust `action=close` resolves the current exchange position size and sends a reduce-only full-position close.
 12. Rust close sizing ignores Python `target_notional`.
-13. Stale SQLite authority state skips intent generation.
-14. `manual_override` skips intent generation for the symbol.
-15. Pending or accepted intents skip new intent generation.
-16. Unfinished system orders skip new intent generation.
+13. Stale SQLite authority state skips intent generation without marking the bar processed.
+14. `manual_override` skips intent generation for the symbol without marking the bar processed.
+15. Pending or accepted intents skip new intent generation without marking the bar processed.
+16. Unfinished system orders skip new intent generation without marking the bar processed.
 17. Existing position plus reverse signal writes close only, never same-bar reverse/open.
 18. Holding expiry uses the profit/loss branch thresholds.
 19. M5 writes only `open` and `close` intents.
