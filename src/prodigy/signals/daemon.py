@@ -271,6 +271,15 @@ def run_once(cfg: RunOnceConfig) -> str:
 
     with connect(cfg.db_path) as conn:
         init_db(conn)
+        # M5 limitation: the processed-key check below and the marker write in
+        # process_decision happen on SEPARATE connections (refresh/score run
+        # with no handle held), so two concurrent prodigy-signal instances could
+        # both pass this check and double-write an intent for one bar. M5 is a
+        # single-instance demo daemon by design; serial calls are idempotent
+        # (test_run_once_is_idempotent_per_closed_bar). A multi-instance
+        # deployment would need BEGIN IMMEDIATE re-check inside the write
+        # transaction — out of M5 scope (and it would contend with the Rust
+        # executor's WAL writes on the same DB).
         if get_executor_state(conn, key) is not None:
             return "already_processed"
         age = _latest_equity_snapshot_age_secs(conn, now)
