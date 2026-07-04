@@ -180,14 +180,12 @@ class RunOnceConfig:
     timeframe: str = "15m"
 
 
-def _write_signal_event(conn: sqlite3.Connection, severity: str, message: str) -> None:
+def write_signal_event(conn: sqlite3.Connection, severity: str, message: str) -> None:
     # ponytail: spec error handling requires writing a SQLite event on
     # refresh/factor errors and on shutdown. Inline insert keeps the daemon
     # dependency-free; events is the shared Rust/Python observability table.
     # Best-effort: a failure here (e.g. DB locked) must not mask the skip the
     # daemon already decided on, so the caller does not depend on this row.
-    import uuid
-
     conn.execute(
         """
         insert into events (event_id, created_at, severity, component, message, payload_json)
@@ -296,7 +294,7 @@ def run_once(cfg: RunOnceConfig) -> str:
     except Exception as exc:  # noqa: BLE001 — daemon isolates any refresh failure
         with connect(cfg.db_path) as conn:
             init_db(conn)
-            _write_signal_event(conn, "warning", f"data refresh error: {exc}")
+            write_signal_event(conn, "warning", f"data refresh error: {exc}")
             conn.commit()
         return "error_data_refresh"
 
@@ -305,7 +303,7 @@ def run_once(cfg: RunOnceConfig) -> str:
     except Exception as exc:  # noqa: BLE001 — daemon isolates any factor/score failure
         with connect(cfg.db_path) as conn:
             init_db(conn)
-            _write_signal_event(conn, "warning", f"factor compute error: {exc}")
+            write_signal_event(conn, "warning", f"factor compute error: {exc}")
             conn.commit()
         return "error_factor_compute"
 
@@ -319,7 +317,7 @@ def run_once(cfg: RunOnceConfig) -> str:
     if _normalize_closed_ts(actual_closed_ts, cfg.timeframe) != closed_ts:
         with connect(cfg.db_path) as conn:
             init_db(conn)
-            _write_signal_event(
+            write_signal_event(
                 conn,
                 "warning",
                 f"stale data: expected closed bar {closed_ts}, latest available {actual_closed_ts}",

@@ -1,18 +1,22 @@
 from __future__ import annotations
 
 import argparse
+import signal as os_signal
 import time
+from typing import Callable
 
 import pandas as pd
 
 from prodigy.config import load_config
 from prodigy.data.backfill import run_backfill
+from prodigy.db import connect, init_db
 from prodigy.signals.daemon import (
     RunOnceConfig,
     SignalDaemonConfig,
     expected_closed_bar_ts,
     load_example_score,
     run_once,
+    write_signal_event,
 )
 
 
@@ -45,6 +49,69 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def run_daemon_loop(
+    args,
+    signal_cfg: dict,
+    db_path,
+    refresh_data: Callable[[], None],
+    score_loader: Callable[[], tuple[float, str]],
+    stop_flag: Callable[[], bool],
+    now_factory: Callable[[], pd.Timestamp] = lambda: pd.Timestamp.now(tz="UTC"),
+    sleep: Callable[[float], None] = time.sleep,
+) -> int:
+    """Drive run_once on the daemon cadence, exiting cleanly on stop.
+
+    `stop_flag` is consulted between iterations; when true (SIGINT/SIGTERM in
+    production, injected in tests) the loop writes a shutdown event and exits 0.
+    Best-effort event write: a SQLite failure logging it must not mask the exit.
+    """
+    research_symbol = signal_cfg["enabled_symbols"][0]
+    exchange_symbol = signal_cfg["exchange_symbols"][research_symbol]
+    signal_daemon_cfg = build_signal_daemon_config(signal_cfg)
+    loops = args.max_loops if args.max_loops is not None else (1 if args.once else None)
+    count = 0
+    try:
+        while loops is None or count < loops:
+            result = run_once(
+                RunOnceConfig(
+                    db_path=db_path,
+                    data_root=args.data_root,
+                    research_symbol=research_symbol,
+                    exchange_symbol=exchange_symbol,
+                    source=args.signal_source,
+                    now=now_factory(),
+                    refresh_data=refresh_data,
+                    score_loader=score_loader,
+                    signal_cfg=signal_daemon_cfg,
+                    max_state_age_secs=signal_cfg["max_state_age_secs"],
+                )
+            )
+            print(result)
+            count += 1
+            if args.once:
+                break
+            if stop_flag():
+                break
+            sleep(int(signal_cfg["poll_interval_secs"]))
+    finally:
+        # --once is a one-shot run, not a shutdown; only log shutdown for the
+        # long-running daemon path. Best-effort: a SQLite failure here must not
+        # mask the clean exit.
+        if not args.once:
+            _write_shutdown_event(db_path)
+    return 0
+
+
+def _write_shutdown_event(db_path) -> None:
+    try:
+        with connect(db_path) as conn:
+            init_db(conn)
+            write_signal_event(conn, "info", "shutdown: signal daemon stopping")
+            conn.commit()
+    except Exception:  # noqa: BLE001 — shutdown logging must not mask the exit
+        pass
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if not args.once and not args.daemon:
@@ -52,9 +119,7 @@ def main(argv: list[str] | None = None) -> int:
     cfg = load_config(args.config)
     signal_cfg = cfg["signal"]
     research_symbol = signal_cfg["enabled_symbols"][0]
-    exchange_symbol = signal_cfg["exchange_symbols"][research_symbol]
     timeframe = signal_cfg["timeframe"]
-    signal_daemon_cfg = build_signal_daemon_config(signal_cfg)
 
     def refresh_data() -> None:
         now = pd.Timestamp.now(tz="UTC")
@@ -78,29 +143,26 @@ def main(argv: list[str] | None = None) -> int:
             return 1.0, expected_closed_bar_ts(now, timeframe)
         return load_example_score(args.data_root, research_symbol, now, timeframe)
 
-    loops = args.max_loops if args.max_loops is not None else (1 if args.once else None)
-    count = 0
-    while loops is None or count < loops:
-        result = run_once(
-            RunOnceConfig(
-                db_path=args.db,
-                data_root=args.data_root,
-                research_symbol=research_symbol,
-                exchange_symbol=exchange_symbol,
-                source=args.signal_source,
-                now=pd.Timestamp.now(tz="UTC"),
-                refresh_data=refresh_data,
-                score_loader=score_loader,
-                signal_cfg=signal_daemon_cfg,
-                max_state_age_secs=signal_cfg["max_state_age_secs"],
-            )
-        )
-        print(result)
-        count += 1
-        if args.once:
-            break
-        time.sleep(int(signal_cfg["poll_interval_secs"]))
-    return 0
+    # SIGINT/SIGTERM -> set the stop flag so the loop exits after the current
+    # iteration and writes a shutdown event. A simple flag (not a hard interrupt)
+    # so an in-flight run_once always finishes and the processed-bar marker
+    # transaction can't be torn.
+    stopping = {"v": False}
+
+    def _on_signal(_signum, _frame):
+        stopping["v"] = True
+
+    for sig in (os_signal.SIGINT, os_signal.SIGTERM):
+        os_signal.signal(sig, _on_signal)
+
+    return run_daemon_loop(
+        args,
+        signal_cfg=signal_cfg,
+        db_path=args.db,
+        refresh_data=refresh_data,
+        score_loader=score_loader,
+        stop_flag=lambda: stopping["v"],
+    )
 
 
 if __name__ == "__main__":

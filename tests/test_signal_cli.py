@@ -77,3 +77,62 @@ def test_default_config_round_trips_through_build_signal_daemon_config():
 
     assert built.entry_threshold == 0.6
     assert built.max_holding_bars == 96
+
+
+def test_daemon_loop_exits_on_stop_flag_and_writes_shutdown_event(tmp_path):
+    # Spec: --daemon "exits cleanly on SIGINT or SIGTERM after writing a shutdown
+    # event when possible." The loop checks an injected stop flag between
+    # iterations; on stop it writes a 'signal' shutdown event and returns.
+    from prodigy.cli.signal import build_parser, run_daemon_loop
+    from prodigy.db import connect, init_db
+
+    db_path = tmp_path / "prodigy.sqlite"
+    with connect(db_path) as conn:
+        init_db(conn)
+        # fresh-enough equity snapshot so run_once is not skipped as stale
+        conn.execute(
+            """
+            insert into equity_snapshots (
+              snapshot_id, created_at, equity, available_margin, unrealized_pnl, realized_pnl_24h
+            ) values ('s1', '2026-07-04T10:15:30Z', 1000, 1000, 0, 0)
+            """
+        )
+        conn.commit()
+
+    args = build_parser().parse_args(["--daemon", "--db", str(db_path)])
+    signal_cfg = load_config("configs/default.toml")["signal"]
+
+    iterations = {"n": 0}
+
+    def stop_flag() -> bool:
+        # Stop after the first completed iteration.
+        return iterations["n"] >= 1
+
+    def refresh_data() -> None:
+        pass
+
+    def score_loader():
+        import pandas as pd
+
+        from prodigy.signals.daemon import expected_closed_bar_ts
+
+        iterations["n"] += 1
+        return 1.0, expected_closed_bar_ts(pd.Timestamp("2026-07-04T10:16:00Z"), "15m")
+
+    rc = run_daemon_loop(
+        args,
+        signal_cfg=signal_cfg,
+        db_path=db_path,
+        refresh_data=refresh_data,
+        score_loader=score_loader,
+        stop_flag=stop_flag,
+        now_factory=lambda: __import__("pandas").Timestamp("2026-07-04T10:16:00Z"),
+        sleep=lambda _s: None,
+    )
+
+    assert rc == 0
+    with connect(db_path) as conn:
+        evt = conn.execute(
+            "select severity, component, message from events where component = 'signal' and message like 'shutdown%'"
+        ).fetchone()
+    assert evt is not None, "daemon loop must write a shutdown event on stop"
