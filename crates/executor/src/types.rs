@@ -64,9 +64,26 @@ pub struct MarketUpdate {
     pub exchange_ts_ms: i64,
 }
 
+/// Equity snapshot parsed from a private-WS `account` event. A fast cache update;
+/// the REST reconcile path remains the source of truth.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AccountSnapshotUpdate {
+    pub equity: f64,
+    pub available_margin: f64,
+    pub unrealized_pnl: f64,
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct PrivateWsUpdate {
     pub orders: Vec<OrderRecord>,
     pub fills: Vec<FillRecord>,
     pub positions: Vec<PositionRecord>,
+    pub account: Option<AccountSnapshotUpdate>,
+    /// True when a private-WS `{"event":"login","code":"0",...}` ack was parsed.
+    /// The WS loop waits for this before treating private state as ready.
+    pub login_ack: bool,
+    /// Set when a private-WS `{"event":"error",...}` or a non-zero login code is
+    /// parsed (auth/subscribe failure). Carries the exchange message so the loop
+    /// can emit a `websocket_auth_failed` event and stay not-ready until reconnect.
+    pub auth_error: Option<String>,
 }

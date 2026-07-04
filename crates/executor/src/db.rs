@@ -97,6 +97,50 @@ pub fn upsert_order(conn: &Connection, order: &OrderRecord) -> Result<()> {
     Ok(())
 }
 
+/// True iff we already have a local order row for this client_oid. The private-WS
+/// loop uses this to refresh ONLY orders we placed locally — it never inserts a
+/// row the executor didn't write (REST reconcile owns order discovery).
+pub fn order_exists(conn: &Connection, client_oid: &str) -> Result<bool> {
+    let n: i64 = conn.query_row(
+        "select count(*) from orders where client_oid = ?",
+        params![client_oid],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
+}
+
+/// Refresh an ALREADY-LOCAL order's live fields from a private-WS update WITHOUT
+/// touching identity columns (order_id, client_oid, intent_id stay as the
+/// executor wrote them). REST reconcile owns order discovery; the executor owns
+/// intent_id. The WS only refreshes status/filled_size/price/raw_json (the fast
+/// cache). Bare UPDATE by positional params (excluded.* is UPSERT-only) and it
+/// matches zero rows when no local row exists — callers gate on order_exists.
+pub fn refresh_order_from_ws(conn: &Connection, order: &OrderRecord) -> Result<()> {
+    conn.execute(
+        "update orders set
+           exchange_order_id = coalesce(?1, exchange_order_id),
+           status = ?2,
+           price = ?3,
+           size = ?4,
+           filled_size = ?5,
+           updated_at = datetime('now'),
+           attempt = ?6,
+           raw_json = ?7
+         where client_oid = ?8",
+        params![
+            order.exchange_order_id,
+            order.status,
+            order.price,
+            order.size,
+            order.filled_size,
+            order.attempt,
+            order.raw_json,
+            order.client_oid,
+        ],
+    )?;
+    Ok(())
+}
+
 /// Remove the local positions row for a symbol. Called by reconcile when the
 /// exchange no longer lists a position for it (manual full-close): exchange state
 /// wins, so the local row must not keep reporting a position Bitget no longer
@@ -125,6 +169,42 @@ pub fn upsert_position(conn: &Connection, position: &PositionRecord) -> Result<(
            opened_at = excluded.opened_at,
            adopted_at = excluded.adopted_at,
            source_intent_id = excluded.source_intent_id,
+           raw_json = excluded.raw_json",
+        params![
+            position.symbol,
+            position.side,
+            position.notional,
+            position.entry_price,
+            position.unrealized_pnl,
+            position.ownership,
+            position.opened_at,
+            position.adopted_at,
+            position.source_intent_id,
+            position.raw_json,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Refresh a position's live market fields from a private-WS update WITHOUT
+/// overwriting reconcile's authoritative ownership classification. REST
+/// reconcile owns ownership/adopted_at/source_intent_id; the WS feed only
+/// refreshes side/notional/entry_price/unrealized_pnl/raw_json (the fast cache).
+/// If no local row exists yet, insert with WS-supplied ownership ("system")
+/// pending the next reconcile reclassification. (Spec: if WS and REST disagree,
+/// REST wins — so we never let a WS push downgrade an existing classification.)
+pub fn refresh_position_from_ws(conn: &Connection, position: &PositionRecord) -> Result<()> {
+    conn.execute(
+        "insert into positions (
+           symbol, side, notional, entry_price, unrealized_pnl, updated_at,
+           ownership, opened_at, adopted_at, source_intent_id, raw_json
+         ) values (?, ?, ?, ?, ?, datetime('now'), ?, ?, ?, ?, ?)
+         on conflict(symbol) do update set
+           side = excluded.side,
+           notional = excluded.notional,
+           entry_price = excluded.entry_price,
+           unrealized_pnl = excluded.unrealized_pnl,
+           updated_at = datetime('now'),
            raw_json = excluded.raw_json",
         params![
             position.symbol,
@@ -1189,6 +1269,81 @@ mod tests {
     }
 
     #[test]
+    fn refresh_position_from_ws_preserves_reconcile_ownership() {
+        // Finding 1 regression: a private-WS positions push must NOT clobber the
+        // ownership classification (imported/system), adopted_at, or source_intent_id
+        // that REST reconcile authoritatively wrote. WS only refreshes market-movement
+        // fields (side/notional/entry_price/unrealized_pnl/raw_json); reconcile's
+        // ownership stays put until the next reconcile reclassifies. Spec: REST wins.
+        use crate::types::PositionRecord;
+        let conn = memory_db();
+        // Reconcile's authoritative write: position classified imported + adopted.
+        let reconciled = PositionRecord {
+            symbol: "ETH/USDT:USDT".to_string(),
+            side: "long".to_string(),
+            notional: 1000.0,
+            entry_price: 3000.0,
+            unrealized_pnl: 12.0,
+            ownership: "imported".to_string(),
+            opened_at: Some("2026-07-01T00:00:00Z".to_string()),
+            adopted_at: Some("2026-07-01T00:00:00Z".to_string()),
+            source_intent_id: Some("intent-9".to_string()),
+            raw_json: "{\"src\":\"reconcile\"}".to_string(),
+        };
+        upsert_position(&conn, &reconciled).unwrap();
+
+        // Private-WS push for the same symbol: WS parser hardcodes ownership "system"
+        // and different market fields.
+        let ws = PositionRecord {
+            notional: 1100.0,
+            unrealized_pnl: 50.0,
+            ownership: "system".to_string(),
+            adopted_at: None,
+            source_intent_id: None,
+            raw_json: "{\"src\":\"ws\"}".to_string(),
+            ..reconciled.clone()
+        };
+        refresh_position_from_ws(&conn, &ws).unwrap();
+
+        let row = conn
+            .query_row(
+                "select notional, unrealized_pnl, ownership, adopted_at, source_intent_id, raw_json
+                 from positions where symbol='ETH/USDT:USDT'",
+                [],
+                |r| {
+                    Ok((
+                        r.get::<_, f64>(0)?,
+                        r.get::<_, f64>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, Option<String>>(3)?,
+                        r.get::<_, Option<String>>(4)?,
+                        r.get::<_, String>(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        // Market fields refreshed from WS.
+        assert!((row.0 - 1100.0).abs() < 1e-9, "notional should refresh");
+        assert!((row.1 - 50.0).abs() < 1e-9, "unrealized_pnl should refresh");
+        // Ownership authority preserved.
+        assert_eq!(
+            row.2, "imported",
+            "ownership must stay reconcile-authoritative"
+        );
+        assert_eq!(
+            row.3.as_deref(),
+            Some("2026-07-01T00:00:00Z"),
+            "adopted_at must be preserved"
+        );
+        assert_eq!(
+            row.4.as_deref(),
+            Some("intent-9"),
+            "source_intent_id must be preserved"
+        );
+        assert_eq!(row.5, "{\"src\":\"ws\"}", "raw_json should refresh");
+    }
+
+    #[test]
     fn set_order_filled_from_detail_partial_keeps_submitted() {
         // A partial cumulative fill (< ordered size) updates filled_size but does
         // NOT prematurely mark the order 'filled'.
@@ -1220,5 +1375,98 @@ mod tests {
             .unwrap();
         assert_eq!(status, "submitted");
         assert!((filled - 0.02).abs() < 1e-9);
+    }
+
+    #[test]
+    fn refresh_order_from_ws_preserves_intent_id_and_does_not_insert() {
+        // Fix-A regression: a private-WS order refresh must update the live fields
+        // (status/filled_size/exchange_order_id/price/...) but MUST preserve the
+        // identity columns the executor wrote (intent_id). The WS order parser sets
+        // intent_id None; if a refresh clobbered intent_id, system_net_base_for_symbol
+        // (filters intent_id is not null) would drop a real system position and
+        // reconcile would mis-classify it. Also it must never INSERT a row.
+        let conn = memory_db();
+        conn.execute(
+            "insert into trade_intents (intent_id, created_at, symbol, side, action,
+               target_notional, max_order_notional, status, source)
+             values ('intent-7','2026-07-01T00:00:00Z','ETH/USDT:USDT','long','open',100,100,'executed','t')",
+            [],
+        )
+        .unwrap();
+        // Executor's authoritative write: system order, submitted, no fill yet.
+        let system = OrderRecord {
+            order_id: "order-1".to_string(),
+            exchange_order_id: None,
+            client_oid: "client-1".to_string(),
+            intent_id: Some("intent-7".to_string()),
+            symbol: "ETH/USDT:USDT".to_string(),
+            side: "buy".to_string(),
+            action: "open".to_string(),
+            order_type: "limit".to_string(),
+            status: "submitted".to_string(),
+            price: Some(3000.0),
+            size: 0.05,
+            filled_size: 0.0,
+            attempt: 1,
+            raw_json: "{\"src\":\"rest\"}".to_string(),
+            last_error: None,
+        };
+        upsert_order(&conn, &system).unwrap();
+
+        // Private-WS push for the SAME client_oid with intent_id None (WS parser),
+        // status filled, fill size 0.05, exchange order id now known.
+        let ws = OrderRecord {
+            exchange_order_id: Some("ex-1".to_string()),
+            status: "filled".to_string(),
+            filled_size: 0.05,
+            intent_id: None,
+            raw_json: "{\"src\":\"ws\"}".to_string(),
+            ..system.clone()
+        };
+        refresh_order_from_ws(&conn, &ws).unwrap();
+
+        let row = conn
+            .query_row(
+                "select status, filled_size, exchange_order_id, intent_id, raw_json
+                 from orders where client_oid = 'client-1'",
+                [],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, f64>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                        r.get::<_, Option<String>>(3)?,
+                        r.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        // Live fields refreshed from WS.
+        assert_eq!(row.0, "filled");
+        assert!((row.1 - 0.05).abs() < 1e-9);
+        assert_eq!(row.2.as_deref(), Some("ex-1"));
+        assert_eq!(row.4, "{\"src\":\"ws\"}");
+        // Identity preserved: the executor's intent_id is untouched.
+        assert_eq!(
+            row.3.as_deref(),
+            Some("intent-7"),
+            "intent_id must be preserved on WS refresh"
+        );
+
+        // CRITICAL: a refresh on a client_oid with NO local row must not INSERT.
+        let fresh = OrderRecord {
+            client_oid: "client-unknown".to_string(),
+            order_id: "order-2".to_string(),
+            ..ws.clone()
+        };
+        refresh_order_from_ws(&conn, &fresh).unwrap();
+        let unknown: i64 = conn
+            .query_row(
+                "select count(*) from orders where client_oid = 'client-unknown'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(unknown, 0, "refresh must not insert an unknown order");
     }
 }

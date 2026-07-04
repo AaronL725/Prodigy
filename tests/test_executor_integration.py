@@ -125,3 +125,106 @@ def test_rust_demo_executor_processes_pending_intent(tmp_path):
         f"total ({orders_filled_total}) — would indicate a double-count"
     )
     assert event_count >= 1
+
+
+def test_rust_demo_daemon_processes_pending_intent_once(tmp_path):
+    _demo_depth_diagnostic()
+    db_path = tmp_path / "prodigy.sqlite"
+
+    with connect(db_path) as conn:
+        init_db(conn)
+        write_trade_intent(
+            conn,
+            TradeIntent(
+                intent_id="daemon-intent-1",
+                created_at="2026-07-03T00:00:00Z",
+                symbol="ETH/USDT:USDT",
+                side="long",
+                action="open",
+                target_notional=100.0,
+                max_order_notional=100.0,
+                source="test",
+                reason="daemon integration",
+                model_version="smoke-test",
+            ),
+        )
+
+    result = subprocess.run(
+        [
+            "cargo",
+            "run",
+            "-q",
+            "-p",
+            "prodigy-executor",
+            "--",
+            "--db",
+            str(db_path),
+            "--daemon",
+            "--max-runtime-ms",
+            "30000",
+            "--test-reset-demo-state",
+        ],
+        check=True,
+        text=True,
+        capture_output=True,
+        # Startup reconcile + set-leverage against the real demo API take ~7s
+        # before the loop starts, and a single intent-processing tick can run
+        # ~30-40s: the maker open path waits open_maker_timeout_seconds (15s)
+        # per attempt, refreshes, then falls back to a taker that the phantom
+        # demo book often rejects, finally failing "left to reconcile". The
+        # bounded-runtime check fires between ticks, so the first tick runs to
+        # the intent's terminal state regardless of max-runtime-ms; the bound
+        # only governs when the *next* tick exits. 90s leaves room for compile
+        # + startup + one full processing tick.
+        timeout=90,
+    )
+
+    with connect(db_path) as conn:
+        intent = conn.execute(
+            "select status, error from trade_intents where intent_id = 'daemon-intent-1'"
+        ).fetchone()
+        order_count = conn.execute("select count(*) from orders").fetchone()[0]
+        event_count = conn.execute("select count(*) from events").fetchone()[0]
+        # No zero-fill order may be marked filled — the M4 anti-false-fill
+        # invariant, mirrored from the --once test.
+        false_fills = conn.execute(
+            "select count(*) from orders where status = 'filled' and filled_size <= 0"
+        ).fetchone()[0]
+
+    # Honest terminal state: executed when the demo book is tradable, failed
+    # with a diagnostic when it is phantom-liquid (see _demo_depth_diagnostic).
+    # 'pending'/'accepted' (stuck) is never accepted after bounded daemon runtime.
+    assert intent["status"] in ("executed", "failed"), (
+        f"expected a terminal state (executed|failed), got {intent['status']}"
+    )
+    if intent["status"] == "failed":
+        assert intent["error"], "a failed intent must record a diagnostic error"
+    assert order_count >= 1, "expected at least one demo order to be attempted"
+    assert event_count >= 1, "daemon must record startup + reconcile + intent events"
+    assert false_fills == 0, "an order must not be marked filled with no fill"
+    assert "daemon" in result.stdout or result.stderr == ""
+
+
+def test_rust_daemon_rejects_live_mode(tmp_path):
+    db_path = tmp_path / "prodigy.sqlite"
+    result = subprocess.run(
+        [
+            "cargo",
+            "run",
+            "-q",
+            "-p",
+            "prodigy-executor",
+            "--",
+            "--db",
+            str(db_path),
+            "--daemon",
+            "--mode",
+            "live",
+        ],
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode != 0
+    assert "only supports --mode demo" in result.stderr

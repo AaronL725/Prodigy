@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use reqwest::Client;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,12 +50,21 @@ pub async fn send_telegram(
         return Ok(());
     };
     let url = format!("https://api.telegram.org/bot{token}/sendMessage");
-    Client::new()
+    // ponytail: M4 spec — "Telegram delivery failure must not block execution,
+    // order management, or reconcile" (design line 141). reqwest's default has no
+    // request timeout, so a hung/slow Telegram POST would block every direct
+    // awaiter (reconcile pass, private-WS auth-failure helper). BOUND it to 3s;
+    // a timeout returns Err, which every caller already swallows (.ok() / let _ =),
+    // so Telegram being down degrades to "no notification" instead of "stuck loop".
+    // Single point of fix — no per-caller timeouts.
+    let request = Client::new()
         .post(url)
         .form(&[("chat_id", chat), ("text", text)])
-        .send()
-        .await?
-        .error_for_status()?;
+        .send();
+    let response = tokio::time::timeout(std::time::Duration::from_secs(3), request)
+        .await
+        .context("telegram send timed out")??;
+    response.error_for_status()?;
     Ok(())
 }
 
@@ -116,5 +125,44 @@ mod tests {
             NotificationMode::Live,
             "manual_override_cleared"
         ));
+    }
+
+    // Regression for the M4 spec: "Telegram delivery failure must not block
+    // execution, order management, or reconcile". send_telegram must never hang
+    // the caller. The real-network timeout path can't be exercised without an
+    // injectable URL (the host is hard-coded), so this pins the two non-network
+    // invariants: (a) a suppressed kind short-circuits to Ok before any I/O, and
+    // (b) missing token/chat short-circuits to Ok before any I/O. Both guarantee
+    // the most common callers (every demo-kind in notify, and any M4 daemon run
+    // without configured Telegram creds) return promptly. The 3s send() bound is
+    // a one-line constant verified by inspection + the live daemon smoke.
+    #[tokio::test]
+    async fn send_telegram_short_circuits_without_hanging() {
+        // Suppressed kind: no I/O attempted.
+        let suppressed = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            send_telegram(Some("t"), Some("c"), "info", "x"),
+        )
+        .await
+        .expect("suppressed kind must not hang");
+        assert!(suppressed.is_ok());
+
+        // Missing token: no I/O attempted even for an active kind.
+        let no_token = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            send_telegram(None, None, "critical", "x"),
+        )
+        .await
+        .expect("missing-creds must not hang");
+        assert!(no_token.is_ok());
+
+        // Active kind, partial creds (no chat): still short-circuits.
+        let partial = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            send_telegram(Some("t"), None, "critical", "x"),
+        )
+        .await
+        .expect("partial-creds must not hang");
+        assert!(partial.is_ok());
     }
 }

@@ -272,7 +272,11 @@ async fn bitget_demo_can_open_and_reduce_only_close_market_order() {
             product_type: cfg.product_type.clone(),
             margin_mode: cfg.margin_mode.clone(),
             margin_coin: cfg.margin_coin.clone(),
-            size: format!("{opened_size}"),
+            // ponytail: round the observed fill to the lot step before formatting
+            // — the raw repr (0.009999999999999995) is one lot, but Bitget rejects
+            // it as "less than minimum order quantity". Reuse the production sizer
+            // so this close path exercises the same lot-rounding as the executor.
+            size: prodigy_executor::executor::format_size(opened_size),
             price: None,
             side: "sell".to_string(),
             order_type: "market".to_string(),

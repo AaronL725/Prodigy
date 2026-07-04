@@ -16,16 +16,24 @@ use crate::types::{MarketUpdate, OrderRecord, TradeIntent};
 #[derive(Debug, Clone, Default)]
 pub struct MarketCache {
     latest: Option<MarketUpdate>,
+    local_received_at_ms: Option<i64>,
 }
 
 impl MarketCache {
     pub fn update(&mut self, update: MarketUpdate) {
+        let now_ms = crate::bitget::now_ms().parse::<i64>().unwrap_or(0);
+        self.update_at(update, now_ms);
+    }
+
+    pub fn update_at(&mut self, update: MarketUpdate, local_received_at_ms: i64) {
         self.latest = Some(update);
+        self.local_received_at_ms = Some(local_received_at_ms);
     }
 
     pub fn latest_fresh(&self, now_ms: i64, stale_after_secs: u64) -> Option<MarketUpdate> {
         let update = self.latest.clone()?;
-        let age_ms = now_ms.saturating_sub(update.exchange_ts_ms);
+        let received_at = self.local_received_at_ms?;
+        let age_ms = now_ms.saturating_sub(received_at);
         if age_ms <= (stale_after_secs as i64) * 1000 {
             Some(update)
         } else {
@@ -34,13 +42,253 @@ impl MarketCache {
     }
 }
 
-/// Turn a (possibly stale/missing) market snapshot into a Result. Used at the
-/// maker-retry and taker-fallback decision points: a maker order times out after
-/// up to 15s while the cache's freshness window is 3s, so re-placing on the
-/// pre-timeout price would post a stale limit. None (stale or unavailable) must
-/// FAIL the intent rather than place on a price we can't trust.
-fn require_fresh_market(market: Option<MarketUpdate>) -> Result<MarketUpdate> {
-    market.ok_or_else(|| anyhow::anyhow!("market data is stale; cannot place on stale price"))
+/// What the intent loop should do for one intent, given WS cache freshness.
+/// Pure so the open-vs-close gating is unit-testable without a network round-trip.
+///
+/// - Opening actions (open/add/reverse) need FRESH WS market to price a limit/market
+///   order on the current level. A stale/missing WS cache DEFERS them (keep pending)
+///   — never fail — so a transient WS gap can't permanently reject an intent (spec:
+///   stale market blocks only new opening exposure). REST ticker is NOT used for
+///   opens here: the whole point of the WS cache is fresh best bid/ask, and falling
+///   back to a (possibly also stale/lagged) REST ticker for an OPEN would defeat the
+///   freshness gate. The open defers until WS is fresh again.
+/// - Risk-reducing actions (close/reduce/cancel) proceed via a fresh REST ticker
+///   regardless of WS staleness (spec line 95: close/cancel/de-risk stay allowed).
+#[derive(Debug, Clone, PartialEq)]
+pub enum MarketGate {
+    /// Use this fresh WS snapshot (opening action, cache fresh).
+    UseWs(MarketUpdate),
+    /// Defer (leave pending) — opening action but WS cache stale/missing. Retry next tick.
+    DeferOpen,
+    /// Risk-reducing action; proceed by fetching a fresh REST ticker (WS cache irrelevant).
+    UseRestTicker,
+}
+
+pub(crate) fn market_gate(action: &str, cache: Option<MarketUpdate>) -> MarketGate {
+    if is_opening_action(action) {
+        match cache {
+            Some(m) => MarketGate::UseWs(m),
+            None => MarketGate::DeferOpen,
+        }
+    } else {
+        MarketGate::UseRestTicker
+    }
+}
+
+/// Minimum gap (ms) between two "deferred open" events for the same intent.
+// ponytail: the daemon ticks every 250ms; without a per-intent cap a WS outage
+// floods the events table (one row per tick per pending open). 10s balances
+// observability (a stuck-deferred intent still logs every ~10s) against write
+// volume. Generalize to config if multiple symbols/intents make this too coarse.
+const DEFER_EVENT_WINDOW_MS: i64 = 10_000;
+
+/// True if a deferred-open event was emitted recently enough to suppress another
+/// emit. Pure over (last_emit_ms, now_ms) so the rate-limit is unit-testable
+/// without the REST/WS harness; the loop persists last_emit_ms in executor_state.
+fn defer_event_recently_emitted(last_emit_ms: Option<i64>, now_ms: i64) -> bool {
+    match last_emit_ms {
+        Some(last) => now_ms - last < DEFER_EVENT_WINDOW_MS,
+        None => false,
+    }
+}
+
+/// Best-effort durable failure for an intent that hit an infrastructure error
+/// AFTER it was accepted. Logs the error event, then flips the intent to
+/// `failed` so a stuck-`accepted` row can't wedge the loop (accept_intent only
+/// matches `pending`, so the loop would otherwise never retry it). reconcile
+/// owns the real order/position truth. Both writes are best-effort: a sqlite
+/// failure here is logged but must not propagate (the caller is mid-batch and a
+/// logging error must not strand the rest of the intents — same isolation as
+/// the per-intent snapshot/equity writes above).
+fn fail_intent_after_infra_error(conn: &Connection, intent_id: &str, err: &anyhow::Error) {
+    let _ = db::write_event(
+        conn,
+        "error",
+        "intent_loop",
+        &format!("intent {intent_id} infrastructure error: {err}"),
+        "{}",
+    );
+    if let Err(fail_err) = db::fail_intent(conn, intent_id, &format!("infrastructure error: {err}"))
+    {
+        let _ = db::write_event(
+            conn,
+            "error",
+            "intent_loop",
+            &format!("could not mark intent {intent_id} failed: {fail_err}"),
+            "{}",
+        );
+    }
+}
+
+/// Process every pending intent in DB order using the same code path the
+/// one-shot `run_once_or_loop` uses. Extracted so the daemon (Task 7) can drive
+/// the loop on its own cadence without duplicating the per-intent wiring
+/// (account snapshot, equity row, freshness gate, process_one_intent, event).
+/// Behavior is identical to the prior inline loop; it returns the count only so
+/// a caller may log it.
+pub async fn process_pending_intents_once(
+    conn: &rusqlite::Connection,
+    cfg: &ExecutorConfig,
+    rest: &BitgetRestClient,
+    market_cache: &mut MarketCache,
+    private_state_ready: bool,
+) -> Result<usize> {
+    let intents = db::pending_intents(conn)?;
+    let mut processed = 0usize;
+    for intent in intents {
+        // Gate FIRST: a stale public WS defers an OPEN before any REST call. The
+        // daemon ticks every 250ms; if the WS is down, fetching a REST account
+        // snapshot for a pending open each tick would hammer REST for nothing.
+        // Close/reduce (UseRestTicker) and fresh-WS opens (UseWs) proceed below.
+        let now_ms = crate::bitget::now_ms().parse::<i64>().unwrap_or(0);
+        let cache = market_cache.latest_fresh(now_ms, cfg.stale_market_data_secs);
+        // DeferOpen is exactly (opening action + no fresh WS cache); check it without
+        // consuming `cache` so the same Option feeds the market_gate resolution below.
+        if cache.is_none() && is_opening_action(&intent.action) {
+            // Opening action + stale/missing WS: defer (leave pending). Do NOT
+            // fail — a transient WS gap must not permanently reject an open.
+            // Stays pending; the next tick retries once WS is fresh.
+            //
+            // Rate-limit the defer event: the daemon ticks every 250ms, so a WS
+            // outage would otherwise flood the events table with one row per tick
+            // per pending open. Emit at most once per DEFER_EVENT_WINDOW per
+            // intent (last-emit timestamp persisted in executor_state so the cap
+            // survives across ticks). The intent defers either way.
+            if !defer_event_recently_emitted(
+                db::get_executor_state(conn, &format!("deferred_open:{}", intent.intent_id))
+                    .unwrap_or(None)
+                    .and_then(|s| s.parse::<i64>().ok()),
+                now_ms,
+            ) {
+                let _ = db::set_executor_state(
+                    conn,
+                    &format!("deferred_open:{}", intent.intent_id),
+                    &now_ms.to_string(),
+                );
+                let _ = db::write_event(
+                    conn,
+                    "info",
+                    "intent_loop",
+                    &format!("deferred open {}: market data stale", intent.intent_id),
+                    "{}",
+                );
+            }
+            continue;
+        }
+
+        // Fetch a FRESH account snapshot per intent. A run can carry multiple
+        // opening intents; if the first fills, its gross notional/equity have
+        // moved by the time the second is risk-checked. Sharing one snapshot
+        // across the loop would let a later intent pass the cap on stale equity
+        // or double-count the headroom the first fill already consumed.
+        // ponytail: per-intent error isolation — a transient account-snapshot
+        // failure must not strand the rest of the batch (head-of-line blocking).
+        // Log + continue; the next tick retries.
+        let account = match fetch_account_snapshot(rest, private_state_ready).await {
+            Ok(a) => a,
+            Err(err) => {
+                let _ = db::write_event(
+                    conn,
+                    "warning",
+                    "intent_loop",
+                    &format!("account snapshot failed for {}: {err}", intent.intent_id),
+                    "{}",
+                );
+                continue;
+            }
+        };
+        // ponytail: isolate the per-intent audit-row write too — a sqlite
+        // failure here (disk full / DB locked) must not strand the rest of the
+        // batch. Skip this intent and retry next tick; the snapshot was fetched
+        // but couldn't be persisted, so don't process the intent either.
+        if let Err(err) = db::insert_equity_snapshot(
+            conn,
+            account.equity,
+            account.available_margin,
+            account.unrealized_pnl_24h,
+            0.0,
+        ) {
+            let _ = db::write_event(
+                conn,
+                "warning",
+                "intent_loop",
+                &format!(
+                    "equity snapshot write failed for {}: {err}",
+                    intent.intent_id
+                ),
+                "{}",
+            );
+            continue;
+        }
+
+        // Resolve the market snapshot: a fresh-WS open reuses the cached level;
+        // a close/reduce (UseRestTicker) fetches a FRESH REST ticker regardless
+        // of WS staleness (spec: close/cancel/de-risk stay allowed when safe) and
+        // refreshes the cache so later opens in the same batch see it.
+        let market = match market_gate(&intent.action, cache) {
+            MarketGate::UseWs(m) => m,
+            MarketGate::UseRestTicker => match fetch_market_snapshot(cfg, rest).await {
+                Ok(m) => {
+                    market_cache.update(m.clone());
+                    m
+                }
+                Err(err) => {
+                    let _ = db::write_event(
+                        conn,
+                        "warning",
+                        "intent_loop",
+                        &format!("market refresh failed for {}: {err}", intent.intent_id),
+                        "{}",
+                    );
+                    continue;
+                }
+            },
+            // DeferOpen was already short-circuited above; this arm satisfies
+            // exhaustiveness and is never reached here.
+            MarketGate::DeferOpen => continue,
+        };
+
+        // ponytail: process_one_intent fails intents DURABLY via db::fail_intent
+        // and returns Ok(()) for known failure modes (risk reject, place-order
+        // reject, market-refresh failure, cancel-confirm failure, max-commands).
+        // A residual Err is genuine infrastructure error (REST/sqlite) that fired
+        // AFTER accept_intent flipped the intent pending→accepted. accept_intent
+        // only matches `pending`, so a stuck-accepted intent would be invisible to
+        // every future tick (pending_intents selects pending only) — i.e. wedged
+        // forever. Fail it durably here so the loop can't strand it; reconcile
+        // owns the real order/position truth, so "failed" means "we lost track of
+        // this attempt", not "no order was placed". This single guard covers every
+        // bare `?` inside process_one_intent (sizing, retry/taker account snapshot,
+        // order-row writes) — fixing the wedge once, where all Err paths converge,
+        // instead of at each `?`.
+        if let Err(err) = process_one_intent(
+            conn,
+            cfg,
+            rest,
+            intent.clone(),
+            market,
+            account,
+            market_cache,
+        )
+        .await
+        {
+            fail_intent_after_infra_error(conn, &intent.intent_id, &err);
+        }
+        // Only count intents that actually reached process_one_intent (UseWs /
+        // UseRestTicker arms). A deferred open stays pending and is NOT counted,
+        // so the caller can tell the batch had headroom left to retry.
+        // ponytail: the processed-event write is best-effort — a logging failure
+        // here must not strand the batch; the println and count are non-failing.
+        if let Err(err) = db::write_event(conn, "info", "executor", "processed intent", "{}") {
+            eprintln!(
+                "processed-intent event write failed for {}: {err}",
+                intent.intent_id
+            );
+        }
+        println!("processed {}", intent.intent_id);
+        processed += 1;
+    }
+    Ok(processed)
 }
 
 pub async fn run_once_or_loop(cfg: ExecutorConfig) -> Result<()> {
@@ -77,49 +325,31 @@ pub async fn run_once_or_loop(cfg: ExecutorConfig) -> Result<()> {
     )
     .await?;
 
-    let intents = db::pending_intents(&conn)?;
     // ponytail: seed the market cache once with a real ticker (not the WS stream
     // yet); latest_fresh per intent rejects openings when the cached price is
     // older than cfg.stale_market_data_secs.
     let mut market_cache = MarketCache::default();
     market_cache.update(fetch_market_snapshot(&cfg, &rest).await?);
-    for intent in intents {
-        // Fetch a FRESH account snapshot per intent. A run can carry multiple
-        // opening intents; if the first fills, its gross notional/equity have
-        // moved by the time the second is risk-checked. Sharing one snapshot
-        // across the loop would let a later intent pass the cap on stale equity
-        // or double-count the headroom the first fill already consumed.
-        let account = fetch_account_snapshot(&rest).await?;
-        db::insert_equity_snapshot(
-            &conn,
-            account.equity,
-            account.available_margin,
-            account.unrealized_pnl_24h,
-            0.0,
-        )?;
-        let now_ms = crate::bitget::now_ms().parse::<i64>().unwrap_or(0);
-        let market =
-            require_fresh_market(market_cache.latest_fresh(now_ms, cfg.stale_market_data_secs))?;
-        process_one_intent(
-            &conn,
-            &cfg,
-            &rest,
-            intent.clone(),
-            market,
-            account,
-            &mut market_cache,
-        )
-        .await?;
-        db::write_event(&conn, "info", "executor", "processed intent", "{}")?;
-        println!("processed {}", intent.intent_id);
-    }
+    // ponytail: pass true — the one-shot already verified the private WS connects
+    // via verify_private_ws_connects above, so private state IS ready at one-shot
+    // time. The daemon instead threads its live PrivateStateReady signal here.
+    process_pending_intents_once(&conn, &cfg, &rest, &mut market_cache, true).await?;
     Ok(())
 }
 
 /// Fetch real account equity/margin/unrealized PnL + sum positions into gross
 /// notional. Parses the Bitget v2 mix account + all-position response into the
 /// AccountRiskSnapshot the risk gate consumes — no hardcoded fiction.
-async fn fetch_account_snapshot(rest: &BitgetRestClient) -> Result<AccountRiskSnapshot> {
+/// `private_state_ready` is the daemon's live PrivateStateReady signal value at
+/// the call site: the per-intent ENTRY snapshot (process_pending_intents_once)
+/// passes the live value so an open is gated on it; the mid-execution re-checks
+/// inside process_one_intent (maker-retry, taker) pass `true` — those run AFTER
+/// the open was already gated at entry, and aborting a half-placed open on a WS
+/// flap would be worse than completing it (spec: refuse new OPENING exposure).
+async fn fetch_account_snapshot(
+    rest: &BitgetRestClient,
+    private_state_ready: bool,
+) -> Result<AccountRiskSnapshot> {
     let acct = rest.get_account_snapshot().await?;
     let data = acct
         .get("data")
@@ -187,7 +417,7 @@ async fn fetch_account_snapshot(rest: &BitgetRestClient) -> Result<AccountRiskSn
         // maker-retry/taker arms fail the intent before reaching this risk check
         // when the ticker refresh itself fails, so this never hides a stale price.
         market_is_fresh: true,
-        private_state_is_ready: true,
+        private_state_is_ready: private_state_ready,
     })
 }
 
@@ -736,10 +966,20 @@ fn round_down_to_step(value: f64, step: f64) -> f64 {
     if step <= 0.0 {
         return value;
     }
-    (value / step).floor() * step
+    // ponytail: floating-point can store a clean lot slightly below its true
+    // value (one lot of 0.01 is 0.009999999999999995 in f64). A bare
+    // (value/step).floor() maps 0.9999...→0, dropping a whole lot — and at one
+    // lot sizes the order to 0, which Bitget rejects ("less than minimum order
+    // quantity"). Add an epsilon in LOT-COUNT space: 1e-9 is far smaller than
+    // the lot step (0.01) so a genuine sub-lot remainder (0.005, 0.0199) is
+    // never bumped up to the next lot, but far larger than FP division error, so
+    // noise at a lot boundary is absorbed. Money path: rounding stays DOWN, so
+    // the placed size never exceeds the approved notional.
+    let lots = value / step;
+    (lots + 1e-9).floor() * step
 }
 
-fn format_size(value: f64) -> String {
+pub fn format_size(value: f64) -> String {
     // ponytail: round to the lot step before formatting so Bitget accepts the size.
     let rounded = round_down_to_step(value, MIN_ORDER_BASE);
     format!("{rounded:.4}")
@@ -894,7 +1134,11 @@ pub async fn process_one_intent(
                 if attempt > 1 {
                     // Fetch a FRESH account snapshot so the re-check uses current
                     // equity/margin, not the stale snapshot from run start.
-                    let fresh_account = fetch_account_snapshot(rest).await?;
+                    // ponytail: pass true — this re-check runs MID-EXECUTION of an
+                    // already-gated open (entry snapshot gated it); aborting here on
+                    // a WS flap would strand a half-placed open. Spec scopes the
+                    // private-state gate to NEW opening exposure.
+                    let fresh_account = fetch_account_snapshot(rest, true).await?;
                     if let Err(reason) = check_intent(
                         &intent,
                         &fresh_account,
@@ -1118,7 +1362,9 @@ pub async fn process_one_intent(
                     }
                 };
                 // Re-check risk with a FRESH account snapshot before taker fallback.
-                let fresh_account = fetch_account_snapshot(rest).await?;
+                // ponytail: pass true — mid-execution of an already-gated open; see
+                // the maker-retry re-check above for the same rationale.
+                let fresh_account = fetch_account_snapshot(rest, true).await?;
                 if let Err(reason) = check_intent(
                     &intent,
                     &fresh_account,
@@ -1270,6 +1516,75 @@ mod tests {
     use super::*;
     use crate::types::{MarketUpdate, TradeIntent};
 
+    fn memory_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(include_str!("../../../schema/001_initial.sql"))
+            .unwrap();
+        conn.execute_batch(include_str!("../../../schema/002_execution.sql"))
+            .unwrap();
+        conn
+    }
+
+    fn insert_pending_intent(conn: &Connection, intent_id: &str) {
+        conn.execute(
+            "insert into trade_intents (
+               intent_id, created_at, symbol, side, action, target_notional,
+               max_order_notional, status, source
+             ) values (?1, '2026-07-01T00:00:00Z', 'ETH/USDT:USDT',
+                       'long', 'open', 100, 100, 'pending', 'test')",
+            rusqlite::params![intent_id],
+        )
+        .unwrap();
+    }
+
+    fn intent_status(conn: &Connection, intent_id: &str) -> String {
+        conn.query_row(
+            "select status from trade_intents where intent_id = ?1",
+            rusqlite::params![intent_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn infra_error_marks_accepted_intent_failed_not_stuck() {
+        // Regression: process_one_intent accepts the intent (pending→accepted)
+        // BEFORE driving the state machine, and accept_intent only matches
+        // `pending`. So a later infrastructure Err would leave the row accepted
+        // and invisible to every future tick — wedged forever. fail_intent_after_
+        // infra_error must flip it to `failed` so the loop can't strand it.
+        let conn = memory_db();
+        insert_pending_intent(&conn, "i1");
+        assert!(db::accept_intent(&conn, "i1").unwrap());
+        assert_eq!(intent_status(&conn, "i1"), "accepted");
+
+        fail_intent_after_infra_error(&conn, "i1", &anyhow::anyhow!("rest timeout"));
+
+        assert_eq!(
+            intent_status(&conn, "i1"),
+            "failed",
+            "infra error after accept must not leave the intent stuck accepted"
+        );
+        let err: String = conn
+            .query_row(
+                "select error from trade_intents where intent_id = 'i1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(err.contains("rest timeout"));
+        assert!(err.contains("infrastructure error"));
+    }
+
+    #[test]
+    fn defer_event_rate_limit_suppresses_recent_emits() {
+        // Never emitted → emit. Within the 10s window → suppress. Past it → emit.
+        assert!(!defer_event_recently_emitted(None, 10_000));
+        assert!(defer_event_recently_emitted(Some(9_500), 10_000)); // 500ms ago
+        assert!(!defer_event_recently_emitted(Some(0), 10_000)); // 10s ago → emit
+        assert!(defer_event_recently_emitted(Some(10_000), 10_000)); // exactly now
+    }
+
     #[test]
     fn maker_open_long_uses_best_bid() {
         let intent = TradeIntent {
@@ -1355,6 +1670,26 @@ mod tests {
     }
 
     #[test]
+    fn round_down_to_step_absorbs_fp_noise_at_lot_boundary() {
+        // 0.01 stored as 0.009999999999999995 is ONE lot, not zero. A bare
+        // (value/step).floor() maps 0.9999...→0, under-sizing the order to 0
+        // (Bitget then rejects "less than minimum order quantity"). The epsilon
+        // absorbs the noise so a value at-or-above an integer lot keeps that lot.
+        assert_eq!(round_down_to_step(0.009999999999999995, 0.01), 0.01);
+        // a genuine sub-lot remainder must NOT be bumped up to the next lot
+        assert_eq!(round_down_to_step(0.0199, 0.01), 0.01); // 1.99 lots → 1
+        assert_eq!(round_down_to_step(0.005, 0.01), 0.0); // half a lot → 0
+    }
+
+    #[test]
+    fn format_size_handles_fp_noise_close_size() {
+        // The observed fill can come back as 0.009999999999999995 (one lot,
+        // FP-noisy); formatting it for a reduce-only close must yield "0.01", not
+        // the raw repr the exchange rejects as below the minimum order quantity.
+        assert_eq!(format_size(0.009999999999999995), "0.01");
+    }
+
+    #[test]
     fn is_open_blocked_only_for_active_override() {
         // money-path open gate: only the literal "active" state blocks opening.
         assert!(is_open_blocked(Some("active")));
@@ -1427,20 +1762,30 @@ mod tests {
     }
 
     #[test]
-    fn stale_market_cache_returns_none() {
+    fn market_cache_uses_local_received_time_for_freshness() {
         let mut cache = MarketCache::default();
-        cache.update(MarketUpdate {
-            symbol: "ETHUSDT".to_string(),
-            best_bid: 3000.0,
-            best_ask: 3000.5,
-            exchange_ts_ms: 1,
-        });
+        cache.update_at(
+            MarketUpdate {
+                symbol: "ETHUSDT".to_string(),
+                best_bid: 100.0,
+                best_ask: 101.0,
+                exchange_ts_ms: 10,
+            },
+            1_000,
+        );
 
-        // units are ms: stale_after_secs(3) -> 3000ms threshold.
-        // age 3999ms (now 4000 - ts 1) exceeds it -> stale -> None.
-        assert!(cache.latest_fresh(4_000, 3).is_none());
-        // age 999ms (now 1000 - ts 1) is under it -> fresh -> Some.
-        assert!(cache.latest_fresh(1_000, 3).is_some());
+        // Freshness is judged by LOCAL-received time, not exchange time: the WS
+        // loop stamps when it receives the message locally, so the staleness
+        // window (stale_after_secs=3 -> 3000ms) measures now - local_received.
+        assert!(cache.latest_fresh(3_999, 3).is_some());
+        assert!(cache.latest_fresh(4_001, 3).is_none());
+    }
+
+    #[test]
+    fn market_cache_rejects_missing_snapshot() {
+        let cache = MarketCache::default();
+
+        assert!(cache.latest_fresh(1_000, 3).is_none());
     }
 
     #[test]
@@ -1458,20 +1803,37 @@ mod tests {
     }
 
     #[test]
-    fn require_fresh_market_rejects_missing_snapshot() {
-        // A maker order can wait up to 15s before timing out; the freshness
-        // window is 3s. Re-placing the retry/taker on the pre-timeout price
-        // would post a stale limit, so a None (stale/unavailable) snapshot must
-        // be an error the intent fails on — not a silent place-on-old-price.
-        assert!(require_fresh_market(None).is_err());
-        let fresh = MarketUpdate {
+    fn market_gate_defers_open_when_cache_stale() {
+        // Opening action with a stale/missing WS cache must DEFER (stay pending),
+        // never fail — a transient WS gap must not permanently reject an open.
+        assert_eq!(market_gate("open", None), MarketGate::DeferOpen);
+        assert_eq!(market_gate("add", None), MarketGate::DeferOpen);
+    }
+
+    #[test]
+    fn market_gate_uses_ws_for_open_when_fresh() {
+        let m = MarketUpdate {
             symbol: "ETHUSDT".to_string(),
             best_bid: 3000.0,
             best_ask: 3000.5,
             exchange_ts_ms: 1,
         };
-        let got = require_fresh_market(Some(fresh.clone())).unwrap();
-        assert_eq!(got.best_bid, fresh.best_bid);
+        // Fresh WS cache for an opening action -> use it directly.
+        assert_eq!(market_gate("open", Some(m.clone())), MarketGate::UseWs(m));
+    }
+
+    #[test]
+    fn market_gate_uses_rest_ticker_for_close_regardless_of_cache() {
+        let m = MarketUpdate {
+            symbol: "ETHUSDT".to_string(),
+            best_bid: 3000.0,
+            best_ask: 3000.5,
+            exchange_ts_ms: 1,
+        };
+        // Risk-reducing actions ignore WS staleness; they proceed via a fresh
+        // REST ticker whether the WS cache is missing or present.
+        assert_eq!(market_gate("close", None), MarketGate::UseRestTicker);
+        assert_eq!(market_gate("close", Some(m)), MarketGate::UseRestTicker);
     }
 
     #[test]

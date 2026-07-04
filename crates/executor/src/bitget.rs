@@ -10,7 +10,9 @@ use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::ExecutorConfig;
-use crate::types::{MarketUpdate, OrderRecord, PrivateWsUpdate};
+use crate::types::{
+    AccountSnapshotUpdate, MarketUpdate, OrderRecord, PositionRecord, PrivateWsUpdate,
+};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -420,11 +422,48 @@ pub fn parse_public_ws_message(text: &str) -> Result<Option<MarketUpdate>> {
     }))
 }
 
-pub fn parse_private_ws_message(text: &str) -> Result<PrivateWsUpdate> {
+pub fn parse_private_ws_message(text: &str, cfg: &ExecutorConfig) -> Result<PrivateWsUpdate> {
     if text == "pong" {
         return Ok(PrivateWsUpdate::default());
     }
     let value: Value = serde_json::from_str(text)?;
+    let mut update = PrivateWsUpdate::default();
+
+    // Connection-control events arrive WITHOUT an arg.channel: the login ack
+    // ({"event":"login","code":0,...}) confirms auth; any {"event":"error",...}
+    // or a non-zero login code is an auth/subscribe failure. The WS loop gates
+    // private-state readiness on the ack and emits websocket_auth_failed on the
+    // error, so the parser must surface both. Data messages (orders/positions/
+    // account) have no top-level "event" and fall through to the channel dispatch.
+    // ponytail: Bitget serializes `code` as a NUMBER on the login ack
+    // ({"event":"login","code":0}) but as a STRING on REST/error bodies; accept
+    // both so a numeric ack isn't mis-read as a missing/failed code.
+    if let Some(event) = value.get("event").and_then(Value::as_str) {
+        if event == "login" {
+            if ws_code(&value) == "0" {
+                update.login_ack = true;
+            } else {
+                update.auth_error = Some(format!(
+                    "login code {}: {}",
+                    ws_code(&value),
+                    value.get("msg").and_then(Value::as_str).unwrap_or("")
+                ));
+            }
+            return Ok(update);
+        }
+        if event == "error" {
+            update.auth_error = Some(format!(
+                "code {}: {}",
+                ws_code(&value),
+                value.get("msg").and_then(Value::as_str).unwrap_or("")
+            ));
+            return Ok(update);
+        }
+        // Other control events (e.g. subscribe ack) carry no private data; return
+        // the empty update so the read loop skips it.
+        return Ok(update);
+    }
+
     let channel = value
         .pointer("/arg/channel")
         .and_then(Value::as_str)
@@ -434,7 +473,6 @@ pub fn parse_private_ws_message(text: &str) -> Result<PrivateWsUpdate> {
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let mut update = PrivateWsUpdate::default();
 
     if channel == "orders" {
         for row in data {
@@ -445,7 +483,7 @@ pub fn parse_private_ws_message(text: &str) -> Result<PrivateWsUpdate> {
                 exchange_order_id: Some(order_id),
                 client_oid,
                 intent_id: None,
-                symbol: "ETH/USDT:USDT".to_string(),
+                symbol: resolve_symbol(cfg, &str_field(&row, "instId")),
                 side: str_field(&row, "side"),
                 action: str_field(&row, "tradeSide"),
                 order_type: str_field(&row, "orderType"),
@@ -469,9 +507,72 @@ pub fn parse_private_ws_message(text: &str) -> Result<PrivateWsUpdate> {
                 last_error: None,
             });
         }
+    } else if channel == "positions" {
+        for row in data {
+            let size = row.get("total").and_then(num_or_str_f64).unwrap_or(0.0);
+            if size.abs() < 1e-12 {
+                continue; // no open position
+            }
+            let entry_price = row
+                .get("openPriceAvg")
+                .and_then(num_or_str_f64)
+                .unwrap_or(0.0);
+            update.positions.push(PositionRecord {
+                symbol: resolve_symbol(cfg, &str_field(&row, "instId")),
+                side: str_field(&row, "holdSide"),
+                notional: size.abs() * entry_price,
+                entry_price,
+                unrealized_pnl: row
+                    .get("unrealizedPL")
+                    .and_then(num_or_str_f64)
+                    .unwrap_or(0.0),
+                ownership: "system".to_string(),
+                opened_at: None,
+                adopted_at: None,
+                source_intent_id: None,
+                raw_json: row.to_string(),
+            });
+        }
+    } else if channel == "account" {
+        // ponytail: a single account message can carry multiple marginCoin rows;
+        // the configured marginCoin is the one the risk gate cares about. Take the
+        // first matching row, fall back to the first row if none matches. equity is
+        // accountEquity on REST and either equity/accountEquity on WS — accept both.
+        let row = data
+            .iter()
+            .find(|r| str_field(r, "marginCoin") == cfg.margin_coin)
+            .or_else(|| data.first());
+        if let Some(row) = row {
+            let equity = row
+                .get("accountEquity")
+                .and_then(num_or_str_f64)
+                .or_else(|| row.get("equity").and_then(num_or_str_f64));
+            let available = row.get("available").and_then(num_or_str_f64);
+            if let (Some(equity), Some(available)) = (equity, available) {
+                update.account = Some(AccountSnapshotUpdate {
+                    equity,
+                    available_margin: available,
+                    unrealized_pnl: row
+                        .get("unrealizedPL")
+                        .and_then(num_or_str_f64)
+                        .unwrap_or(0.0),
+                });
+            }
+        }
     }
 
     Ok(update)
+}
+
+/// Map a private-WS message instId (e.g. "ETHUSDT") to the configured display
+/// symbol (e.g. "ETH/USDT:USDT"). A foreign instId falls through to the raw
+/// string — never silently relabel a non-configured symbol as ETH.
+fn resolve_symbol(cfg: &ExecutorConfig, inst_id: &str) -> String {
+    if inst_id == cfg.bitget_symbol {
+        cfg.symbol.clone()
+    } else {
+        inst_id.to_string()
+    }
 }
 
 fn str_field(value: &Value, key: &str) -> String {
@@ -482,6 +583,18 @@ fn str_field(value: &Value, key: &str) -> String {
         .to_string()
 }
 
+/// Read a connection-control `code` field as a string regardless of whether
+/// Bitget serialized it as a number (login ack: `"code":0`) or a string
+/// (error/REST bodies: `"code":"30001"`). Empty string when absent.
+fn ws_code(value: &Value) -> String {
+    match value.get("code") {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Number(n)) => n.to_string(),
+        Some(other) => other.to_string(),
+        None => String::new(),
+    }
+}
+
 fn parse_f64(value: Option<&Value>, name: &str) -> Result<f64> {
     value
         .and_then(Value::as_str)
@@ -490,18 +603,54 @@ fn parse_f64(value: Option<&Value>, name: &str) -> Result<f64> {
         .with_context(|| format!("parse {name}"))
 }
 
-pub async fn verify_public_ws_connects(cfg: &ExecutorConfig) -> Result<()> {
-    cfg.validate_demo_only()?;
-    let (mut socket, _) = tokio_tungstenite::connect_async(&cfg.public_ws_url).await?;
-    use futures_util::{SinkExt, StreamExt};
-    let msg = serde_json::json!({
+/// Private WS login payload: signs `GET /user/verify` with the per-connection
+/// timestamp. Pure so the one-shot verify and the long-running WS loop build the
+/// identical login (and the test pins the signature path).
+pub fn private_login_message(cfg: &ExecutorConfig, timestamp: &str) -> serde_json::Value {
+    serde_json::json!({
+        "op": "login",
+        "args": [{
+            "apiKey": cfg.secrets.api_key,
+            "passphrase": cfg.secrets.passphrase,
+            "timestamp": timestamp,
+            "sign": websocket_sign(&cfg.secrets.api_secret, timestamp)
+        }]
+    })
+}
+
+/// Private WS subscribe payload for orders/positions/account (orders+positions
+/// key on instId, account keys on coin; "default" carries every symbol for the
+/// product type). Pure so the one-shot verify and the long-running WS loop build
+/// the identical subscription. Sent after login.
+pub fn private_subscribe_message(cfg: &ExecutorConfig) -> serde_json::Value {
+    serde_json::json!({
+        "op": "subscribe",
+        "args": [
+            {"instType": cfg.product_type, "channel": "orders", "instId": "default"},
+            {"instType": cfg.product_type, "channel": "positions", "instId": "default"},
+            {"instType": cfg.product_type, "channel": "account", "coin": "default"}
+        ]
+    })
+}
+
+/// Public books5 subscribe payload for the configured symbol. Pure so the one-shot
+/// verify and the long-running WS loop build the identical subscription.
+pub fn public_books5_subscribe_message(cfg: &ExecutorConfig) -> serde_json::Value {
+    serde_json::json!({
         "op": "subscribe",
         "args": [{
             "instType": cfg.product_type,
             "channel": "books5",
             "instId": cfg.bitget_symbol
         }]
-    });
+    })
+}
+
+pub async fn verify_public_ws_connects(cfg: &ExecutorConfig) -> Result<()> {
+    cfg.validate_demo_only()?;
+    let (mut socket, _) = tokio_tungstenite::connect_async(&cfg.public_ws_url).await?;
+    use futures_util::{SinkExt, StreamExt};
+    let msg = public_books5_subscribe_message(cfg);
     socket
         .send(tokio_tungstenite::tungstenite::Message::Text(
             msg.to_string(),
@@ -522,15 +671,7 @@ pub async fn verify_private_ws_connects(cfg: &ExecutorConfig) -> Result<()> {
     let (mut socket, _) = tokio_tungstenite::connect_async(&cfg.private_ws_url).await?;
     use futures_util::{SinkExt, StreamExt};
     let timestamp = now_seconds();
-    let login = serde_json::json!({
-        "op": "login",
-        "args": [{
-            "apiKey": cfg.secrets.api_key,
-            "passphrase": cfg.secrets.passphrase,
-            "timestamp": timestamp,
-            "sign": websocket_sign(&cfg.secrets.api_secret, &timestamp)
-        }]
-    });
+    let login = private_login_message(cfg, &timestamp);
     socket
         .send(tokio_tungstenite::tungstenite::Message::Text(
             login.to_string(),
@@ -540,8 +681,17 @@ pub async fn verify_private_ws_connects(cfg: &ExecutorConfig) -> Result<()> {
         .await?
         .ok_or_else(|| anyhow::anyhow!("private websocket closed"))??;
     let text = msg.into_text()?;
-    if text.contains("\"event\":\"error\"") || !text.contains("\"login\"") {
-        bail!("private websocket login failed: {text}");
+    // ponytail: reuse the daemon's parser instead of a string-contains probe so
+    // the one-shot verify and the long-running loop judge login the same way —
+    // including Bitget's NUMERIC login code ({"event":"login","code":0}), which
+    // a "contains \"login\"" check accepts but a future stricter check could
+    // diverge on. Surfaces the real code+msg on failure instead of raw text.
+    let update = parse_private_ws_message(&text, cfg)?;
+    if let Some(detail) = update.auth_error {
+        bail!("private websocket login failed: {detail}");
+    }
+    if !update.login_ack {
+        bail!("private websocket login not acked: {text}");
     }
     Ok(())
 }
@@ -613,11 +763,146 @@ mod tests {
           }]
         }"#;
 
-        let update = parse_private_ws_message(raw).unwrap();
+        let cfg = ExecutorConfig::demo_for_tests();
+        let update = parse_private_ws_message(raw, &cfg).unwrap();
 
         assert_eq!(update.orders.len(), 1);
         assert_eq!(update.orders[0].client_oid, "client-1");
         assert_eq!(update.orders[0].status, "live");
+        // de-hardcoded symbol: instId ETHUSDT resolves to the configured display symbol.
+        assert_eq!(update.orders[0].symbol, "ETH/USDT:USDT");
+    }
+
+    #[test]
+    fn private_subscribe_message_covers_orders_positions_account() {
+        let cfg = ExecutorConfig::demo_for_tests();
+        let msg = private_subscribe_message(&cfg);
+        let text = msg.to_string();
+
+        assert!(text.contains("\"op\":\"subscribe\""));
+        assert!(text.contains("\"channel\":\"orders\""));
+        assert!(text.contains("\"channel\":\"positions\""));
+        assert!(text.contains("\"channel\":\"account\""));
+        assert!(text.contains("\"instType\":\"USDT-FUTURES\""));
+    }
+
+    #[test]
+    fn parses_private_position_message() {
+        let raw = r#"{
+          "action":"snapshot",
+          "arg":{"instType":"USDT-FUTURES","instId":"default","channel":"positions"},
+          "data":[{
+            "instId":"ETHUSDT",
+            "holdSide":"long",
+            "total":"0.05",
+            "openPriceAvg":"3000",
+            "unrealizedPL":"1.5"
+          }]
+        }"#;
+
+        let cfg = ExecutorConfig::demo_for_tests();
+        let update = parse_private_ws_message(raw, &cfg).unwrap();
+
+        assert_eq!(update.positions.len(), 1);
+        let pos = &update.positions[0];
+        assert_eq!(pos.symbol, "ETH/USDT:USDT");
+        assert_eq!(pos.side, "long");
+        assert!((pos.entry_price - 3000.0).abs() < 1e-9);
+        assert!((pos.notional - 150.0).abs() < 1e-9);
+        assert!((pos.unrealized_pnl - 1.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn parses_private_account_message() {
+        let raw = r#"{
+          "action":"snapshot",
+          "arg":{"instType":"USDT-FUTURES","instId":"default","channel":"account"},
+          "data":[{
+            "marginCoin":"USDT",
+            "available":"500",
+            "accountEquity":"1000",
+            "unrealizedPL":"-2"
+          }]
+        }"#;
+
+        let cfg = ExecutorConfig::demo_for_tests();
+        let update = parse_private_ws_message(raw, &cfg).unwrap();
+
+        let acct = update.account.expect("account snapshot parsed");
+        assert!((acct.equity - 1000.0).abs() < 1e-9);
+        assert!((acct.available_margin - 500.0).abs() < 1e-9);
+        assert!((acct.unrealized_pnl - (-2.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn parses_private_login_ack() {
+        // Bitget's real login ack serializes code as a NUMBER: {"event":"login","code":0}.
+        // The WS loop waits for this before treating private state as ready, so the
+        // parser must set login_ack for the numeric form (and the string form too).
+        let cfg = ExecutorConfig::demo_for_tests();
+        let update = parse_private_ws_message(r#"{"event":"login","code":0}"#, &cfg).unwrap();
+        assert!(update.login_ack);
+        assert!(update.auth_error.is_none());
+        // defensive: a string "0" must also ack (some clients/gateways vary)
+        let update_s = parse_private_ws_message(r#"{"event":"login","code":"0"}"#, &cfg).unwrap();
+        assert!(update_s.login_ack);
+    }
+
+    #[test]
+    fn parses_private_login_failure_code_as_auth_error() {
+        // A login response with a non-zero code (numeric, like the ack). Must
+        // surface as auth_error so the loop emits websocket_auth_failed and stays
+        // not-ready; login_ack must NOT be set.
+        let cfg = ExecutorConfig::demo_for_tests();
+        let update = parse_private_ws_message(
+            r#"{"event":"login","code":30001,"msg":"sign invalid"}"#,
+            &cfg,
+        )
+        .unwrap();
+        assert!(!update.login_ack);
+        let err = update.auth_error.expect("auth error parsed");
+        assert!(err.contains("30001"));
+        assert!(err.contains("sign invalid"));
+    }
+
+    #[test]
+    fn parses_private_error_event_as_auth_error() {
+        // A generic {"event":"error",...} (string code, as on REST/error bodies).
+        let cfg = ExecutorConfig::demo_for_tests();
+        let update = parse_private_ws_message(
+            r#"{"event":"error","code":"30005","msg":"login timeout"}"#,
+            &cfg,
+        )
+        .unwrap();
+        assert!(!update.login_ack);
+        let err = update.auth_error.expect("auth error parsed");
+        assert!(err.contains("30005"));
+        assert!(err.contains("login timeout"));
+    }
+
+    #[test]
+    fn public_books5_subscribe_payload_targets_demo_symbol() {
+        let cfg = ExecutorConfig::demo_for_tests();
+        let msg = public_books5_subscribe_message(&cfg);
+        let text = msg.to_string();
+
+        assert!(text.contains("\"op\":\"subscribe\""));
+        assert!(text.contains("\"channel\":\"books5\""));
+        assert!(text.contains("\"instId\":\"ETHUSDT\""));
+        assert!(text.contains("\"instType\":\"USDT-FUTURES\""));
+    }
+
+    #[test]
+    fn private_login_payload_uses_websocket_signature() {
+        let cfg = ExecutorConfig::demo_for_tests();
+        let msg = private_login_message(&cfg, "1538054050");
+        let text = msg.to_string();
+
+        assert!(text.contains("\"op\":\"login\""));
+        assert!(text.contains("\"apiKey\":\"key\""));
+        assert!(text.contains("\"passphrase\":\"pass\""));
+        assert!(text.contains("\"timestamp\":\"1538054050\""));
+        assert!(text.contains(&websocket_sign("secret", "1538054050")));
     }
 
     #[test]
