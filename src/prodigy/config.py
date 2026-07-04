@@ -12,6 +12,7 @@ REQUIRED_SECTIONS = (
     "fees",
     "model",
     "telegram",
+    "signal",
 )
 
 

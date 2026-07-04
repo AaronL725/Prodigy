@@ -30,3 +30,16 @@ score_exit_threshold = 0.10
 [telegram]
 enabled = false
 allowed_user_ids = []
+
+[signal]
+enabled_symbols = ["ETH/USDT:USDT"]
+exchange_symbols = { "ETH/USDT:USDT" = "ETHUSDT" }
+timeframe = "15m"
+signal_source = "example-factors"
+max_state_age_secs = 120
+poll_interval_secs = 30
+entry_threshold = 0.60
+exit_threshold = 0.20
+min_order_fraction = 0.05
+max_order_fraction = 0.10
+max_holding_bars = 96
