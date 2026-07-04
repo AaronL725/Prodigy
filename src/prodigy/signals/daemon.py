@@ -9,7 +9,13 @@ from typing import Callable
 
 import pandas as pd
 
+from prodigy.data.parquet_store import load_funding_rates, load_ohlcv
 from prodigy.db import connect, init_db
+from prodigy.factors.examples import (
+    example_funding_factor,
+    example_momentum_factor,
+    example_volatility_factor,
+)
 from prodigy.signals.intents import TradeIntent, insert_trade_intent
 from prodigy.signals.state import (
     get_executor_state,
@@ -223,3 +229,41 @@ def run_once(cfg: RunOnceConfig) -> str:
             model_version=cfg.source,
         )
         return "open_intent_written" if decision.action == "open" else "close_intent_written"
+
+
+def load_example_score(
+    data_root: str | Path,
+    research_symbol: str,
+    now: pd.Timestamp,
+    timeframe: str = "15m",
+) -> float:
+    now = pd.Timestamp(now).tz_convert("UTC") if pd.Timestamp(now).tzinfo else pd.Timestamp(now, tz="UTC")
+    start = now - pd.Timedelta(days=7)
+    end = now + pd.Timedelta(days=1)
+    ohlcv = load_ohlcv(data_root, research_symbol, start, end, timeframe)
+    funding = load_funding_rates(data_root, research_symbol, start, end)
+    closed = latest_closed_bar(ohlcv, now, timeframe)
+    closed_ts = closed["timestamp"]
+
+    momentum = example_momentum_factor(ohlcv).rename(columns={"value": "example_momentum"})
+    volatility = example_volatility_factor(ohlcv).rename(columns={"value": "example_volatility"})
+    features = momentum[["timestamp", "symbol", "example_momentum"]].merge(
+        volatility[["timestamp", "symbol", "example_volatility"]],
+        on=["timestamp", "symbol"],
+        how="left",
+    )
+    if not funding.empty:
+        funding_factor = example_funding_factor(funding).rename(columns={"value": "example_funding"})
+        features = features.merge(
+            funding_factor[["timestamp", "symbol", "example_funding"]],
+            on=["timestamp", "symbol"],
+            how="left",
+        )
+    # ponytail: normalize both sides of the equality to tz-aware UTC so a
+    # naive-vs-aware mismatch (parquet round-trip surprise) can't yield an empty
+    # selection and blow up .iloc[-1]. One guard here beats per-call fixes.
+    features_ts = pd.to_datetime(features["timestamp"], utc=True)
+    closed_ts = pd.Timestamp(closed_ts)
+    closed_ts = closed_ts.tz_convert("UTC") if closed_ts.tzinfo else closed_ts.tz_localize("UTC")
+    row = features[features_ts == closed_ts].iloc[-1]
+    return combine_example_score(row)

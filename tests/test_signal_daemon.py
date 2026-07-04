@@ -228,3 +228,55 @@ def test_run_once_skips_manual_override(tmp_path):
     with connect(db_path) as conn:
         key = signal_processed_key("dummy-cycle", "ETHUSDT", "15m", "2026-07-04T10:00:00Z")
         assert get_executor_state(conn, key) is None
+
+
+from prodigy.data.parquet_store import write_daily_partition
+from prodigy.signals.daemon import load_example_score
+
+
+def test_load_example_score_reads_parquet_and_uses_closed_bar(tmp_path):
+    ts = pd.date_range("2026-07-04T09:00:00Z", periods=8, freq="15min")
+    ohlcv = pd.DataFrame(
+        {
+            "timestamp": ts,
+            "symbol": ["ETH/USDT:USDT"] * len(ts),
+            "open": [100, 101, 102, 103, 104, 105, 106, 107],
+            "high": [101, 102, 103, 104, 105, 106, 107, 108],
+            "low": [99, 100, 101, 102, 103, 104, 105, 106],
+            "close": [100, 102, 104, 106, 108, 110, 112, 114],
+            "volume": [10] * len(ts),
+        }
+    )
+    funding = pd.DataFrame(
+        {
+            "timestamp": ts,
+            "symbol": ["ETH/USDT:USDT"] * len(ts),
+            "funding_rate": [0.0001] * len(ts),
+        }
+    )
+    write_daily_partition(
+        ohlcv,
+        data_root=tmp_path,
+        exchange="bitget",
+        symbol="ETH/USDT:USDT",
+        dataset="ohlcv",
+        date="2026-07-04",
+        timeframe="15m",
+    )
+    write_daily_partition(
+        funding,
+        data_root=tmp_path,
+        exchange="bitget",
+        symbol="ETH/USDT:USDT",
+        dataset="funding_rates",
+        date="2026-07-04",
+    )
+
+    score = load_example_score(
+        data_root=tmp_path,
+        research_symbol="ETH/USDT:USDT",
+        now=pd.Timestamp("2026-07-04T11:00:00Z"),
+        timeframe="15m",
+    )
+
+    assert -1.0 <= score <= 1.0
