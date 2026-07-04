@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import signal as os_signal
+import sys
 import time
 from typing import Callable
 
@@ -18,6 +19,25 @@ from prodigy.signals.daemon import (
     run_once,
     write_signal_event,
 )
+
+
+ALLOWED_SIGNAL_SOURCES = ("example-factors", "dummy-cycle")
+
+
+def resolve_signal_source(cli_value: str | None, config_value: str) -> str:
+    """Pick the signal source: CLI flag wins, else the config value.
+
+    M5 supports only example-factors (default demo source) and dummy-cycle
+    (explicit test source). Any other value — including a typo — must NOT
+    silently fall back to example-factors scoring while keeping the typo as the
+    source/idempotency key, so reject it loudly.
+    """
+    source = cli_value if cli_value is not None else config_value
+    if source not in ALLOWED_SIGNAL_SOURCES:
+        raise ValueError(
+            f"unsupported signal source {source!r}; expected one of {ALLOWED_SIGNAL_SOURCES}"
+        )
+    return source
 
 
 def build_signal_daemon_config(signal_cfg: dict) -> SignalDaemonConfig:
@@ -44,7 +64,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", default="configs/default.toml")
     parser.add_argument("--db", default="var/prodigy.sqlite")
     parser.add_argument("--data-root", default="data")
-    parser.add_argument("--signal-source", default="example-factors")
+    parser.add_argument("--signal-source", default=None)
     parser.add_argument("--max-loops", type=int)
     return parser
 
@@ -53,6 +73,7 @@ def run_daemon_loop(
     args,
     signal_cfg: dict,
     db_path,
+    source: str,
     refresh_data: Callable[[], None],
     score_loader: Callable[[], tuple[float, str]],
     stop_flag: Callable[[], bool],
@@ -64,6 +85,7 @@ def run_daemon_loop(
     `stop_flag` is consulted between iterations; when true (SIGINT/SIGTERM in
     production, injected in tests) the loop writes a shutdown event and exits 0.
     Best-effort event write: a SQLite failure logging it must not mask the exit.
+    `source` is the already-validated signal source (see resolve_signal_source).
     """
     research_symbol = signal_cfg["enabled_symbols"][0]
     exchange_symbol = signal_cfg["exchange_symbols"][research_symbol]
@@ -78,7 +100,7 @@ def run_daemon_loop(
                     data_root=args.data_root,
                     research_symbol=research_symbol,
                     exchange_symbol=exchange_symbol,
-                    source=args.signal_source,
+                    source=source,
                     now=now_factory(),
                     refresh_data=refresh_data,
                     score_loader=score_loader,
@@ -120,6 +142,13 @@ def main(argv: list[str] | None = None) -> int:
     signal_cfg = cfg["signal"]
     research_symbol = signal_cfg["enabled_symbols"][0]
     timeframe = signal_cfg["timeframe"]
+    # Resolve + validate the signal source: CLI flag wins, else the config
+    # value. An unknown source must not silently fall back to example-factors.
+    try:
+        source = resolve_signal_source(args.signal_source, signal_cfg["signal_source"])
+    except ValueError as exc:
+        print(f"prodigy-signal: {exc}", file=sys.stderr)
+        return 2
 
     def refresh_data() -> None:
         now = pd.Timestamp.now(tz="UTC")
@@ -137,7 +166,7 @@ def main(argv: list[str] | None = None) -> int:
 
     def score_loader() -> tuple[float, str]:
         now = pd.Timestamp.now(tz="UTC")
-        if args.signal_source == "dummy-cycle":
+        if source == "dummy-cycle":
             # dummy-cycle has no data layer; report the expected closed bar so
             # run_once's stale-data check passes deterministically.
             return 1.0, expected_closed_bar_ts(now, timeframe)
@@ -159,6 +188,7 @@ def main(argv: list[str] | None = None) -> int:
         args,
         signal_cfg=signal_cfg,
         db_path=args.db,
+        source=source,
         refresh_data=refresh_data,
         score_loader=score_loader,
         stop_flag=lambda: stopping["v"],

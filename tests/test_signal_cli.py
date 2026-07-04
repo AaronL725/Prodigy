@@ -9,7 +9,9 @@ def test_signal_parser_supports_once_and_defaults():
     assert args.daemon is False
     assert args.db == "var/prodigy.sqlite"
     assert args.data_root == "data"
-    assert args.signal_source == "example-factors"
+    # --signal-source defaults to None so the config's signal_source is honored
+    # when the flag is omitted (resolved + validated in resolve_signal_source).
+    assert args.signal_source is None
 
 
 def test_signal_parser_rejects_once_and_daemon_together():
@@ -123,6 +125,7 @@ def test_daemon_loop_exits_on_stop_flag_and_writes_shutdown_event(tmp_path):
         args,
         signal_cfg=signal_cfg,
         db_path=db_path,
+        source="dummy-cycle",
         refresh_data=refresh_data,
         score_loader=score_loader,
         stop_flag=stop_flag,
@@ -136,3 +139,25 @@ def test_daemon_loop_exits_on_stop_flag_and_writes_shutdown_event(tmp_path):
             "select severity, component, message from events where component = 'signal' and message like 'shutdown%'"
         ).fetchone()
     assert evt is not None, "daemon loop must write a shutdown event on stop"
+
+
+def test_resolve_signal_source_prefers_cli_then_config():
+    from prodigy.cli.signal import resolve_signal_source
+
+    # CLI flag wins over config.
+    assert resolve_signal_source("dummy-cycle", "example-factors") == "dummy-cycle"
+    # No CLI flag -> fall back to config value.
+    assert resolve_signal_source(None, "example-factors") == "example-factors"
+
+
+def test_resolve_signal_source_rejects_unknown_source():
+    from prodigy.cli.signal import resolve_signal_source
+
+    # A typo must NOT silently fall back to example-factors scoring while
+    # keeping the typo as the source/idempotency key — reject it loudly.
+    import pytest
+
+    with pytest.raises(ValueError):
+        resolve_signal_source("example-factor", "example-factors")
+    with pytest.raises(ValueError):
+        resolve_signal_source(None, "bogus-source")
