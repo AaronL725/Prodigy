@@ -135,3 +135,96 @@ def test_process_decision_close_uses_zero_notional(tmp_path):
         "target_notional": 0.0,
         "max_order_notional": 0.0,
     }
+
+
+from prodigy.signals.daemon import RunOnceConfig, run_once
+from prodigy.signals.state import set_executor_state
+
+
+def test_run_once_skips_when_state_is_stale(tmp_path):
+    db_path = tmp_path / "prodigy.sqlite"
+    with connect(db_path) as conn:
+        init_db(conn)
+
+    result = run_once(
+        RunOnceConfig(
+            db_path=db_path,
+            data_root=tmp_path / "data",
+            research_symbol="ETH/USDT:USDT",
+            exchange_symbol="ETHUSDT",
+            source="dummy-cycle",
+            now=pd.Timestamp("2026-07-04T10:16:00Z"),
+            refresh_data=lambda: None,
+            score_loader=lambda: 1.0,
+        )
+    )
+
+    assert result == "skipped_stale_state"
+    with connect(db_path) as conn:
+        assert conn.execute("select count(*) from trade_intents").fetchone()[0] == 0
+        key = signal_processed_key("dummy-cycle", "ETHUSDT", "15m", "2026-07-04T10:00:00Z")
+        assert get_executor_state(conn, key) is None
+
+
+def test_run_once_is_idempotent_per_closed_bar(tmp_path):
+    db_path = tmp_path / "prodigy.sqlite"
+    with connect(db_path) as conn:
+        init_db(conn)
+        conn.execute(
+            """
+            insert into equity_snapshots (
+              snapshot_id, created_at, equity, available_margin, unrealized_pnl, realized_pnl_24h
+            ) values ('s1', '2026-07-04T10:15:30Z', 1000, 1000, 0, 0)
+            """
+        )
+        conn.commit()
+
+    cfg = RunOnceConfig(
+        db_path=db_path,
+        data_root=tmp_path / "data",
+        research_symbol="ETH/USDT:USDT",
+        exchange_symbol="ETHUSDT",
+        source="dummy-cycle",
+        now=pd.Timestamp("2026-07-04T10:16:00Z"),
+        refresh_data=lambda: None,
+        score_loader=lambda: 1.0,
+    )
+
+    assert run_once(cfg) == "open_intent_written"
+    assert run_once(cfg) == "already_processed"
+
+    with connect(db_path) as conn:
+        assert conn.execute("select count(*) from trade_intents").fetchone()[0] == 1
+
+
+def test_run_once_skips_manual_override(tmp_path):
+    db_path = tmp_path / "prodigy.sqlite"
+    with connect(db_path) as conn:
+        init_db(conn)
+        conn.execute(
+            """
+            insert into equity_snapshots (
+              snapshot_id, created_at, equity, available_margin, unrealized_pnl, realized_pnl_24h
+            ) values ('s1', '2026-07-04T10:15:30Z', 1000, 1000, 0, 0)
+            """
+        )
+        set_executor_state(conn, "manual_override:ETHUSDT", "active", "2026-07-04T10:15:30Z")
+        conn.commit()
+
+    result = run_once(
+        RunOnceConfig(
+            db_path=db_path,
+            data_root=tmp_path / "data",
+            research_symbol="ETH/USDT:USDT",
+            exchange_symbol="ETHUSDT",
+            source="dummy-cycle",
+            now=pd.Timestamp("2026-07-04T10:16:00Z"),
+            refresh_data=lambda: None,
+            score_loader=lambda: 1.0,
+        )
+    )
+
+    assert result == "skipped_manual_override"
+    with connect(db_path) as conn:
+        key = signal_processed_key("dummy-cycle", "ETHUSDT", "15m", "2026-07-04T10:00:00Z")
+        assert get_executor_state(conn, key) is None

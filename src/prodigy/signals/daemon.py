@@ -4,11 +4,21 @@ import re
 import sqlite3
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Callable
 
 import pandas as pd
 
+from prodigy.db import connect, init_db
 from prodigy.signals.intents import TradeIntent, insert_trade_intent
-from prodigy.signals.state import set_executor_state
+from prodigy.signals.state import (
+    get_executor_state,
+    has_unfinished_system_order,
+    has_unresolved_intent,
+    is_manual_override_active,
+    set_executor_state,
+    signal_processed_key,
+)
 
 
 def _floor_alias(timeframe: str) -> str:
@@ -130,3 +140,86 @@ def process_decision(
     with conn:
         insert_trade_intent(conn, intent)
         set_executor_state(conn, processed_key, outcome, created_at)
+
+
+@dataclass(frozen=True)
+class RunOnceConfig:
+    db_path: str | Path
+    data_root: str | Path
+    research_symbol: str
+    exchange_symbol: str
+    source: str
+    now: pd.Timestamp
+    refresh_data: Callable[[], None]
+    score_loader: Callable[[], float]
+    signal_cfg: SignalDaemonConfig = SignalDaemonConfig(total_notional_cap=10_000)
+    max_state_age_secs: int = 120
+    timeframe: str = "15m"
+
+
+def _latest_equity_snapshot_age_secs(conn: sqlite3.Connection, now: pd.Timestamp) -> float | None:
+    row = conn.execute(
+        "select created_at from equity_snapshots order by created_at desc limit 1"
+    ).fetchone()
+    if row is None:
+        return None
+    created = pd.Timestamp(row["created_at"])
+    created = created.tz_localize("UTC") if created.tzinfo is None else created.tz_convert("UTC")
+    now = pd.Timestamp(now)
+    now = now.tz_localize("UTC") if now.tzinfo is None else now.tz_convert("UTC")
+    return (now - created).total_seconds()
+
+
+def _position_state(conn: sqlite3.Connection, symbol: str) -> PositionState | None:
+    row = conn.execute(
+        "select side, unrealized_pnl from positions where symbol = ?",
+        (symbol,),
+    ).fetchone()
+    if row is None:
+        return None
+    return PositionState(side=str(row["side"]), unrealized_pnl=float(row["unrealized_pnl"]))
+
+
+def run_once(cfg: RunOnceConfig) -> str:
+    now = pd.Timestamp(cfg.now)
+    now = now.tz_localize("UTC") if now.tzinfo is None else now.tz_convert("UTC")
+    closed_ts = (
+        now.floor(_floor_alias(cfg.timeframe)) - pd.Timedelta(cfg.timeframe)
+    ).isoformat().replace("+00:00", "Z")
+    key = signal_processed_key(cfg.source, cfg.exchange_symbol, cfg.timeframe, closed_ts)
+
+    with connect(cfg.db_path) as conn:
+        init_db(conn)
+        if get_executor_state(conn, key) is not None:
+            return "already_processed"
+        age = _latest_equity_snapshot_age_secs(conn, now)
+        if age is None or age > cfg.max_state_age_secs:
+            return "skipped_stale_state"
+        if is_manual_override_active(conn, cfg.exchange_symbol):
+            return "skipped_manual_override"
+        if has_unresolved_intent(conn, cfg.exchange_symbol):
+            return "skipped_pending_intent"
+        if has_unfinished_system_order(conn, cfg.exchange_symbol):
+            return "skipped_pending_order"
+
+    cfg.refresh_data()
+    score = cfg.score_loader()
+
+    with connect(cfg.db_path) as conn:
+        init_db(conn)
+        position = _position_state(conn, cfg.exchange_symbol)
+        decision = decide_intent(score, position, holding_bars=0, cfg=cfg.signal_cfg)
+        if decision is None:
+            set_executor_state(conn, key, "no_signal", now.isoformat())
+            conn.commit()
+            return "no_signal"
+        process_decision(
+            conn=conn,
+            decision=decision,
+            processed_key=key,
+            created_at=now.isoformat().replace("+00:00", "Z"),
+            symbol=cfg.exchange_symbol,
+            source=cfg.source,
+            model_version=cfg.source,
+        )
+        return "open_intent_written" if decision.action == "open" else "close_intent_written"
