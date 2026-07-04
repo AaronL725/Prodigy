@@ -496,6 +496,24 @@ fn position_row_closeable<'a>(row: &'a serde_json::Value, symbol: &str) -> Optio
     Some((size, hold_side))
 }
 
+/// Resolve the closeable base for a position row, but ONLY if its holdSide matches
+/// the requested side. A close-long intent must close the LONG position; if only a
+/// short exists (or vice versa), there is nothing for THIS intent to close. Returns
+/// None on symbol/side mismatch or a sub-dust size, so a close with no matching
+/// exchange position can be failed with a diagnostic rather than submit zero size.
+fn position_row_close_base_for_side(
+    row: &serde_json::Value,
+    symbol: &str,
+    side: &str,
+) -> Option<f64> {
+    let (size, hold_side) = position_row_closeable(row, symbol)?;
+    if hold_side == side {
+        Some(size)
+    } else {
+        None
+    }
+}
+
 /// Count the exchange's open pending orders for the configured symbol. Used by
 /// the test reset to wait for cancels to settle before closing positions, so a
 /// just-cancelled reduce-only order has released its size lock.
@@ -747,11 +765,16 @@ pub fn remaining_is_dust(target_base: f64, cumulative_filled_base: f64) -> bool 
     }
 }
 
-pub fn build_order_request(
+/// Order builder that takes a base size DIRECTLY (no notional/price conversion).
+/// Used for close intents: the executor resolves the live exchange position size
+/// and submits a reduce-only order for that full base, so the (zero) notionals on
+/// the intent must not participate in sizing. Mirrors `build_order_request` except
+/// `size = format_size(base_size)`.
+pub fn build_order_request_for_base(
     cfg: &ExecutorConfig,
     intent: &TradeIntent,
     market: &MarketUpdate,
-    approved_notional: f64,
+    base_size: f64,
     mode: OrderMode,
     attempt: u32,
 ) -> PlaceOrderRequest {
@@ -761,8 +784,7 @@ pub fn build_order_request(
         OrderMode::Maker => Some(format_price(market.best_ask)),
         OrderMode::Taker => None,
     };
-    let reference_price = reference_price(mode, side, market);
-    let size = format_size(approved_notional / reference_price);
+    let size = format_size(base_size);
     // ponytail: append now_ms so re-running the same intent doesn't collide on
     // Bitget's client_oid uniqueness window (code 40786); matches the demo test
     // convention. attempt still sequences retries within one placement.
@@ -798,6 +820,25 @@ pub fn build_order_request(
             None
         },
     }
+}
+
+pub fn build_order_request(
+    cfg: &ExecutorConfig,
+    intent: &TradeIntent,
+    market: &MarketUpdate,
+    approved_notional: f64,
+    mode: OrderMode,
+    attempt: u32,
+) -> PlaceOrderRequest {
+    let reference_price = reference_price(mode, order_side(&intent.action, &intent.side), market);
+    build_order_request_for_base(
+        cfg,
+        intent,
+        market,
+        approved_notional / reference_price,
+        mode,
+        attempt,
+    )
 }
 
 /// Outcome of polling one order's exchange status. Pure classification over the
@@ -1077,7 +1118,44 @@ pub async fn process_one_intent(
         order_side(&intent.action, &intent.side),
         &market,
     );
-    let target_base = if maker_ref > 0.0 {
+    // Close intents carry target_notional=max_order_notional=0.0 (the signal
+    // daemon must NOT size contracts); resolve the live exchange position size
+    // and submit a reduce-only order for that full base instead. Open intents
+    // keep the existing notional→base conversion via the maker reference price.
+    let close_target_base = if intent.action == "close" {
+        let positions = rest
+            .get(
+                "/api/v2/mix/position/all-position",
+                &[
+                    ("productType", cfg.product_type.clone()),
+                    ("marginCoin", cfg.margin_coin.clone()),
+                ],
+            )
+            .await?;
+        let rows = positions
+            .get("data")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let base = rows
+            .iter()
+            .find_map(|row| position_row_close_base_for_side(row, &cfg.bitget_symbol, &intent.side))
+            .unwrap_or(0.0);
+        if base <= DUST_BASE {
+            db::fail_intent(
+                conn,
+                &intent.intent_id,
+                "close requested but no matching exchange position exists",
+            )?;
+            return Ok(());
+        }
+        Some(base)
+    } else {
+        None
+    };
+    let target_base = if let Some(base) = close_target_base {
+        base
+    } else if maker_ref > 0.0 {
         approved / maker_ref
     } else {
         // ponytail: build_order_request would already fail loud on a bad price;
@@ -1165,19 +1243,32 @@ pub async fn process_one_intent(
                     state.on_order_filled();
                     continue;
                 }
-                // Size this attempt to the remaining base: convert remaining→notional
-                // with the maker reference price, then build_order_request divides by
-                // that same price, so the placed base == remaining exactly.
-                let remaining_notional =
-                    remaining_base(target_base, cumulative_filled_base) * maker_ref;
-                let order = build_order_request(
-                    cfg,
-                    &intent,
-                    &place_market,
-                    remaining_notional,
-                    OrderMode::Maker,
-                    attempt,
-                );
+                // Size this attempt to the remaining base. Close intents place the
+                // base directly (resolved from the exchange position); open intents
+                // convert remaining→notional via the maker reference price so the
+                // placed base == remaining exactly (build_order_request divides by
+                // that same price).
+                let order = if intent.action == "close" {
+                    build_order_request_for_base(
+                        cfg,
+                        &intent,
+                        &place_market,
+                        remaining_base(target_base, cumulative_filled_base),
+                        OrderMode::Maker,
+                        attempt,
+                    )
+                } else {
+                    let remaining_notional =
+                        remaining_base(target_base, cumulative_filled_base) * maker_ref;
+                    build_order_request(
+                        cfg,
+                        &intent,
+                        &place_market,
+                        remaining_notional,
+                        OrderMode::Maker,
+                        attempt,
+                    )
+                };
                 let response = match rest
                     .post_json("/api/v2/mix/order/place-order", &order)
                     .await
@@ -1389,21 +1480,32 @@ pub async fn process_one_intent(
                     state.on_order_filled();
                     continue;
                 }
-                // Taker sizes to the remaining base. Re-derive base from target
-                // via the maker reference price (so maker+taker sum to target_base
-                // exactly) and let build_order_request price it as a crossing
-                // market order using its own (opposite-side) reference on the
-                // freshly-refreshed market.
-                let remaining_notional =
-                    remaining_base(target_base, cumulative_filled_base) * maker_ref;
-                let order = build_order_request(
-                    cfg,
-                    &intent,
-                    &place_market,
-                    remaining_notional,
-                    OrderMode::Taker,
-                    1,
-                );
+                // Taker sizes to the remaining base. Close intents place the base
+                // directly; open intents re-derive base from target via the maker
+                // reference price (so maker+taker sum to target_base exactly) and
+                // let build_order_request price it as a crossing market order using
+                // its own (opposite-side) reference on the freshly-refreshed market.
+                let order = if intent.action == "close" {
+                    build_order_request_for_base(
+                        cfg,
+                        &intent,
+                        &place_market,
+                        remaining_base(target_base, cumulative_filled_base),
+                        OrderMode::Taker,
+                        1,
+                    )
+                } else {
+                    let remaining_notional =
+                        remaining_base(target_base, cumulative_filled_base) * maker_ref;
+                    build_order_request(
+                        cfg,
+                        &intent,
+                        &place_market,
+                        remaining_notional,
+                        OrderMode::Taker,
+                        1,
+                    )
+                };
                 let response = match rest
                     .post_json("/api/v2/mix/order/place-order", &order)
                     .await
@@ -1834,6 +1936,55 @@ mod tests {
         // REST ticker whether the WS cache is missing or present.
         assert_eq!(market_gate("close", None), MarketGate::UseRestTicker);
         assert_eq!(market_gate("close", Some(m)), MarketGate::UseRestTicker);
+    }
+
+    #[test]
+    fn close_order_request_uses_base_size_not_target_notional() {
+        // Close intents arrive with target_notional/max_order_notional = 0.0 (the
+        // signal daemon must NOT size contracts); the executor resolves the live
+        // exchange position size and submits a reduce-only order for that full
+        // base. build_order_request_for_base takes the base directly — it must
+        // ignore the (zero) notionals entirely.
+        let cfg = ExecutorConfig::demo_for_tests();
+        let intent = TradeIntent {
+            intent_id: "close-intent".to_string(),
+            symbol: "ETH/USDT:USDT".to_string(),
+            side: "long".to_string(),
+            action: "close".to_string(),
+            target_notional: 0.0,
+            max_order_notional: 0.0,
+        };
+        let market = MarketUpdate {
+            symbol: "ETHUSDT".to_string(),
+            best_bid: 2000.0,
+            best_ask: 2001.0,
+            exchange_ts_ms: 1,
+        };
+
+        let order = build_order_request_for_base(&cfg, &intent, &market, 0.03, OrderMode::Taker, 1);
+
+        assert_eq!(order.size, "0.03");
+        assert_eq!(order.side, "sell");
+        assert_eq!(order.reduce_only.as_deref(), Some("YES"));
+    }
+
+    #[test]
+    fn position_row_matches_close_side_and_full_size() {
+        let row = serde_json::json!({
+            "symbol": "ETHUSDT",
+            "holdSide": "long",
+            "total": "0.04",
+            "available": "0"
+        });
+
+        assert_eq!(
+            position_row_close_base_for_side(&row, "ETHUSDT", "long"),
+            Some(0.04)
+        );
+        assert_eq!(
+            position_row_close_base_for_side(&row, "ETHUSDT", "short"),
+            None
+        );
     }
 
     #[test]
