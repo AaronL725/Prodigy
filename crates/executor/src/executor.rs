@@ -90,6 +90,28 @@ pub async fn process_pending_intents_once(
     let intents = db::pending_intents(conn)?;
     let mut processed = 0usize;
     for intent in intents {
+        // Gate FIRST: a stale public WS defers an OPEN before any REST call. The
+        // daemon ticks every 250ms; if the WS is down, fetching a REST account
+        // snapshot for a pending open each tick would hammer REST for nothing.
+        // Close/reduce (UseRestTicker) and fresh-WS opens (UseWs) proceed below.
+        let now_ms = crate::bitget::now_ms().parse::<i64>().unwrap_or(0);
+        let cache = market_cache.latest_fresh(now_ms, cfg.stale_market_data_secs);
+        // DeferOpen is exactly (opening action + no fresh WS cache); check it without
+        // consuming `cache` so the same Option feeds the market_gate resolution below.
+        if cache.is_none() && is_opening_action(&intent.action) {
+            // Opening action + stale/missing WS: defer (leave pending). Do NOT
+            // fail — a transient WS gap must not permanently reject an open.
+            // Stays pending; the next tick retries once WS is fresh.
+            let _ = db::write_event(
+                conn,
+                "info",
+                "intent_loop",
+                &format!("deferred open {}: market data stale", intent.intent_id),
+                "{}",
+            );
+            continue;
+        }
+
         // Fetch a FRESH account snapshot per intent. A run can carry multiple
         // opening intents; if the first fills, its gross notional/equity have
         // moved by the time the second is risk-checked. Sharing one snapshot
@@ -134,85 +156,55 @@ pub async fn process_pending_intents_once(
             );
             continue;
         }
-        let now_ms = crate::bitget::now_ms().parse::<i64>().unwrap_or(0);
-        let cache = market_cache.latest_fresh(now_ms, cfg.stale_market_data_secs);
-        match market_gate(&intent.action, cache) {
-            MarketGate::DeferOpen => {
-                // Opening action + stale/missing WS: defer (leave pending). Do
-                // NOT fail — a transient WS gap must not permanently reject an
-                // open. Stays pending; the next tick retries once WS is fresh.
-                let _ = db::write_event(
-                    conn,
-                    "info",
-                    "intent_loop",
-                    &format!("deferred open {}: market data stale", intent.intent_id),
-                    "{}",
-                );
-                continue;
-            }
-            MarketGate::UseRestTicker => {
-                // Risk-reducing action: proceed via a FRESH REST ticker regardless
-                // of WS staleness (spec: close/cancel/de-risk stay allowed when safe).
-                let market = match fetch_market_snapshot(cfg, rest).await {
-                    Ok(m) => {
-                        market_cache.update(m.clone());
-                        m
-                    }
-                    Err(err) => {
-                        let _ = db::write_event(
-                            conn,
-                            "warning",
-                            "intent_loop",
-                            &format!("market refresh failed for {}: {err}", intent.intent_id),
-                            "{}",
-                        );
-                        continue;
-                    }
-                };
-                // ponytail: process_one_intent fails intents DURABLY via
-                // db::fail_intent and returns Ok(()) for those, so this Err
-                // branch is genuine infrastructure error only — don't double-log.
-                if let Err(err) = process_one_intent(
-                    conn,
-                    cfg,
-                    rest,
-                    intent.clone(),
-                    market,
-                    account,
-                    market_cache,
-                )
-                .await
-                {
+
+        // Resolve the market snapshot: a fresh-WS open reuses the cached level;
+        // a close/reduce (UseRestTicker) fetches a FRESH REST ticker regardless
+        // of WS staleness (spec: close/cancel/de-risk stay allowed when safe) and
+        // refreshes the cache so later opens in the same batch see it.
+        let market = match market_gate(&intent.action, cache) {
+            MarketGate::UseWs(m) => m,
+            MarketGate::UseRestTicker => match fetch_market_snapshot(cfg, rest).await {
+                Ok(m) => {
+                    market_cache.update(m.clone());
+                    m
+                }
+                Err(err) => {
                     let _ = db::write_event(
                         conn,
-                        "error",
+                        "warning",
                         "intent_loop",
-                        &format!("intent {} failed: {err}", intent.intent_id),
+                        &format!("market refresh failed for {}: {err}", intent.intent_id),
                         "{}",
                     );
+                    continue;
                 }
-            }
-            MarketGate::UseWs(market) => {
-                if let Err(err) = process_one_intent(
-                    conn,
-                    cfg,
-                    rest,
-                    intent.clone(),
-                    market,
-                    account,
-                    market_cache,
-                )
-                .await
-                {
-                    let _ = db::write_event(
-                        conn,
-                        "error",
-                        "intent_loop",
-                        &format!("intent {} failed: {err}", intent.intent_id),
-                        "{}",
-                    );
-                }
-            }
+            },
+            // DeferOpen was already short-circuited above; this arm satisfies
+            // exhaustiveness and is never reached here.
+            MarketGate::DeferOpen => continue,
+        };
+
+        // ponytail: process_one_intent fails intents DURABLY via db::fail_intent
+        // and returns Ok(()) for those, so this Err branch is genuine
+        // infrastructure error only — don't double-log.
+        if let Err(err) = process_one_intent(
+            conn,
+            cfg,
+            rest,
+            intent.clone(),
+            market,
+            account,
+            market_cache,
+        )
+        .await
+        {
+            let _ = db::write_event(
+                conn,
+                "error",
+                "intent_loop",
+                &format!("intent {} failed: {err}", intent.intent_id),
+                "{}",
+            );
         }
         // Only count intents that actually reached process_one_intent (UseWs /
         // UseRestTicker arms). A deferred open stays pending and is NOT counted,
