@@ -29,3 +29,34 @@ def test_write_trade_intent_persists_pending_row(tmp_path):
         "status": "pending",
         "symbol": "ETH/USDT:USDT",
     }
+
+
+from prodigy.signals.intents import insert_trade_intent
+
+
+def test_insert_trade_intent_does_not_commit(tmp_path):
+    db_path = tmp_path / "prodigy.sqlite"
+    intent = TradeIntent(
+        intent_id="intent-no-commit",
+        created_at="2026-07-04T00:00:00Z",
+        symbol="ETHUSDT",
+        side="long",
+        action="open",
+        target_notional=100.0,
+        max_order_notional=100.0,
+        source="test",
+        reason="transaction test",
+        model_version="m5-test",
+    )
+
+    with connect(db_path) as conn:
+        init_db(conn)
+        conn.execute("begin")
+        insert_trade_intent(conn, intent)
+        conn.rollback()
+        row = conn.execute(
+            "select intent_id from trade_intents where intent_id = ?",
+            (intent.intent_id,),
+        ).fetchone()
+
+    assert row is None

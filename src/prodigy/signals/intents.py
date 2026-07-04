@@ -18,7 +18,7 @@ class TradeIntent:
     model_version: str
 
 
-def write_trade_intent(conn: sqlite3.Connection, intent: TradeIntent) -> None:
+def insert_trade_intent(conn: sqlite3.Connection, intent: TradeIntent) -> None:
     conn.execute(
         """
         insert into trade_intents (
@@ -39,4 +39,8 @@ def write_trade_intent(conn: sqlite3.Connection, intent: TradeIntent) -> None:
             intent.model_version,
         ),
     )
+
+
+def write_trade_intent(conn: sqlite3.Connection, intent: TradeIntent) -> None:
+    insert_trade_intent(conn, intent)
     conn.commit()
