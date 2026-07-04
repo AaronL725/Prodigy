@@ -94,6 +94,12 @@ def run_daemon_loop(
     count = 0
     try:
         while loops is None or count < loops:
+            # Check stop BEFORE starting a new iteration: a SIGINT/SIGTERM that
+            # fires during the previous sleep must not let the loop start another
+            # run_once (spec: stop accepting new intents / opening new orders).
+            # Skipped for --once, which is a one-shot run with no stop source.
+            if not args.once and stop_flag():
+                break
             result = run_once(
                 RunOnceConfig(
                     db_path=db_path,
@@ -115,6 +121,11 @@ def run_daemon_loop(
             if stop_flag():
                 break
             sleep(int(signal_cfg["poll_interval_secs"]))
+            # Re-check immediately after sleep so a signal that fired during the
+            # sleep exits here rather than top-of-loop on the next pass (same
+            # guarantee, defensive belt-and-suspenders).
+            if stop_flag():
+                break
     finally:
         # --once is a one-shot run, not a shutdown; only log shutdown for the
         # long-running daemon path. Best-effort: a SQLite failure here must not

@@ -141,6 +141,76 @@ def test_daemon_loop_exits_on_stop_flag_and_writes_shutdown_event(tmp_path):
     assert evt is not None, "daemon loop must write a shutdown event on stop"
 
 
+def test_daemon_loop_stops_without_extra_run_once_after_sleep(tmp_path):
+    # Spec: after SIGINT/SIGTERM the daemon stops accepting new intents / opening
+    # new orders — it must NOT start another run_once. The stop flag can fire
+    # during sleep; the loop must check it at the top of the next iteration (and
+    # right after sleep) instead of barreling into another run_once.
+    from prodigy.cli.signal import build_parser, run_daemon_loop
+    from prodigy.db import connect, init_db
+
+    db_path = tmp_path / "prodigy.sqlite"
+    with connect(db_path) as conn:
+        init_db(conn)
+        conn.execute(
+            """
+            insert into equity_snapshots (
+              snapshot_id, created_at, equity, available_margin, unrealized_pnl, realized_pnl_24h
+            ) values ('s1', '2026-07-04T10:15:30Z', 1000, 1000, 0, 0)
+            """
+        )
+        conn.commit()
+
+    args = build_parser().parse_args(["--daemon", "--db", str(db_path)])
+    signal_cfg = load_config("configs/default.toml")["signal"]
+
+    score_calls = {"n": 0}
+    now_calls = {"n": 0}  # counts run_once invocations (now_factory is called first thing)
+    stop = {"v": False}
+
+    def refresh_data() -> None:
+        pass
+
+    def score_loader():
+        import pandas as pd
+
+        from prodigy.signals.daemon import expected_closed_bar_ts
+
+        score_calls["n"] += 1
+        return 1.0, expected_closed_bar_ts(
+            pd.Timestamp("2026-07-04T10:16:00Z"), "15m"
+        )
+
+    def now_factory():
+        import pandas as pd
+
+        now_calls["n"] += 1
+        return pd.Timestamp("2026-07-04T10:16:00Z")
+
+    def sleeping(_secs):
+        # Signal fires while the loop is sleeping after iteration 1.
+        stop["v"] = True
+
+    rc = run_daemon_loop(
+        args,
+        signal_cfg=signal_cfg,
+        db_path=db_path,
+        source="dummy-cycle",
+        refresh_data=refresh_data,
+        score_loader=score_loader,
+        stop_flag=lambda: stop["v"],
+        now_factory=now_factory,
+        sleep=sleeping,
+    )
+
+    assert rc == 0
+    # now_factory is invoked once per run_once; a stop flag during sleep must
+    # not let the loop start a second run_once.
+    assert now_calls["n"] == 1, (
+        f"stop flag during sleep must not trigger a second run_once (got {now_calls['n']})"
+    )
+
+
 def test_resolve_signal_source_prefers_cli_then_config():
     from prodigy.cli.signal import resolve_signal_source
 
