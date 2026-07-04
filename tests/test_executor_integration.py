@@ -255,7 +255,7 @@ def test_signal_run_once_writes_intent_for_executor(tmp_path):
             source="dummy-cycle",
             now=pd.Timestamp("2026-07-04T10:16:00Z"),
             refresh_data=lambda: None,
-            score_loader=lambda: 1.0,
+            score_loader=lambda: (1.0, "2026-07-04T10:00:00Z"),
         )
     )
 

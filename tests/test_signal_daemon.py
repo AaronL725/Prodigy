@@ -155,7 +155,7 @@ def test_run_once_skips_when_state_is_stale(tmp_path):
             source="dummy-cycle",
             now=pd.Timestamp("2026-07-04T10:16:00Z"),
             refresh_data=lambda: None,
-            score_loader=lambda: 1.0,
+            score_loader=lambda: (1.0, "2026-07-04T10:00:00Z"),
         )
     )
 
@@ -187,7 +187,7 @@ def test_run_once_is_idempotent_per_closed_bar(tmp_path):
         source="dummy-cycle",
         now=pd.Timestamp("2026-07-04T10:16:00Z"),
         refresh_data=lambda: None,
-        score_loader=lambda: 1.0,
+        score_loader=lambda: (1.0, "2026-07-04T10:00:00Z"),
     )
 
     assert run_once(cfg) == "open_intent_written"
@@ -220,7 +220,7 @@ def test_run_once_skips_manual_override(tmp_path):
             source="dummy-cycle",
             now=pd.Timestamp("2026-07-04T10:16:00Z"),
             refresh_data=lambda: None,
-            score_loader=lambda: 1.0,
+            score_loader=lambda: (1.0, "2026-07-04T10:00:00Z"),
         )
     )
 
@@ -272,7 +272,7 @@ def test_load_example_score_reads_parquet_and_uses_closed_bar(tmp_path):
         date="2026-07-04",
     )
 
-    score = load_example_score(
+    score, closed_ts = load_example_score(
         data_root=tmp_path,
         research_symbol="ETH/USDT:USDT",
         now=pd.Timestamp("2026-07-04T11:00:00Z"),
@@ -280,6 +280,9 @@ def test_load_example_score_reads_parquet_and_uses_closed_bar(tmp_path):
     )
 
     assert -1.0 <= score <= 1.0
+    # The latest data bar is 10:45 (8 bars from 09:00, 15m each); at now=11:00
+    # the expected closed bar is also 10:45, so the loader reports that bar.
+    assert closed_ts == "2026-07-04T10:45:00Z"
 
 
 def test_run_once_closes_position_via_holding_expiry_from_opened_at(tmp_path):
@@ -312,7 +315,7 @@ def test_run_once_closes_position_via_holding_expiry_from_opened_at(tmp_path):
             source="dummy-cycle",
             now=pd.Timestamp("2026-07-04T10:16:00Z"),
             refresh_data=lambda: None,
-            score_loader=lambda: 0.1,
+            score_loader=lambda: (0.1, "2026-07-04T10:00:00Z"),
         )
     )
 
@@ -358,7 +361,7 @@ def test_run_once_does_not_guess_holding_bars_when_opened_at_missing(tmp_path):
             source="dummy-cycle",
             now=pd.Timestamp("2026-07-04T10:16:00Z"),
             refresh_data=lambda: None,
-            score_loader=lambda: 0.1,
+            score_loader=lambda: (0.1, "2026-07-04T10:00:00Z"),
         )
     )
 
@@ -399,7 +402,7 @@ def test_run_once_skips_on_data_refresh_error_and_writes_event(tmp_path):
             source="dummy-cycle",
             now=pd.Timestamp("2026-07-04T10:16:00Z"),
             refresh_data=boom,
-            score_loader=lambda: 1.0,
+            score_loader=lambda: (1.0, "2026-07-04T10:00:00Z"),
         )
     )
 
@@ -448,3 +451,58 @@ def test_run_once_skips_on_factor_compute_error_and_writes_event(tmp_path):
     assert evt is not None
     assert evt["severity"] == "warning"
     assert "factor boom" in evt["message"]
+
+
+def test_run_once_skips_when_data_bar_is_stale(tmp_path):
+    # The processed key is derived from `now` (expected closed bar 10:00), but
+    # the data layer may only have an older closed bar (09:45). The daemon must
+    # NOT write a 10:00 marker/intent from 09:45 data — it skips as stale data.
+    # score_loader returns (score, actual_closed_bar_ts).
+    db_path = tmp_path / "prodigy.sqlite"
+    _seed_fresh_equity(db_path)
+
+    result = run_once(
+        RunOnceConfig(
+            db_path=db_path,
+            data_root=tmp_path / "data",
+            research_symbol="ETH/USDT:USDT",
+            exchange_symbol="ETHUSDT",
+            source="dummy-cycle",
+            now=pd.Timestamp("2026-07-04T10:16:00Z"),
+            refresh_data=lambda: None,
+            score_loader=lambda: (1.0, "2026-07-04T09:45:00Z"),
+        )
+    )
+
+    assert result == "skipped_stale_data"
+    with connect(db_path) as conn:
+        assert conn.execute("select count(*) from trade_intents").fetchone()[0] == 0
+        key = signal_processed_key("dummy-cycle", "ETHUSDT", "15m", "2026-07-04T10:00:00Z")
+        assert get_executor_state(conn, key) is None
+        evt = conn.execute(
+            "select severity, component, message from events where component = 'signal'"
+        ).fetchone()
+    assert evt is not None
+    assert "09:45" in evt["message"]
+
+
+def test_run_once_writes_intent_when_data_bar_matches_expected(tmp_path):
+    # When score_loader reports the actual closed bar equals the expected one
+    # (10:00 at now=10:16), the daemon proceeds normally.
+    db_path = tmp_path / "prodigy.sqlite"
+    _seed_fresh_equity(db_path)
+
+    result = run_once(
+        RunOnceConfig(
+            db_path=db_path,
+            data_root=tmp_path / "data",
+            research_symbol="ETH/USDT:USDT",
+            exchange_symbol="ETHUSDT",
+            source="dummy-cycle",
+            now=pd.Timestamp("2026-07-04T10:16:00Z"),
+            refresh_data=lambda: None,
+            score_loader=lambda: (1.0, "2026-07-04T10:00:00Z"),
+        )
+    )
+
+    assert result == "open_intent_written"

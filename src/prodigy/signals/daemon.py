@@ -32,6 +32,19 @@ def _floor_alias(timeframe: str) -> str:
     return re.sub(r"(\d+)m$", r"\1min", timeframe)
 
 
+def expected_closed_bar_ts(now: pd.Timestamp, timeframe: str) -> str:
+    """The fully-closed bar timestamp for `now`, as an ISO-8601 'Z' string.
+
+    Used both by run_once (to key idempotency) and by callers without a data
+    layer (dummy-cycle) so they report the same expected bar the daemon will
+    compare against.
+    """
+    now = pd.Timestamp(now)
+    now = now.tz_localize("UTC") if now.tzinfo is None else now.tz_convert("UTC")
+    closed = now.floor(_floor_alias(timeframe)) - pd.Timedelta(timeframe)
+    return closed.isoformat().replace("+00:00", "Z")
+
+
 @dataclass(frozen=True)
 class SignalDaemonConfig:
     total_notional_cap: float
@@ -158,7 +171,10 @@ class RunOnceConfig:
     source: str
     now: pd.Timestamp
     refresh_data: Callable[[], None]
-    score_loader: Callable[[], float]
+    # score_loader returns (score, actual_closed_bar_ts). The closed-bar ts is
+    # the bar the score was actually computed on; run_once compares it to the
+    # expected closed bar to reject stale data.
+    score_loader: Callable[[], tuple[float, str]]
     signal_cfg: SignalDaemonConfig = SignalDaemonConfig(total_notional_cap=10_000)
     max_state_age_secs: int = 120
     timeframe: str = "15m"
@@ -184,6 +200,20 @@ def _write_signal_event(conn: sqlite3.Connection, severity: str, message: str) -
             message,
         ),
     )
+
+
+def _normalize_closed_ts(value: str, timeframe: str) -> str:
+    # Compare apples to apples: run_once builds closed_ts as an ISO "Z" string
+    # floored to the timeframe boundary. The score loader reports whatever ts
+    # the parquet bar carries (tz-aware). Normalize both to the same floored
+    # "Z" form so a comparison isn't defeated by "+00:00" vs "Z" or sub-bar
+    # noise. Falls back to the raw string if parsing fails (the comparison then
+    # fails and the bar is skipped, the safe outcome).
+    parsed = _parse_utc(value)
+    if parsed is None:
+        return str(value)
+    floored = parsed.floor(_floor_alias(timeframe))
+    return floored.isoformat().replace("+00:00", "Z")
 
 
 def _latest_equity_snapshot_age_secs(conn: sqlite3.Connection, now: pd.Timestamp) -> float | None:
@@ -238,9 +268,7 @@ def _holding_bars(opened_at: str | None, closed_ts: str, timeframe: str) -> int:
 def run_once(cfg: RunOnceConfig) -> str:
     now = pd.Timestamp(cfg.now)
     now = now.tz_localize("UTC") if now.tzinfo is None else now.tz_convert("UTC")
-    closed_ts = (
-        now.floor(_floor_alias(cfg.timeframe)) - pd.Timedelta(cfg.timeframe)
-    ).isoformat().replace("+00:00", "Z")
+    closed_ts = expected_closed_bar_ts(now, cfg.timeframe)
     key = signal_processed_key(cfg.source, cfg.exchange_symbol, cfg.timeframe, closed_ts)
 
     with connect(cfg.db_path) as conn:
@@ -273,13 +301,31 @@ def run_once(cfg: RunOnceConfig) -> str:
         return "error_data_refresh"
 
     try:
-        score = cfg.score_loader()
+        score, actual_closed_ts = cfg.score_loader()
     except Exception as exc:  # noqa: BLE001 — daemon isolates any factor/score failure
         with connect(cfg.db_path) as conn:
             init_db(conn)
             _write_signal_event(conn, "warning", f"factor compute error: {exc}")
             conn.commit()
         return "error_factor_compute"
+
+    # The processed key is derived from `now` (the expected closed bar), but the
+    # data layer may lag — e.g. now=10:16 expects the 10:00 bar, but the freshest
+    # closed bar in parquet could be 09:45 if refresh fell short. Writing a 10:00
+    # marker/intent from 09:45 data would be a stale-data bug, so when the actual
+    # closed bar reported by the score loader does not match the expected one,
+    # skip without marking the bar and let the next run re-evaluate once data
+    # catches up.
+    if _normalize_closed_ts(actual_closed_ts, cfg.timeframe) != closed_ts:
+        with connect(cfg.db_path) as conn:
+            init_db(conn)
+            _write_signal_event(
+                conn,
+                "warning",
+                f"stale data: expected closed bar {closed_ts}, latest available {actual_closed_ts}",
+            )
+            conn.commit()
+        return "skipped_stale_data"
 
     with connect(cfg.db_path) as conn:
         init_db(conn)
@@ -311,7 +357,13 @@ def load_example_score(
     research_symbol: str,
     now: pd.Timestamp,
     timeframe: str = "15m",
-) -> float:
+) -> tuple[float, str]:
+    """Return (score, actual_closed_bar_ts).
+
+    The closed-bar ts lets run_once verify the data layer's latest bar matches
+    the expected closed bar for `now`, so a stale parquet can't drive an intent
+    for a fresher bar.
+    """
     now = pd.Timestamp(now).tz_convert("UTC") if pd.Timestamp(now).tzinfo else pd.Timestamp(now, tz="UTC")
     start = now - pd.Timedelta(days=7)
     end = now + pd.Timedelta(days=1)
@@ -341,4 +393,5 @@ def load_example_score(
     closed_ts = pd.Timestamp(closed_ts)
     closed_ts = closed_ts.tz_convert("UTC") if closed_ts.tzinfo else closed_ts.tz_localize("UTC")
     row = features[features_ts == closed_ts].iloc[-1]
-    return combine_example_score(row)
+    closed_ts_str = closed_ts.isoformat().replace("+00:00", "Z")
+    return combine_example_score(row), closed_ts_str

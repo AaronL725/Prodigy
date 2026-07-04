@@ -7,7 +7,13 @@ import pandas as pd
 
 from prodigy.config import load_config
 from prodigy.data.backfill import run_backfill
-from prodigy.signals.daemon import RunOnceConfig, SignalDaemonConfig, load_example_score, run_once
+from prodigy.signals.daemon import (
+    RunOnceConfig,
+    SignalDaemonConfig,
+    expected_closed_bar_ts,
+    load_example_score,
+    run_once,
+)
 
 
 def build_signal_daemon_config(signal_cfg: dict) -> SignalDaemonConfig:
@@ -64,10 +70,13 @@ def main(argv: list[str] | None = None) -> int:
             db_path=args.db,
         )
 
-    def score_loader() -> float:
+    def score_loader() -> tuple[float, str]:
+        now = pd.Timestamp.now(tz="UTC")
         if args.signal_source == "dummy-cycle":
-            return 1.0
-        return load_example_score(args.data_root, research_symbol, pd.Timestamp.now(tz="UTC"), timeframe)
+            # dummy-cycle has no data layer; report the expected closed bar so
+            # run_once's stale-data check passes deterministically.
+            return 1.0, expected_closed_bar_ts(now, timeframe)
+        return load_example_score(args.data_root, research_symbol, now, timeframe)
 
     loops = args.max_loops if args.max_loops is not None else (1 if args.once else None)
     count = 0
