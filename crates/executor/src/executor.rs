@@ -86,6 +86,7 @@ pub async fn process_pending_intents_once(
     cfg: &ExecutorConfig,
     rest: &BitgetRestClient,
     market_cache: &mut MarketCache,
+    private_state_ready: bool,
 ) -> Result<usize> {
     let intents = db::pending_intents(conn)?;
     let mut processed = 0usize;
@@ -120,7 +121,7 @@ pub async fn process_pending_intents_once(
         // ponytail: per-intent error isolation — a transient account-snapshot
         // failure must not strand the rest of the batch (head-of-line blocking).
         // Log + continue; the next tick retries.
-        let account = match fetch_account_snapshot(rest).await {
+        let account = match fetch_account_snapshot(rest, private_state_ready).await {
             Ok(a) => a,
             Err(err) => {
                 let _ = db::write_event(
@@ -262,14 +263,26 @@ pub async fn run_once_or_loop(cfg: ExecutorConfig) -> Result<()> {
     // older than cfg.stale_market_data_secs.
     let mut market_cache = MarketCache::default();
     market_cache.update(fetch_market_snapshot(&cfg, &rest).await?);
-    process_pending_intents_once(&conn, &cfg, &rest, &mut market_cache).await?;
+    // ponytail: pass true — the one-shot already verified the private WS connects
+    // via verify_private_ws_connects above, so private state IS ready at one-shot
+    // time. The daemon instead threads its live PrivateStateReady signal here.
+    process_pending_intents_once(&conn, &cfg, &rest, &mut market_cache, true).await?;
     Ok(())
 }
 
 /// Fetch real account equity/margin/unrealized PnL + sum positions into gross
 /// notional. Parses the Bitget v2 mix account + all-position response into the
 /// AccountRiskSnapshot the risk gate consumes — no hardcoded fiction.
-async fn fetch_account_snapshot(rest: &BitgetRestClient) -> Result<AccountRiskSnapshot> {
+/// `private_state_ready` is the daemon's live PrivateStateReady signal value at
+/// the call site: the per-intent ENTRY snapshot (process_pending_intents_once)
+/// passes the live value so an open is gated on it; the mid-execution re-checks
+/// inside process_one_intent (maker-retry, taker) pass `true` — those run AFTER
+/// the open was already gated at entry, and aborting a half-placed open on a WS
+/// flap would be worse than completing it (spec: refuse new OPENING exposure).
+async fn fetch_account_snapshot(
+    rest: &BitgetRestClient,
+    private_state_ready: bool,
+) -> Result<AccountRiskSnapshot> {
     let acct = rest.get_account_snapshot().await?;
     let data = acct
         .get("data")
@@ -337,7 +350,7 @@ async fn fetch_account_snapshot(rest: &BitgetRestClient) -> Result<AccountRiskSn
         // maker-retry/taker arms fail the intent before reaching this risk check
         // when the ticker refresh itself fails, so this never hides a stale price.
         market_is_fresh: true,
-        private_state_is_ready: true,
+        private_state_is_ready: private_state_ready,
     })
 }
 
@@ -1044,7 +1057,11 @@ pub async fn process_one_intent(
                 if attempt > 1 {
                     // Fetch a FRESH account snapshot so the re-check uses current
                     // equity/margin, not the stale snapshot from run start.
-                    let fresh_account = fetch_account_snapshot(rest).await?;
+                    // ponytail: pass true — this re-check runs MID-EXECUTION of an
+                    // already-gated open (entry snapshot gated it); aborting here on
+                    // a WS flap would strand a half-placed open. Spec scopes the
+                    // private-state gate to NEW opening exposure.
+                    let fresh_account = fetch_account_snapshot(rest, true).await?;
                     if let Err(reason) = check_intent(
                         &intent,
                         &fresh_account,
@@ -1268,7 +1285,9 @@ pub async fn process_one_intent(
                     }
                 };
                 // Re-check risk with a FRESH account snapshot before taker fallback.
-                let fresh_account = fetch_account_snapshot(rest).await?;
+                // ponytail: pass true — mid-execution of an already-gated open; see
+                // the maker-retry re-check above for the same rationale.
+                let fresh_account = fetch_account_snapshot(rest, true).await?;
                 if let Err(reason) = check_intent(
                     &intent,
                     &fresh_account,

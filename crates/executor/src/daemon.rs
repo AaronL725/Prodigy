@@ -35,6 +35,38 @@ impl ReconcileSignal {
     }
 }
 
+/// Cross-task "private account state is ready" flag. The private WS loop sets it
+/// true after a successful (re)connect (login + subscribe sent without error) and
+/// false on disconnect; the daemon's intent loop reads it when risk-checking a new
+/// OPEN (spec: refuse new opening exposure when private state is not ready). Close /
+/// reduce / cancel bypass it (they're risk-reducing and use REST). Arc-shared so the
+/// WS task and the main loop can reach it without channel plumbing. Pure accessors so
+/// the set/get semantics are unit-testable without a network round-trip.
+///
+/// ponytail: "ready" means the private WS is connected, authenticated, and subscribed
+/// (login + subscribe sends succeeded) — NOT "we have received the first data push". An
+/// idle demo account may never push an orders/positions message, so gating on first
+/// data would deadlock all opens on an idle account. Connection-level readiness is the
+/// correct, non-deadlocking signal.
+#[derive(Debug, Clone, Default)]
+pub struct PrivateStateReady {
+    ready: Arc<AtomicBool>,
+}
+
+impl PrivateStateReady {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    /// Private WS loop: set true after a successful (re)connect, false on disconnect.
+    pub fn set(&self, value: bool) {
+        self.ready.store(value, Ordering::SeqCst);
+    }
+    /// Intent loop: is private state ready (private WS connected + subscribed)?
+    pub fn is_ready(&self) -> bool {
+        self.ready.load(Ordering::SeqCst)
+    }
+}
+
 pub async fn run_daemon(cfg: ExecutorConfig, options: DaemonOptions) -> Result<()> {
     cfg.validate_demo_only()?;
     let conn = rusqlite::Connection::open(&cfg.db_path)?;
@@ -86,6 +118,12 @@ pub async fn run_daemon(cfg: ExecutorConfig, options: DaemonOptions) -> Result<(
     // each tick to run a REST reconcile immediately (spec: reconcile after WS
     // reconnect) instead of waiting for the periodic interval.
     let reconcile_signal = ReconcileSignal::new();
+    // Cross-task signal: the private WS loop sets this true after a successful
+    // (re)connect (login + subscribe sent) and false on disconnect; the intent
+    // loop reads it to gate NEW opening exposure (spec: refuse new opening
+    // exposure when private state is not ready). Only the PRIVATE WS owns it —
+    // public WS and telegram do not.
+    let private_ready = PrivateStateReady::new();
 
     let mut public_task = tokio::spawn(run_public_ws_loop(
         cfg.clone(),
@@ -97,6 +135,7 @@ pub async fn run_daemon(cfg: ExecutorConfig, options: DaemonOptions) -> Result<(
         cfg.clone(),
         shutdown_rx.clone(),
         reconcile_signal.clone(),
+        private_ready.clone(),
     ));
     let mut telegram_task = tokio::spawn(run_telegram_query_loop(cfg.clone(), shutdown_rx.clone()));
 
@@ -188,6 +227,7 @@ pub async fn run_daemon(cfg: ExecutorConfig, options: DaemonOptions) -> Result<(
                     &cfg,
                     &rest,
                     &mut local_cache,
+                    private_ready.is_ready(),
                 )
                 .await
                 {
@@ -524,6 +564,7 @@ pub async fn run_private_ws_loop(
     cfg: ExecutorConfig,
     shutdown: tokio::sync::watch::Receiver<bool>,
     reconcile_signal: ReconcileSignal,
+    private_ready: PrivateStateReady,
 ) -> Result<()> {
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;
@@ -534,6 +575,12 @@ pub async fn run_private_ws_loop(
         if *shutdown.borrow() {
             return Ok(());
         }
+        // ponytail: flip not-ready at the top of every outer iteration — a
+        // disconnect that broke the inner read-loop lands here on its next
+        // iteration, so readiness reflects the disconnect BEFORE we attempt to
+        // reconnect. set(true) below only fires after the subscribe send
+        // succeeds, so a connect/login/subscribe failure stays not-ready.
+        private_ready.set(false);
         match tokio_tungstenite::connect_async(&cfg.private_ws_url).await {
             Ok((mut socket, _)) => {
                 let timestamp = crate::bitget::now_seconds();
@@ -566,7 +613,13 @@ pub async fn run_private_ws_loop(
                 }
                 // (Re)connect succeeded and we're subscribed: request a REST
                 // reconcile on the next main-loop tick (spec: reconcile after
-                // WS reconnect) so any orders/fills/positions gap is repaired.
+                // WS reconnect) so any orders/fills/positions gap is repaired,
+                // and mark private state READY so new opens are no longer gated
+                // out (spec: refuse new opening exposure when private state is
+                // not ready — connection-level readiness: login + subscribe
+                // sends both succeeded; an idle demo account may never push
+                // data, so we do NOT wait for a first data message).
+                private_ready.set(true);
                 reconcile_signal.request();
                 loop {
                     tokio::select! {
@@ -611,9 +664,17 @@ pub async fn run_private_ws_loop(
                         }
                     }
                 }
+                // The socket died (close/err broke the read loop) — flip readiness
+                // OFF immediately so a 250ms intent-loop tick in the ~1s reconnect
+                // window can't slip a new OPEN through the gate on stale readiness.
+                // (set(false) at the top of the next outer iteration would be ~1s late.)
+                private_ready.set(false);
                 eprintln!("private ws socket closed; reconnecting");
             }
             Err(err) => {
+                // Connect itself failed: readiness is already false (set at the top
+                // of this outer iteration), but set again for clarity/symmetry.
+                private_ready.set(false);
                 eprintln!("private ws disconnected: {err}");
             }
         }
@@ -673,6 +734,27 @@ mod tests {
         assert!(
             sig.take(),
             "main loop sees the request through its own handle"
+        );
+    }
+
+    #[test]
+    fn private_state_ready_default_false_then_set() {
+        let r = PrivateStateReady::new();
+        assert!(!r.is_ready(), "fresh signal should be not-ready");
+        r.set(true);
+        assert!(r.is_ready());
+        r.set(false);
+        assert!(!r.is_ready());
+    }
+
+    #[test]
+    fn private_state_ready_shared_between_clones() {
+        let r = PrivateStateReady::new();
+        let clone = r.clone();
+        clone.set(true); // private WS task sets via its clone
+        assert!(
+            r.is_ready(),
+            "main loop sees the readiness through its own handle"
         );
     }
 
