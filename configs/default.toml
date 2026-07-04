@@ -43,3 +43,4 @@ exit_threshold = 0.20
 min_order_fraction = 0.05
 max_order_fraction = 0.10
 max_holding_bars = 96
+total_notional_cap = 10000.0

@@ -37,6 +37,7 @@ def test_default_config_has_signal_section():
     assert cfg["signal"]["min_order_fraction"] == 0.05
     assert cfg["signal"]["max_order_fraction"] == 0.10
     assert cfg["signal"]["max_holding_bars"] == 96
+    assert cfg["signal"]["total_notional_cap"] == 10_000
 
 
 def test_signal_parser_supports_bounded_daemon_loop():
@@ -56,10 +57,11 @@ def test_build_signal_daemon_config_reads_thresholds():
         "max_order_fraction": 0.12,
         "max_holding_bars": 48,
         "max_state_age_secs": 60,
+        "total_notional_cap": 12345.0,
     }
     cfg = build_signal_daemon_config(signal_cfg)
 
-    assert cfg.total_notional_cap == 10_000
+    assert cfg.total_notional_cap == 12345.0
     assert cfg.entry_threshold == 0.7
     assert cfg.exit_threshold == 0.3
     assert cfg.min_order_fraction == 0.06

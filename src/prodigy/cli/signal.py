@@ -11,10 +11,13 @@ from prodigy.signals.daemon import RunOnceConfig, SignalDaemonConfig, load_examp
 
 
 def build_signal_daemon_config(signal_cfg: dict) -> SignalDaemonConfig:
-    # ponytail: total_notional_cap has no [signal] key by design — keep the
-    # 10_000 default (matches prior RunOnceConfig default behavior).
+    # total_notional_cap reuses the shared research/backtest signal-param
+    # concept (research/signals.py SignalParams.total_notional_cap): one
+    # notional cap drives both backtest lot sizing and live signal sizing, so
+    # an operator tunes position sizing in one place. Configurable here, not
+    # hardcoded.
     return SignalDaemonConfig(
-        total_notional_cap=10_000,
+        total_notional_cap=signal_cfg["total_notional_cap"],
         entry_threshold=signal_cfg["entry_threshold"],
         exit_threshold=signal_cfg["exit_threshold"],
         min_order_fraction=signal_cfg["min_order_fraction"],
