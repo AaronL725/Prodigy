@@ -81,3 +81,57 @@ def test_decide_holding_expiry_profit_and_loss_thresholds():
     assert profit_hold is None
     assert profit_close == SignalDecision(action="close", side="long", target_notional=0.0, reason="holding_expiry_profit")
     assert loss_close == SignalDecision(action="close", side="long", target_notional=0.0, reason="holding_expiry_loss")
+
+
+from prodigy.db import connect, init_db
+from prodigy.signals.daemon import process_decision
+from prodigy.signals.state import get_executor_state, signal_processed_key
+
+
+def test_process_decision_writes_intent_and_marker_in_one_transaction(tmp_path):
+    db_path = tmp_path / "prodigy.sqlite"
+    key = signal_processed_key("dummy-cycle", "ETHUSDT", "15m", "2026-07-04T10:15:00Z")
+
+    with connect(db_path) as conn:
+        init_db(conn)
+        decision = SignalDecision("open", "long", 100.0, "open_threshold")
+        process_decision(
+            conn=conn,
+            decision=decision,
+            processed_key=key,
+            created_at="2026-07-04T10:15:01Z",
+            symbol="ETHUSDT",
+            source="dummy-cycle",
+            model_version="dummy-cycle",
+        )
+
+        intent = conn.execute("select action, side, target_notional from trade_intents").fetchone()
+        marker = get_executor_state(conn, key)
+
+    assert dict(intent) == {"action": "open", "side": "long", "target_notional": 100.0}
+    assert marker == "open_intent_written"
+
+
+def test_process_decision_close_uses_zero_notional(tmp_path):
+    db_path = tmp_path / "prodigy.sqlite"
+    key = signal_processed_key("dummy-cycle", "ETHUSDT", "15m", "2026-07-04T10:15:00Z")
+
+    with connect(db_path) as conn:
+        init_db(conn)
+        process_decision(
+            conn=conn,
+            decision=SignalDecision("close", "long", 0.0, "close_opposite"),
+            processed_key=key,
+            created_at="2026-07-04T10:15:01Z",
+            symbol="ETHUSDT",
+            source="dummy-cycle",
+            model_version="dummy-cycle",
+        )
+        intent = conn.execute("select action, side, target_notional, max_order_notional from trade_intents").fetchone()
+
+    assert dict(intent) == {
+        "action": "close",
+        "side": "long",
+        "target_notional": 0.0,
+        "max_order_notional": 0.0,
+    }

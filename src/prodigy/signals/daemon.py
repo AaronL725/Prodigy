@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 import re
+import sqlite3
+import uuid
 from dataclasses import dataclass
 
 import pandas as pd
+
+from prodigy.signals.intents import TradeIntent, insert_trade_intent
+from prodigy.signals.state import set_executor_state
 
 
 def _floor_alias(timeframe: str) -> str:
@@ -94,3 +99,34 @@ def decide_intent(
         return SignalDecision("open", side, _notional(score, cfg), "open_threshold")
 
     return None
+
+
+def process_decision(
+    conn: sqlite3.Connection,
+    decision: SignalDecision,
+    processed_key: str,
+    created_at: str,
+    symbol: str,
+    source: str,
+    model_version: str,
+) -> None:
+    outcome = "open_intent_written" if decision.action == "open" else "close_intent_written"
+    intent = TradeIntent(
+        intent_id=f"{source}-{symbol}-{uuid.uuid4().hex[:12]}",
+        created_at=created_at,
+        symbol=symbol,
+        side=decision.side,
+        action=decision.action,
+        target_notional=decision.target_notional,
+        max_order_notional=decision.target_notional if decision.action == "open" else 0.0,
+        source=source,
+        reason=decision.reason,
+        model_version=model_version,
+    )
+    # ponytail: `with conn` commits on success, rolls back on exception — so the
+    # intent insert and the signal_processed marker are atomic; neither persists
+    # alone. Move either statement outside this block and a crash between them
+    # can double-fire orders on the next cycle (idempotency relies on the marker).
+    with conn:
+        insert_trade_intent(conn, intent)
+        set_executor_state(conn, processed_key, outcome, created_at)
