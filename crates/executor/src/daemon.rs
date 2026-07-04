@@ -610,9 +610,85 @@ pub async fn run_private_ws_loop(
                     tokio::time::sleep(Duration::from_secs(1)).await;
                     continue;
                 }
-                // Subscribe to orders/positions/account after login. A production
-                // client waits for the login ack; for this demo daemon sending both
-                // immediately is acceptable and matches the existing verify style.
+                // Wait for the login ack BEFORE subscribing or marking ready. A
+                // failed login (bad signature / expired timestamp / banned key)
+                // arrives as {"event":"error",...} or a non-zero login code; the
+                // parser surfaces it as auth_error. Only {"event":"login","code":"0"}
+                // makes private state ready. Spec: emit websocket_auth_failed on
+                // auth failure and keep new opens gated out until a successful
+                // reconnect re-acks. Bounded by a 10s ack deadline so a dead
+                // socket can't hang the loop.
+                let ack_deadline = std::time::Instant::now() + Duration::from_secs(10);
+                let mut acked = false;
+                let mut auth_failure: Option<String> = None;
+                while std::time::Instant::now() < ack_deadline {
+                    let msg = tokio::select! {
+                        _ = shutdown.changed() => {
+                            if *shutdown.borrow() {
+                                return Ok(());
+                            }
+                            continue;
+                        }
+                        msg = socket.next() => match msg {
+                            Some(Ok(m)) => m,
+                            Some(Err(_)) | None => break,
+                        },
+                    };
+                    let Ok(text) = msg.into_text() else {
+                        continue;
+                    };
+                    match crate::bitget::parse_private_ws_message(&text, &cfg) {
+                        Ok(u) if u.auth_error.is_some() => {
+                            auth_failure = u.auth_error;
+                            break;
+                        }
+                        Ok(u) if u.login_ack => {
+                            acked = true;
+                            break;
+                        }
+                        Ok(_) => continue,
+                        Err(err) => {
+                            eprintln!("private ws parse error pre-ack: {err}");
+                            continue;
+                        }
+                    }
+                }
+                if let Some(detail) = auth_failure {
+                    // Auth failed: surface it as an important event (telegram-
+                    // delivered in demo mode via notify::should_send_telegram) and
+                    // stay not-ready. Reconnect backs off below; a corrected
+                    // key/timestamp re-acks on the next connect.
+                    match rusqlite::Connection::open(&cfg.db_path) {
+                        Ok(conn) => {
+                            let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
+                            let _ = crate::db::write_event(
+                                &conn,
+                                "warning",
+                                "private_ws",
+                                &format!("websocket auth failed: {detail}"),
+                                "{}",
+                            );
+                        }
+                        Err(err) => {
+                            eprintln!("websocket_auth_failed event sqlite open error: {err}")
+                        }
+                    }
+                    crate::notify::send_telegram(
+                        cfg.telegram_bot_token.as_deref(),
+                        cfg.telegram_chat_id.as_deref(),
+                        "websocket_auth_failed",
+                        &format!("private websocket login failed: {detail}"),
+                    )
+                    .await
+                    .ok();
+                    eprintln!("private ws login rejected: {detail}; reconnecting");
+                    continue;
+                }
+                if !acked {
+                    eprintln!("private ws login ack timed out; reconnecting");
+                    continue;
+                }
+                // Subscribe to orders/positions/account now that login is acked.
                 if let Err(err) = socket
                     .send(Message::Text(
                         crate::bitget::private_subscribe_message(&cfg).to_string(),
@@ -623,14 +699,15 @@ pub async fn run_private_ws_loop(
                     tokio::time::sleep(Duration::from_secs(1)).await;
                     continue;
                 }
-                // (Re)connect succeeded and we're subscribed: request a REST
-                // reconcile on the next main-loop tick (spec: reconcile after
-                // WS reconnect) so any orders/fills/positions gap is repaired,
-                // and mark private state READY so new opens are no longer gated
-                // out (spec: refuse new opening exposure when private state is
-                // not ready — connection-level readiness: login + subscribe
-                // sends both succeeded; an idle demo account may never push
-                // data, so we do NOT wait for a first data message).
+                // (Re)connect succeeded, login was ACKED, and we're subscribed:
+                // request a REST reconcile on the next main-loop tick (spec:
+                // reconcile after WS reconnect) so any orders/fills/positions gap
+                // is repaired, and mark private state READY so new opens are no
+                // longer gated out (spec: refuse new opening exposure when
+                // private state is not ready). Readiness is connection-level: we
+                // wait for the login ack but NOT for a first data push — an idle
+                // demo account may never push one, and gating on it would
+                // deadlock all opens on an idle account.
                 private_ready.set(true);
                 reconcile_signal.request();
                 loop {
@@ -858,6 +935,8 @@ mod tests {
         .unwrap();
 
         let update = crate::types::PrivateWsUpdate {
+            login_ack: false,
+            auth_error: None,
             orders: vec![crate::types::OrderRecord {
                 exchange_order_id: Some("ex-1".to_string()),
                 status: "filled".to_string(),

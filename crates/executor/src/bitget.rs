@@ -427,6 +427,43 @@ pub fn parse_private_ws_message(text: &str, cfg: &ExecutorConfig) -> Result<Priv
         return Ok(PrivateWsUpdate::default());
     }
     let value: Value = serde_json::from_str(text)?;
+    let mut update = PrivateWsUpdate::default();
+
+    // Connection-control events arrive WITHOUT an arg.channel: the login ack
+    // ({"event":"login","code":0,...}) confirms auth; any {"event":"error",...}
+    // or a non-zero login code is an auth/subscribe failure. The WS loop gates
+    // private-state readiness on the ack and emits websocket_auth_failed on the
+    // error, so the parser must surface both. Data messages (orders/positions/
+    // account) have no top-level "event" and fall through to the channel dispatch.
+    // ponytail: Bitget serializes `code` as a NUMBER on the login ack
+    // ({"event":"login","code":0}) but as a STRING on REST/error bodies; accept
+    // both so a numeric ack isn't mis-read as a missing/failed code.
+    if let Some(event) = value.get("event").and_then(Value::as_str) {
+        if event == "login" {
+            if ws_code(&value) == "0" {
+                update.login_ack = true;
+            } else {
+                update.auth_error = Some(format!(
+                    "login code {}: {}",
+                    ws_code(&value),
+                    value.get("msg").and_then(Value::as_str).unwrap_or("")
+                ));
+            }
+            return Ok(update);
+        }
+        if event == "error" {
+            update.auth_error = Some(format!(
+                "code {}: {}",
+                ws_code(&value),
+                value.get("msg").and_then(Value::as_str).unwrap_or("")
+            ));
+            return Ok(update);
+        }
+        // Other control events (e.g. subscribe ack) carry no private data; return
+        // the empty update so the read loop skips it.
+        return Ok(update);
+    }
+
     let channel = value
         .pointer("/arg/channel")
         .and_then(Value::as_str)
@@ -436,7 +473,6 @@ pub fn parse_private_ws_message(text: &str, cfg: &ExecutorConfig) -> Result<Priv
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let mut update = PrivateWsUpdate::default();
 
     if channel == "orders" {
         for row in data {
@@ -545,6 +581,18 @@ fn str_field(value: &Value, key: &str) -> String {
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string()
+}
+
+/// Read a connection-control `code` field as a string regardless of whether
+/// Bitget serialized it as a number (login ack: `"code":0`) or a string
+/// (error/REST bodies: `"code":"30001"`). Empty string when absent.
+fn ws_code(value: &Value) -> String {
+    match value.get("code") {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Number(n)) => n.to_string(),
+        Some(other) => other.to_string(),
+        None => String::new(),
+    }
 }
 
 fn parse_f64(value: Option<&Value>, name: &str) -> Result<f64> {
@@ -775,6 +823,52 @@ mod tests {
         assert!((acct.equity - 1000.0).abs() < 1e-9);
         assert!((acct.available_margin - 500.0).abs() < 1e-9);
         assert!((acct.unrealized_pnl - (-2.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn parses_private_login_ack() {
+        // Bitget's real login ack serializes code as a NUMBER: {"event":"login","code":0}.
+        // The WS loop waits for this before treating private state as ready, so the
+        // parser must set login_ack for the numeric form (and the string form too).
+        let cfg = ExecutorConfig::demo_for_tests();
+        let update = parse_private_ws_message(r#"{"event":"login","code":0}"#, &cfg).unwrap();
+        assert!(update.login_ack);
+        assert!(update.auth_error.is_none());
+        // defensive: a string "0" must also ack (some clients/gateways vary)
+        let update_s = parse_private_ws_message(r#"{"event":"login","code":"0"}"#, &cfg).unwrap();
+        assert!(update_s.login_ack);
+    }
+
+    #[test]
+    fn parses_private_login_failure_code_as_auth_error() {
+        // A login response with a non-zero code (numeric, like the ack). Must
+        // surface as auth_error so the loop emits websocket_auth_failed and stays
+        // not-ready; login_ack must NOT be set.
+        let cfg = ExecutorConfig::demo_for_tests();
+        let update = parse_private_ws_message(
+            r#"{"event":"login","code":30001,"msg":"sign invalid"}"#,
+            &cfg,
+        )
+        .unwrap();
+        assert!(!update.login_ack);
+        let err = update.auth_error.expect("auth error parsed");
+        assert!(err.contains("30001"));
+        assert!(err.contains("sign invalid"));
+    }
+
+    #[test]
+    fn parses_private_error_event_as_auth_error() {
+        // A generic {"event":"error",...} (string code, as on REST/error bodies).
+        let cfg = ExecutorConfig::demo_for_tests();
+        let update = parse_private_ws_message(
+            r#"{"event":"error","code":"30005","msg":"login timeout"}"#,
+            &cfg,
+        )
+        .unwrap();
+        assert!(!update.login_ack);
+        let err = update.auth_error.expect("auth error parsed");
+        assert!(err.contains("30005"));
+        assert!(err.contains("login timeout"));
     }
 
     #[test]

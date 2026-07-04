@@ -79,4 +79,11 @@ pub struct PrivateWsUpdate {
     pub fills: Vec<FillRecord>,
     pub positions: Vec<PositionRecord>,
     pub account: Option<AccountSnapshotUpdate>,
+    /// True when a private-WS `{"event":"login","code":"0",...}` ack was parsed.
+    /// The WS loop waits for this before treating private state as ready.
+    pub login_ack: bool,
+    /// Set when a private-WS `{"event":"error",...}` or a non-zero login code is
+    /// parsed (auth/subscribe failure). Carries the exchange message so the loop
+    /// can emit a `websocket_auth_failed` event and stay not-ready until reconnect.
+    pub auth_error: Option<String>,
 }

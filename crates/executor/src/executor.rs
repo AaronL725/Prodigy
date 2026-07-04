@@ -75,6 +75,51 @@ pub(crate) fn market_gate(action: &str, cache: Option<MarketUpdate>) -> MarketGa
     }
 }
 
+/// Minimum gap (ms) between two "deferred open" events for the same intent.
+// ponytail: the daemon ticks every 250ms; without a per-intent cap a WS outage
+// floods the events table (one row per tick per pending open). 10s balances
+// observability (a stuck-deferred intent still logs every ~10s) against write
+// volume. Generalize to config if multiple symbols/intents make this too coarse.
+const DEFER_EVENT_WINDOW_MS: i64 = 10_000;
+
+/// True if a deferred-open event was emitted recently enough to suppress another
+/// emit. Pure over (last_emit_ms, now_ms) so the rate-limit is unit-testable
+/// without the REST/WS harness; the loop persists last_emit_ms in executor_state.
+fn defer_event_recently_emitted(last_emit_ms: Option<i64>, now_ms: i64) -> bool {
+    match last_emit_ms {
+        Some(last) => now_ms - last < DEFER_EVENT_WINDOW_MS,
+        None => false,
+    }
+}
+
+/// Best-effort durable failure for an intent that hit an infrastructure error
+/// AFTER it was accepted. Logs the error event, then flips the intent to
+/// `failed` so a stuck-`accepted` row can't wedge the loop (accept_intent only
+/// matches `pending`, so the loop would otherwise never retry it). reconcile
+/// owns the real order/position truth. Both writes are best-effort: a sqlite
+/// failure here is logged but must not propagate (the caller is mid-batch and a
+/// logging error must not strand the rest of the intents — same isolation as
+/// the per-intent snapshot/equity writes above).
+fn fail_intent_after_infra_error(conn: &Connection, intent_id: &str, err: &anyhow::Error) {
+    let _ = db::write_event(
+        conn,
+        "error",
+        "intent_loop",
+        &format!("intent {intent_id} infrastructure error: {err}"),
+        "{}",
+    );
+    if let Err(fail_err) = db::fail_intent(conn, intent_id, &format!("infrastructure error: {err}"))
+    {
+        let _ = db::write_event(
+            conn,
+            "error",
+            "intent_loop",
+            &format!("could not mark intent {intent_id} failed: {fail_err}"),
+            "{}",
+        );
+    }
+}
+
 /// Process every pending intent in DB order using the same code path the
 /// one-shot `run_once_or_loop` uses. Extracted so the daemon (Task 7) can drive
 /// the loop on its own cadence without duplicating the per-intent wiring
@@ -103,13 +148,31 @@ pub async fn process_pending_intents_once(
             // Opening action + stale/missing WS: defer (leave pending). Do NOT
             // fail — a transient WS gap must not permanently reject an open.
             // Stays pending; the next tick retries once WS is fresh.
-            let _ = db::write_event(
-                conn,
-                "info",
-                "intent_loop",
-                &format!("deferred open {}: market data stale", intent.intent_id),
-                "{}",
-            );
+            //
+            // Rate-limit the defer event: the daemon ticks every 250ms, so a WS
+            // outage would otherwise flood the events table with one row per tick
+            // per pending open. Emit at most once per DEFER_EVENT_WINDOW per
+            // intent (last-emit timestamp persisted in executor_state so the cap
+            // survives across ticks). The intent defers either way.
+            if !defer_event_recently_emitted(
+                db::get_executor_state(conn, &format!("deferred_open:{}", intent.intent_id))
+                    .unwrap_or(None)
+                    .and_then(|s| s.parse::<i64>().ok()),
+                now_ms,
+            ) {
+                let _ = db::set_executor_state(
+                    conn,
+                    &format!("deferred_open:{}", intent.intent_id),
+                    &now_ms.to_string(),
+                );
+                let _ = db::write_event(
+                    conn,
+                    "info",
+                    "intent_loop",
+                    &format!("deferred open {}: market data stale", intent.intent_id),
+                    "{}",
+                );
+            }
             continue;
         }
 
@@ -186,8 +249,18 @@ pub async fn process_pending_intents_once(
         };
 
         // ponytail: process_one_intent fails intents DURABLY via db::fail_intent
-        // and returns Ok(()) for those, so this Err branch is genuine
-        // infrastructure error only — don't double-log.
+        // and returns Ok(()) for known failure modes (risk reject, place-order
+        // reject, market-refresh failure, cancel-confirm failure, max-commands).
+        // A residual Err is genuine infrastructure error (REST/sqlite) that fired
+        // AFTER accept_intent flipped the intent pending→accepted. accept_intent
+        // only matches `pending`, so a stuck-accepted intent would be invisible to
+        // every future tick (pending_intents selects pending only) — i.e. wedged
+        // forever. Fail it durably here so the loop can't strand it; reconcile
+        // owns the real order/position truth, so "failed" means "we lost track of
+        // this attempt", not "no order was placed". This single guard covers every
+        // bare `?` inside process_one_intent (sizing, retry/taker account snapshot,
+        // order-row writes) — fixing the wedge once, where all Err paths converge,
+        // instead of at each `?`.
         if let Err(err) = process_one_intent(
             conn,
             cfg,
@@ -199,13 +272,7 @@ pub async fn process_pending_intents_once(
         )
         .await
         {
-            let _ = db::write_event(
-                conn,
-                "error",
-                "intent_loop",
-                &format!("intent {} failed: {err}", intent.intent_id),
-                "{}",
-            );
+            fail_intent_after_infra_error(conn, &intent.intent_id, &err);
         }
         // Only count intents that actually reached process_one_intent (UseWs /
         // UseRestTicker arms). A deferred open stays pending and is NOT counted,
@@ -899,10 +966,20 @@ fn round_down_to_step(value: f64, step: f64) -> f64 {
     if step <= 0.0 {
         return value;
     }
-    (value / step).floor() * step
+    // ponytail: floating-point can store a clean lot slightly below its true
+    // value (one lot of 0.01 is 0.009999999999999995 in f64). A bare
+    // (value/step).floor() maps 0.9999...→0, dropping a whole lot — and at one
+    // lot sizes the order to 0, which Bitget rejects ("less than minimum order
+    // quantity"). Add an epsilon in LOT-COUNT space: 1e-9 is far smaller than
+    // the lot step (0.01) so a genuine sub-lot remainder (0.005, 0.0199) is
+    // never bumped up to the next lot, but far larger than FP division error, so
+    // noise at a lot boundary is absorbed. Money path: rounding stays DOWN, so
+    // the placed size never exceeds the approved notional.
+    let lots = value / step;
+    (lots + 1e-9).floor() * step
 }
 
-fn format_size(value: f64) -> String {
+pub fn format_size(value: f64) -> String {
     // ponytail: round to the lot step before formatting so Bitget accepts the size.
     let rounded = round_down_to_step(value, MIN_ORDER_BASE);
     format!("{rounded:.4}")
@@ -1439,6 +1516,75 @@ mod tests {
     use super::*;
     use crate::types::{MarketUpdate, TradeIntent};
 
+    fn memory_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(include_str!("../../../schema/001_initial.sql"))
+            .unwrap();
+        conn.execute_batch(include_str!("../../../schema/002_execution.sql"))
+            .unwrap();
+        conn
+    }
+
+    fn insert_pending_intent(conn: &Connection, intent_id: &str) {
+        conn.execute(
+            "insert into trade_intents (
+               intent_id, created_at, symbol, side, action, target_notional,
+               max_order_notional, status, source
+             ) values (?1, '2026-07-01T00:00:00Z', 'ETH/USDT:USDT',
+                       'long', 'open', 100, 100, 'pending', 'test')",
+            rusqlite::params![intent_id],
+        )
+        .unwrap();
+    }
+
+    fn intent_status(conn: &Connection, intent_id: &str) -> String {
+        conn.query_row(
+            "select status from trade_intents where intent_id = ?1",
+            rusqlite::params![intent_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn infra_error_marks_accepted_intent_failed_not_stuck() {
+        // Regression: process_one_intent accepts the intent (pending→accepted)
+        // BEFORE driving the state machine, and accept_intent only matches
+        // `pending`. So a later infrastructure Err would leave the row accepted
+        // and invisible to every future tick — wedged forever. fail_intent_after_
+        // infra_error must flip it to `failed` so the loop can't strand it.
+        let conn = memory_db();
+        insert_pending_intent(&conn, "i1");
+        assert!(db::accept_intent(&conn, "i1").unwrap());
+        assert_eq!(intent_status(&conn, "i1"), "accepted");
+
+        fail_intent_after_infra_error(&conn, "i1", &anyhow::anyhow!("rest timeout"));
+
+        assert_eq!(
+            intent_status(&conn, "i1"),
+            "failed",
+            "infra error after accept must not leave the intent stuck accepted"
+        );
+        let err: String = conn
+            .query_row(
+                "select error from trade_intents where intent_id = 'i1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(err.contains("rest timeout"));
+        assert!(err.contains("infrastructure error"));
+    }
+
+    #[test]
+    fn defer_event_rate_limit_suppresses_recent_emits() {
+        // Never emitted → emit. Within the 10s window → suppress. Past it → emit.
+        assert!(!defer_event_recently_emitted(None, 10_000));
+        assert!(defer_event_recently_emitted(Some(9_500), 10_000)); // 500ms ago
+        assert!(!defer_event_recently_emitted(Some(0), 10_000)); // 10s ago → emit
+        assert!(defer_event_recently_emitted(Some(10_000), 10_000)); // exactly now
+    }
+
     #[test]
     fn maker_open_long_uses_best_bid() {
         let intent = TradeIntent {
@@ -1521,6 +1667,26 @@ mod tests {
         assert_eq!(format_size(0.05), "0.05");
         // a value just under a step floors to the step below, never rounds up
         assert_eq!(format_size(0.0199), "0.01");
+    }
+
+    #[test]
+    fn round_down_to_step_absorbs_fp_noise_at_lot_boundary() {
+        // 0.01 stored as 0.009999999999999995 is ONE lot, not zero. A bare
+        // (value/step).floor() maps 0.9999...→0, under-sizing the order to 0
+        // (Bitget then rejects "less than minimum order quantity"). The epsilon
+        // absorbs the noise so a value at-or-above an integer lot keeps that lot.
+        assert_eq!(round_down_to_step(0.009999999999999995, 0.01), 0.01);
+        // a genuine sub-lot remainder must NOT be bumped up to the next lot
+        assert_eq!(round_down_to_step(0.0199, 0.01), 0.01); // 1.99 lots → 1
+        assert_eq!(round_down_to_step(0.005, 0.01), 0.0); // half a lot → 0
+    }
+
+    #[test]
+    fn format_size_handles_fp_noise_close_size() {
+        // The observed fill can come back as 0.009999999999999995 (one lot,
+        // FP-noisy); formatting it for a reduce-only close must yield "0.01", not
+        // the raw repr the exchange rejects as below the minimum order quantity.
+        assert_eq!(format_size(0.009999999999999995), "0.01");
     }
 
     #[test]
