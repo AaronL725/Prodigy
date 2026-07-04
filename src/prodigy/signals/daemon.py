@@ -269,6 +269,45 @@ def run_once(cfg: RunOnceConfig) -> str:
     closed_ts = expected_closed_bar_ts(now, cfg.timeframe)
     key = signal_processed_key(cfg.source, cfg.exchange_symbol, cfg.timeframe, closed_ts)
 
+def _gate_skip(
+    conn: sqlite3.Connection,
+    cfg: RunOnceConfig,
+    key: str,
+    now: pd.Timestamp,
+    *,
+    check_already_processed: bool,
+) -> str | None:
+    """Return the first skip reason the current SQLite state triggers, else None.
+
+    Gate order: already_processed → stale_state → manual_override →
+    pending_intent → pending_order. Called TWICE in run_once — before refresh
+    (cheap pre-check, releases the handle so refresh/score run with no DB lock)
+    and again on the FINAL write connection, because refresh/score can take
+    seconds and a manual_override, pending intent, unfinished order, or stale
+    state appearing during that window must still block the write (TOCTOU guard
+    for the M5 skip rules). `check_already_processed` lets the second call reuse
+    the same gate without re-asserting idempotency the caller already owns.
+    """
+    if check_already_processed and get_executor_state(conn, key) is not None:
+        return "already_processed"
+    age = _latest_equity_snapshot_age_secs(conn, now)
+    if age is None or age > cfg.max_state_age_secs:
+        return "skipped_stale_state"
+    if is_manual_override_active(conn, cfg.exchange_symbol):
+        return "skipped_manual_override"
+    if has_unresolved_intent(conn, cfg.exchange_symbol):
+        return "skipped_pending_intent"
+    if has_unfinished_system_order(conn, cfg.exchange_symbol):
+        return "skipped_pending_order"
+    return None
+
+
+def run_once(cfg: RunOnceConfig) -> str:
+    now = pd.Timestamp(cfg.now)
+    now = now.tz_localize("UTC") if now.tzinfo is None else now.tz_convert("UTC")
+    closed_ts = expected_closed_bar_ts(now, cfg.timeframe)
+    key = signal_processed_key(cfg.source, cfg.exchange_symbol, cfg.timeframe, closed_ts)
+
     with connect(cfg.db_path) as conn:
         init_db(conn)
         # M5 limitation: the processed-key check below and the marker write in
@@ -280,17 +319,9 @@ def run_once(cfg: RunOnceConfig) -> str:
         # deployment would need BEGIN IMMEDIATE re-check inside the write
         # transaction — out of M5 scope (and it would contend with the Rust
         # executor's WAL writes on the same DB).
-        if get_executor_state(conn, key) is not None:
-            return "already_processed"
-        age = _latest_equity_snapshot_age_secs(conn, now)
-        if age is None or age > cfg.max_state_age_secs:
-            return "skipped_stale_state"
-        if is_manual_override_active(conn, cfg.exchange_symbol):
-            return "skipped_manual_override"
-        if has_unresolved_intent(conn, cfg.exchange_symbol):
-            return "skipped_pending_intent"
-        if has_unfinished_system_order(conn, cfg.exchange_symbol):
-            return "skipped_pending_order"
+        pre = _gate_skip(conn, cfg, key, now, check_already_processed=True)
+        if pre is not None:
+            return pre
 
     # ponytail: spec error handling — refresh/factor errors must write an event
     # and skip this run, NOT crash (the daemon must not crash the Rust executor;
@@ -336,6 +367,15 @@ def run_once(cfg: RunOnceConfig) -> str:
 
     with connect(cfg.db_path) as conn:
         init_db(conn)
+        # TOCTOU re-check: refresh + score ran outside this transaction and can
+        # take seconds; a manual_override, pending intent, unfinished order, or
+        # stale state that appeared during that window must still block the
+        # write. already_processed is owned by the caller (it can't change
+        # within a single run_once), so the re-check excludes it. None of these
+        # transient skips writes the processed marker.
+        reskip = _gate_skip(conn, cfg, key, now, check_already_processed=False)
+        if reskip is not None:
+            return reskip
         position = _position_state(conn, cfg.exchange_symbol)
         holding_bars = (
             _holding_bars(position.opened_at, closed_ts, cfg.timeframe)

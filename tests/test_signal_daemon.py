@@ -506,3 +506,80 @@ def test_run_once_writes_intent_when_data_bar_matches_expected(tmp_path):
     )
 
     assert result == "open_intent_written"
+
+
+def test_run_once_rechecks_manual_override_after_refresh(tmp_path):
+    # TOCTOU guard: gates run on conn1, then refresh+score (which can take
+    # seconds), then the write happens on conn2. If a human flips
+    # manual_override to active DURING refresh, the write path must re-check and
+    # skip — not write an open intent. The processed marker must NOT be written
+    # (transient skip), so the bar is re-evaluated next run.
+    db_path = tmp_path / "prodigy.sqlite"
+    _seed_fresh_equity(db_path)
+
+    def refresh_data() -> None:
+        # Simulate a human touching the symbol mid-refresh.
+        with connect(db_path) as conn:
+            init_db(conn)
+            set_executor_state(conn, "manual_override:ETHUSDT", "active", "2026-07-04T10:15:40Z")
+            conn.commit()
+
+    result = run_once(
+        RunOnceConfig(
+            db_path=db_path,
+            data_root=tmp_path / "data",
+            research_symbol="ETH/USDT:USDT",
+            exchange_symbol="ETHUSDT",
+            source="dummy-cycle",
+            now=pd.Timestamp("2026-07-04T10:16:00Z"),
+            refresh_data=refresh_data,
+            score_loader=lambda: (1.0, "2026-07-04T10:00:00Z"),
+        )
+    )
+
+    assert result == "skipped_manual_override"
+    with connect(db_path) as conn:
+        assert conn.execute("select count(*) from trade_intents").fetchone()[0] == 0
+        key = signal_processed_key("dummy-cycle", "ETHUSDT", "15m", "2026-07-04T10:00:00Z")
+        assert get_executor_state(conn, key) is None
+
+
+def test_run_once_rechecks_pending_intent_after_refresh(tmp_path):
+    # Same TOCTOU guard for the pending-intent gate: an intent that lands during
+    # refresh must block a second open intent for the same symbol.
+    db_path = tmp_path / "prodigy.sqlite"
+    _seed_fresh_equity(db_path)
+
+    def refresh_data() -> None:
+        with connect(db_path) as conn:
+            init_db(conn)
+            conn.execute(
+                """
+                insert into trade_intents (
+                  intent_id, created_at, symbol, side, action, target_notional,
+                  max_order_notional, status, source, reason, model_version
+                ) values ('pre', '2026-07-04T10:15:40Z', 'ETHUSDT', 'long', 'open',
+                          100, 100, 'pending', 'other', 'x', 'm')
+                """
+            )
+            conn.commit()
+
+    result = run_once(
+        RunOnceConfig(
+            db_path=db_path,
+            data_root=tmp_path / "data",
+            research_symbol="ETH/USDT:USDT",
+            exchange_symbol="ETHUSDT",
+            source="dummy-cycle",
+            now=pd.Timestamp("2026-07-04T10:16:00Z"),
+            refresh_data=refresh_data,
+            score_loader=lambda: (1.0, "2026-07-04T10:00:00Z"),
+        )
+    )
+
+    assert result == "skipped_pending_intent"
+    with connect(db_path) as conn:
+        # Only the pre-existing pending intent; no new intent from this run.
+        assert conn.execute("select count(*) from trade_intents").fetchone()[0] == 1
+        key = signal_processed_key("dummy-cycle", "ETHUSDT", "15m", "2026-07-04T10:00:00Z")
+        assert get_executor_state(conn, key) is None
