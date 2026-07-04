@@ -37,3 +37,10 @@ def test_default_config_has_signal_section():
     assert cfg["signal"]["min_order_fraction"] == 0.05
     assert cfg["signal"]["max_order_fraction"] == 0.10
     assert cfg["signal"]["max_holding_bars"] == 96
+
+
+def test_signal_parser_supports_bounded_daemon_loop():
+    args = build_parser().parse_args(["--daemon", "--max-loops", "1"])
+
+    assert args.daemon is True
+    assert args.max_loops == 1

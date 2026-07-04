@@ -1,6 +1,9 @@
 import subprocess
 
+import pandas as pd
+
 from prodigy.db import connect, init_db
+from prodigy.signals.daemon import RunOnceConfig, run_once
 from prodigy.signals.intents import TradeIntent, write_trade_intent
 
 
@@ -228,3 +231,43 @@ def test_rust_daemon_rejects_live_mode(tmp_path):
 
     assert result.returncode != 0
     assert "only supports --mode demo" in result.stderr
+
+
+def test_signal_run_once_writes_intent_for_executor(tmp_path):
+    db_path = tmp_path / "prodigy.sqlite"
+    with connect(db_path) as conn:
+        init_db(conn)
+        conn.execute(
+            """
+            insert into equity_snapshots (
+              snapshot_id, created_at, equity, available_margin, unrealized_pnl, realized_pnl_24h
+            ) values ('s1', '2026-07-04T10:15:30Z', 1000, 1000, 0, 0)
+            """
+        )
+        conn.commit()
+
+    result = run_once(
+        RunOnceConfig(
+            db_path=db_path,
+            data_root=tmp_path / "data",
+            research_symbol="ETH/USDT:USDT",
+            exchange_symbol="ETHUSDT",
+            source="dummy-cycle",
+            now=pd.Timestamp("2026-07-04T10:16:00Z"),
+            refresh_data=lambda: None,
+            score_loader=lambda: 1.0,
+        )
+    )
+
+    with connect(db_path) as conn:
+        row = conn.execute(
+            "select status, symbol, action, side from trade_intents"
+        ).fetchone()
+
+    assert result == "open_intent_written"
+    assert dict(row) == {
+        "status": "pending",
+        "symbol": "ETHUSDT",
+        "action": "open",
+        "side": "long",
+    }
