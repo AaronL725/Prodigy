@@ -164,6 +164,28 @@ class RunOnceConfig:
     timeframe: str = "15m"
 
 
+def _write_signal_event(conn: sqlite3.Connection, severity: str, message: str) -> None:
+    # ponytail: spec error handling requires writing a SQLite event on
+    # refresh/factor errors and on shutdown. Inline insert keeps the daemon
+    # dependency-free; events is the shared Rust/Python observability table.
+    # Best-effort: a failure here (e.g. DB locked) must not mask the skip the
+    # daemon already decided on, so the caller does not depend on this row.
+    import uuid
+
+    conn.execute(
+        """
+        insert into events (event_id, created_at, severity, component, message, payload_json)
+        values (?, ?, ?, 'signal', ?, '{}')
+        """,
+        (
+            f"signal-{uuid.uuid4().hex[:16]}",
+            pd.Timestamp.now(tz="UTC").isoformat().replace("+00:00", "Z"),
+            severity,
+            message,
+        ),
+    )
+
+
 def _latest_equity_snapshot_age_secs(conn: sqlite3.Connection, now: pd.Timestamp) -> float | None:
     row = conn.execute(
         "select created_at from equity_snapshots order by created_at desc limit 1"
@@ -235,8 +257,29 @@ def run_once(cfg: RunOnceConfig) -> str:
         if has_unfinished_system_order(conn, cfg.exchange_symbol):
             return "skipped_pending_order"
 
-    cfg.refresh_data()
-    score = cfg.score_loader()
+    # ponytail: spec error handling — refresh/factor errors must write an event
+    # and skip this run, NOT crash (the daemon must not crash the Rust executor;
+    # SQLite is the only shared boundary). Neither skip writes the processed
+    # marker, so the bar is re-evaluated next run once the data layer recovers.
+    # The event write is best-effort: a SQLite failure logging the event must
+    # not prevent the skip itself.
+    try:
+        cfg.refresh_data()
+    except Exception as exc:  # noqa: BLE001 — daemon isolates any refresh failure
+        with connect(cfg.db_path) as conn:
+            init_db(conn)
+            _write_signal_event(conn, "warning", f"data refresh error: {exc}")
+            conn.commit()
+        return "error_data_refresh"
+
+    try:
+        score = cfg.score_loader()
+    except Exception as exc:  # noqa: BLE001 — daemon isolates any factor/score failure
+        with connect(cfg.db_path) as conn:
+            init_db(conn)
+            _write_signal_event(conn, "warning", f"factor compute error: {exc}")
+            conn.commit()
+        return "error_factor_compute"
 
     with connect(cfg.db_path) as conn:
         init_db(conn)

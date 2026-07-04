@@ -365,3 +365,86 @@ def test_run_once_does_not_guess_holding_bars_when_opened_at_missing(tmp_path):
     assert result == "no_signal"
     with connect(db_path) as conn:
         assert conn.execute("select count(*) from trade_intents").fetchone()[0] == 0
+
+
+def _seed_fresh_equity(db_path):
+    """Shared fixture: an equity snapshot fresh enough to pass the stale gate."""
+    with connect(db_path) as conn:
+        init_db(conn)
+        conn.execute(
+            """
+            insert into equity_snapshots (
+              snapshot_id, created_at, equity, available_margin, unrealized_pnl, realized_pnl_24h
+            ) values ('s1', '2026-07-04T10:15:30Z', 1000, 1000, 0, 0)
+            """
+        )
+        conn.commit()
+
+
+def test_run_once_skips_on_data_refresh_error_and_writes_event(tmp_path):
+    # Spec error handling: "Data refresh error: write event, skip." Must NOT
+    # crash, must NOT write a trade_intent, must NOT mark the bar processed.
+    db_path = tmp_path / "prodigy.sqlite"
+    _seed_fresh_equity(db_path)
+
+    def boom() -> None:
+        raise RuntimeError("refresh failed")
+
+    result = run_once(
+        RunOnceConfig(
+            db_path=db_path,
+            data_root=tmp_path / "data",
+            research_symbol="ETH/USDT:USDT",
+            exchange_symbol="ETHUSDT",
+            source="dummy-cycle",
+            now=pd.Timestamp("2026-07-04T10:16:00Z"),
+            refresh_data=boom,
+            score_loader=lambda: 1.0,
+        )
+    )
+
+    assert result == "error_data_refresh"
+    with connect(db_path) as conn:
+        assert conn.execute("select count(*) from trade_intents").fetchone()[0] == 0
+        key = signal_processed_key("dummy-cycle", "ETHUSDT", "15m", "2026-07-04T10:00:00Z")
+        assert get_executor_state(conn, key) is None
+        evt = conn.execute(
+            "select severity, component, message from events where component = 'signal'"
+        ).fetchone()
+    assert evt is not None
+    assert evt["severity"] == "warning"
+    assert "refresh failed" in evt["message"]
+
+
+def test_run_once_skips_on_factor_compute_error_and_writes_event(tmp_path):
+    # Spec error handling: "Factor compute error: write event, skip."
+    db_path = tmp_path / "prodigy.sqlite"
+    _seed_fresh_equity(db_path)
+
+    def boom() -> float:
+        raise RuntimeError("factor boom")
+
+    result = run_once(
+        RunOnceConfig(
+            db_path=db_path,
+            data_root=tmp_path / "data",
+            research_symbol="ETH/USDT:USDT",
+            exchange_symbol="ETHUSDT",
+            source="dummy-cycle",
+            now=pd.Timestamp("2026-07-04T10:16:00Z"),
+            refresh_data=lambda: None,
+            score_loader=boom,
+        )
+    )
+
+    assert result == "error_factor_compute"
+    with connect(db_path) as conn:
+        assert conn.execute("select count(*) from trade_intents").fetchone()[0] == 0
+        key = signal_processed_key("dummy-cycle", "ETHUSDT", "15m", "2026-07-04T10:00:00Z")
+        assert get_executor_state(conn, key) is None
+        evt = conn.execute(
+            "select severity, component, message from events where component = 'signal'"
+        ).fetchone()
+    assert evt is not None
+    assert evt["severity"] == "warning"
+    assert "factor boom" in evt["message"]
