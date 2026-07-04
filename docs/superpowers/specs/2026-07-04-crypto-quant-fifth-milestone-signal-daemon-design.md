@@ -32,6 +32,7 @@ Included:
 - Read position, order, PnL, manual override, and reconcile freshness state from SQLite.
 - Use Rust executor state in SQLite as the durable idempotency record.
 - Keep Rust as the only component that talks to Bitget account, position, order, and execution APIs.
+- Add the minimum Rust executor change needed for `action=close` to close the full current exchange position with a reduce-only order.
 
 Excluded:
 
@@ -177,6 +178,29 @@ M5 keeps `exit_threshold` configurable.
 
 If a position exists and a reverse signal appears, M5 writes only a `close` intent. It does not open the opposite direction in the same closed bar. Opposite-direction opening can only be considered on a later closed bar.
 
+## Close Intent Semantics
+
+Python does not calculate the precise contract size for `action=close`.
+
+For a close signal, Python writes:
+
+```text
+action = close
+side = current SQLite position side
+target_notional = 0.0
+max_order_notional = 0.0
+```
+
+The Rust executor must treat `action=close` as a full-position reduce-only close:
+
+- resolve the current exchange position size for the symbol and side through the Rust execution/reconcile authority path;
+- ignore `target_notional` and `max_order_notional` for close order sizing;
+- submit a reduce-only order for the full current position size;
+- never place a zero-size close order;
+- fail the close intent with a diagnostic event if no matching exchange position exists.
+
+This is a small M5 Rust executor adjustment. The normal `open` path keeps the existing notional-based sizing.
+
 ## Holding Expiry Rule
 
 When a position reaches `max_holding_bars`, M5 does not close unconditionally.
@@ -248,6 +272,16 @@ This prevents inconsistent states such as:
 
 For skip/no-signal outcomes, writing only the processed-bar marker is acceptable. If the marker write fails, the next run may re-evaluate the bar.
 
+The existing Python `write_trade_intent` helper commits immediately. M5 must refactor it or add a no-commit insert helper so the signal daemon can commit:
+
+```text
+insert trade_intent
+set executor_state signal_processed:...
+commit
+```
+
+as one SQLite transaction.
+
 ## Config
 
 M5 uses unified config values rather than a separate hardcoded strategy config.
@@ -262,11 +296,15 @@ signal_source = "example-factors"
 max_state_age_secs = 120
 poll_interval_secs = 30
 entry_threshold = 0.6
+exit_threshold = 0.2
 min_order_fraction = 0.05
 max_order_fraction = 0.10
+max_holding_bars = 96
 ```
 
-The total notional cap, holding horizon, and signal thresholds should reuse the existing research/backtest signal parameter path where possible.
+`max_holding_bars = 96` means 24 hours on `15m` bars.
+
+The total notional cap, holding horizon, and signal thresholds should reuse the existing research/backtest signal parameter path where possible. `exit_threshold` maps to the existing close-threshold concept in `SignalParams`.
 
 ## Error Handling
 
@@ -294,16 +332,19 @@ M5 is complete when:
 7. Only closed `15m` bars can produce decisions.
 8. A repeated run on the same closed bar does not write a duplicate intent.
 9. Intent write and processed-bar marker write are committed in one SQLite transaction.
-10. Stale SQLite authority state skips intent generation.
-11. `manual_override` skips intent generation for the symbol.
-12. Pending or accepted intents skip new intent generation.
-13. Unfinished system orders skip new intent generation.
-14. Existing position plus reverse signal writes close only, never same-bar reverse/open.
-15. Holding expiry uses the profit/loss branch thresholds.
-16. M5 writes only `open` and `close` intents.
-17. Python does not call Bitget account, position, order, or execution APIs.
-18. Existing Rust executor tests still pass.
-19. Existing Python tests still pass.
+10. Python has a no-commit intent insert path for transaction composition.
+11. Rust `action=close` resolves the current exchange position size and sends a reduce-only full-position close.
+12. Rust close sizing ignores Python `target_notional`.
+13. Stale SQLite authority state skips intent generation.
+14. `manual_override` skips intent generation for the symbol.
+15. Pending or accepted intents skip new intent generation.
+16. Unfinished system orders skip new intent generation.
+17. Existing position plus reverse signal writes close only, never same-bar reverse/open.
+18. Holding expiry uses the profit/loss branch thresholds.
+19. M5 writes only `open` and `close` intents.
+20. Python does not call Bitget account, position, order, or execution APIs.
+21. Existing Rust executor tests still pass.
+22. Existing Python tests still pass.
 
 ## Deferred
 
