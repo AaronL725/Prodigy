@@ -74,7 +74,19 @@ pub async fn run_daemon(cfg: ExecutorConfig, options: DaemonOptions) -> Result<(
     // M4 has Python writing intents, the daemon R/W, the private WS writing, and Telegram
     // reading — all concurrent. WAL lets those readers/writers proceed in parallel instead of
     // serializing on a single rollback journal; busy_timeout makes them wait out SQLITE_BUSY.
-    let _ = conn.pragma_update(None, "journal_mode", "wal");
+    if let Err(err) = conn.pragma_update(None, "journal_mode", "wal") {
+        // WAL is the assumed journal mode for concurrent Python/daemon/WS/Telegram
+        // access. A failure isn't fatal (busy_timeout still serializes writers), but
+        // surface it as a warning event so the operator knows the DB isn't WAL — M4
+        // claims WAL-compatible behavior and shouldn't swallow this silently.
+        crate::db::write_event(
+            &conn,
+            "warning",
+            "daemon",
+            &format!("WAL journal_mode setup failed: {err}"),
+            "{}",
+        )?;
+    }
     conn.busy_timeout(Duration::from_secs(5))?;
     let rest = crate::bitget::BitgetRestClient::new(cfg.clone())?;
 
