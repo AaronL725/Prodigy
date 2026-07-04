@@ -44,3 +44,34 @@ def test_signal_parser_supports_bounded_daemon_loop():
 
     assert args.daemon is True
     assert args.max_loops == 1
+
+
+def test_build_signal_daemon_config_reads_thresholds():
+    from prodigy.cli.signal import build_signal_daemon_config
+
+    signal_cfg = {
+        "entry_threshold": 0.7,
+        "exit_threshold": 0.3,
+        "min_order_fraction": 0.06,
+        "max_order_fraction": 0.12,
+        "max_holding_bars": 48,
+        "max_state_age_secs": 60,
+    }
+    cfg = build_signal_daemon_config(signal_cfg)
+
+    assert cfg.total_notional_cap == 10_000
+    assert cfg.entry_threshold == 0.7
+    assert cfg.exit_threshold == 0.3
+    assert cfg.min_order_fraction == 0.06
+    assert cfg.max_order_fraction == 0.12
+    assert cfg.max_holding_bars == 48
+
+
+def test_default_config_round_trips_through_build_signal_daemon_config():
+    from prodigy.cli.signal import build_signal_daemon_config
+
+    signal_cfg = load_config("configs/default.toml")["signal"]
+    built = build_signal_daemon_config(signal_cfg)
+
+    assert built.entry_threshold == 0.6
+    assert built.max_holding_bars == 96

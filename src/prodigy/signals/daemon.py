@@ -48,6 +48,7 @@ class SignalDaemonConfig:
 class PositionState:
     side: str
     unrealized_pnl: float
+    opened_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -178,12 +179,38 @@ def _latest_equity_snapshot_age_secs(conn: sqlite3.Connection, now: pd.Timestamp
 
 def _position_state(conn: sqlite3.Connection, symbol: str) -> PositionState | None:
     row = conn.execute(
-        "select side, unrealized_pnl from positions where symbol = ?",
+        "select side, unrealized_pnl, opened_at from positions where symbol = ?",
         (symbol,),
     ).fetchone()
     if row is None:
         return None
-    return PositionState(side=str(row["side"]), unrealized_pnl=float(row["unrealized_pnl"]))
+    return PositionState(
+        side=str(row["side"]),
+        unrealized_pnl=float(row["unrealized_pnl"]),
+        opened_at=row["opened_at"],
+    )
+
+
+def _parse_utc(value: str | pd.Timestamp) -> pd.Timestamp | None:
+    try:
+        ts = pd.Timestamp(value)
+    except (ValueError, TypeError):
+        return None
+    if ts.tzinfo is None:
+        return ts.tz_localize("UTC")
+    return ts.tz_convert("UTC")
+
+
+def _holding_bars(opened_at: str | None, closed_ts: str, timeframe: str) -> int:
+    # ponytail: spec says skip (no guess) when opened_at can't be read — return 0
+    # so decide_intent's expiry branch never fires for that position.
+    if opened_at is None:
+        return 0
+    opened = _parse_utc(opened_at)
+    closed = _parse_utc(closed_ts)
+    if opened is None or closed is None:
+        return 0
+    return max(0, int((closed - opened) / pd.Timedelta(timeframe)))
 
 
 def run_once(cfg: RunOnceConfig) -> str:
@@ -214,7 +241,12 @@ def run_once(cfg: RunOnceConfig) -> str:
     with connect(cfg.db_path) as conn:
         init_db(conn)
         position = _position_state(conn, cfg.exchange_symbol)
-        decision = decide_intent(score, position, holding_bars=0, cfg=cfg.signal_cfg)
+        holding_bars = (
+            _holding_bars(position.opened_at, closed_ts, cfg.timeframe)
+            if position is not None
+            else 0
+        )
+        decision = decide_intent(score, position, holding_bars=holding_bars, cfg=cfg.signal_cfg)
         if decision is None:
             set_executor_state(conn, key, "no_signal", now.isoformat())
             conn.commit()

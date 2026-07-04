@@ -7,7 +7,20 @@ import pandas as pd
 
 from prodigy.config import load_config
 from prodigy.data.backfill import run_backfill
-from prodigy.signals.daemon import RunOnceConfig, load_example_score, run_once
+from prodigy.signals.daemon import RunOnceConfig, SignalDaemonConfig, load_example_score, run_once
+
+
+def build_signal_daemon_config(signal_cfg: dict) -> SignalDaemonConfig:
+    # ponytail: total_notional_cap has no [signal] key by design — keep the
+    # 10_000 default (matches prior RunOnceConfig default behavior).
+    return SignalDaemonConfig(
+        total_notional_cap=10_000,
+        entry_threshold=signal_cfg["entry_threshold"],
+        exit_threshold=signal_cfg["exit_threshold"],
+        min_order_fraction=signal_cfg["min_order_fraction"],
+        max_order_fraction=signal_cfg["max_order_fraction"],
+        max_holding_bars=signal_cfg["max_holding_bars"],
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -32,6 +45,7 @@ def main(argv: list[str] | None = None) -> int:
     research_symbol = signal_cfg["enabled_symbols"][0]
     exchange_symbol = signal_cfg["exchange_symbols"][research_symbol]
     timeframe = signal_cfg["timeframe"]
+    signal_daemon_cfg = build_signal_daemon_config(signal_cfg)
 
     def refresh_data() -> None:
         now = pd.Timestamp.now(tz="UTC")
@@ -65,6 +79,8 @@ def main(argv: list[str] | None = None) -> int:
                 now=pd.Timestamp.now(tz="UTC"),
                 refresh_data=refresh_data,
                 score_loader=score_loader,
+                signal_cfg=signal_daemon_cfg,
+                max_state_age_secs=signal_cfg["max_state_age_secs"],
             )
         )
         print(result)

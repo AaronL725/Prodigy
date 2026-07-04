@@ -280,3 +280,88 @@ def test_load_example_score_reads_parquet_and_uses_closed_bar(tmp_path):
     )
 
     assert -1.0 <= score <= 1.0
+
+
+def test_run_once_closes_position_via_holding_expiry_from_opened_at(tmp_path):
+    # opened_at far enough back that holding_bars >= max_holding_bars (96); score
+    # below profit_hold threshold so decide_intent's expiry-profit branch fires.
+    db_path = tmp_path / "prodigy.sqlite"
+    with connect(db_path) as conn:
+        init_db(conn)
+        conn.execute(
+            """
+            insert into equity_snapshots (
+              snapshot_id, created_at, equity, available_margin, unrealized_pnl, realized_pnl_24h
+            ) values ('s1', '2026-07-04T10:15:30Z', 1000, 1000, 0, 0)
+            """
+        )
+        conn.execute(
+            """
+            insert into positions (symbol, side, notional, entry_price, unrealized_pnl, updated_at, opened_at)
+            values ('ETHUSDT', 'long', 100.0, 100.0, 1.0, '2026-07-04T10:15:30Z', '2026-07-01T00:00:00Z')
+            """
+        )
+        conn.commit()
+
+    result = run_once(
+        RunOnceConfig(
+            db_path=db_path,
+            data_root=tmp_path / "data",
+            research_symbol="ETH/USDT:USDT",
+            exchange_symbol="ETHUSDT",
+            source="dummy-cycle",
+            now=pd.Timestamp("2026-07-04T10:16:00Z"),
+            refresh_data=lambda: None,
+            score_loader=lambda: 0.1,
+        )
+    )
+
+    assert result == "close_intent_written"
+    with connect(db_path) as conn:
+        row = conn.execute(
+            "select action, side, target_notional, reason from trade_intents"
+        ).fetchone()
+    assert dict(row) == {
+        "action": "close",
+        "side": "long",
+        "target_notional": 0.0,
+        "reason": "holding_expiry_profit",
+    }
+
+
+def test_run_once_does_not_guess_holding_bars_when_opened_at_missing(tmp_path):
+    # Spec: when opened_at can't be read, daemon skips rather than guessing age.
+    db_path = tmp_path / "prodigy.sqlite"
+    with connect(db_path) as conn:
+        init_db(conn)
+        conn.execute(
+            """
+            insert into equity_snapshots (
+              snapshot_id, created_at, equity, available_margin, unrealized_pnl, realized_pnl_24h
+            ) values ('s1', '2026-07-04T10:15:30Z', 1000, 1000, 0, 0)
+            """
+        )
+        conn.execute(
+            """
+            insert into positions (symbol, side, notional, entry_price, unrealized_pnl, updated_at)
+            values ('ETHUSDT', 'long', 100.0, 100.0, 1.0, '2026-07-04T10:15:30Z')
+            """
+        )
+        conn.commit()
+
+    result = run_once(
+        RunOnceConfig(
+            db_path=db_path,
+            data_root=tmp_path / "data",
+            research_symbol="ETH/USDT:USDT",
+            exchange_symbol="ETHUSDT",
+            source="dummy-cycle",
+            now=pd.Timestamp("2026-07-04T10:16:00Z"),
+            refresh_data=lambda: None,
+            score_loader=lambda: 0.1,
+        )
+    )
+
+    assert result == "no_signal"
+    with connect(db_path) as conn:
+        assert conn.execute("select count(*) from trade_intents").fetchone()[0] == 0
