@@ -1,4 +1,5 @@
 import subprocess
+from pathlib import Path
 
 import pandas as pd
 
@@ -188,6 +189,10 @@ def test_rust_demo_daemon_processes_pending_intent_once(tmp_path):
         ).fetchone()
         order_count = conn.execute("select count(*) from orders").fetchone()[0]
         event_count = conn.execute("select count(*) from events").fetchone()[0]
+        deferred_open_events = conn.execute(
+            "select count(*) from events where component = 'intent_loop' "
+            "and message like 'deferred open daemon-intent-1:%market data stale%'"
+        ).fetchone()[0]
         # No zero-fill order may be marked filled — the M4 anti-false-fill
         # invariant, mirrored from the --once test.
         false_fills = conn.execute(
@@ -195,14 +200,19 @@ def test_rust_demo_daemon_processes_pending_intent_once(tmp_path):
         ).fetchone()[0]
 
     # Honest terminal state: executed when the demo book is tradable, failed
-    # with a diagnostic when it is phantom-liquid (see _demo_depth_diagnostic).
-    # 'pending'/'accepted' (stuck) is never accepted after bounded daemon runtime.
-    assert intent["status"] in ("executed", "failed"), (
-        f"expected a terminal state (executed|failed), got {intent['status']}"
+    # with a diagnostic when it is phantom-liquid (see _demo_depth_diagnostic). If
+    # the public WS never delivers a fresh book during the bounded run, the open
+    # must stay pending with an explicit stale-market defer event and no order.
+    assert intent["status"] in ("executed", "failed", "pending"), (
+        f"expected executed|failed|pending-with-defer, got {intent['status']}"
     )
     if intent["status"] == "failed":
         assert intent["error"], "a failed intent must record a diagnostic error"
-    assert order_count >= 1, "expected at least one demo order to be attempted"
+    if intent["status"] == "pending":
+        assert deferred_open_events >= 1, "pending open must explain stale market data"
+        assert order_count == 0, "stale-market deferred open must not place orders"
+    else:
+        assert order_count >= 1, "expected at least one demo order to be attempted"
     assert event_count >= 1, "daemon must record startup + reconcile + intent events"
     assert false_fills == 0, "an order must not be marked filled with no fill"
     assert "daemon" in result.stdout or result.stderr == ""
@@ -272,3 +282,34 @@ def test_signal_run_once_writes_intent_for_executor(tmp_path):
         "action": "open",
         "side": "long",
     }
+
+
+def test_m6_scope_scan_has_no_remote_open_or_live_enablement():
+    repo_root = Path(__file__).resolve().parents[1]
+    dangerous = subprocess.run(
+        [
+            "rg",
+            "-n",
+            (
+                "remote_open|open_from_telegram|TELEGRAM_LIVE|BITGET_LIVE|"
+                "TELEGRAM_PARAM|remote_shell|shell_from_telegram|model_debug_from_telegram"
+            ),
+            "src",
+            "crates",
+        ],
+        check=False,
+        text=True,
+        capture_output=True,
+        cwd=repo_root,
+    )
+    assert dangerous.returncode == 1, dangerous.stdout + dangerous.stderr
+
+    config_rs = (repo_root / "crates/executor/src/config.rs").read_text()
+    production_config, test_config = config_rs.split("#[cfg(test)]", 1)
+    assert "ws.bitget.com" not in production_config
+    assert "wss://ws.bitget.com/v2/ws/public" in test_config
+    assert "wss://ws.bitget.com/v2/ws/private" in test_config
+
+    telegram_query = (repo_root / "crates/executor/src/telegram_query.rs").read_text()
+    for forbidden in ("BitgetRestClient", "/api/v2", "place-order", "cancel-order"):
+        assert forbidden not in telegram_query
