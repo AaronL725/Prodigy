@@ -25,6 +25,8 @@ Included:
 - Use one command set for demo and future live semantics.
 - Keep M6 implementation demo-only.
 - Keep Telegram away from Bitget APIs.
+- Test real Telegram send/receive when `TELEGRAM_BOT_TOKEN` and
+  `TELEGRAM_ALLOWED_USER_IDS` are configured.
 - Write every remote control action to SQLite audit events.
 - Add `cancel_all` to `control_commands` through a schema migration.
 - Make Rust executor consume `control_commands` and perform the actual action.
@@ -39,6 +41,7 @@ Excluded:
 - Remote model debugging.
 - Remote shell or arbitrary command execution.
 - 24-72 hour soak testing.
+- `TELEGRAM_CHAT_ID` as a permission gate.
 - A separate Telegram control service, Redis, Kafka, FastAPI, actors, or an event bus.
 
 ## Live Boundary
@@ -71,6 +74,27 @@ Telegram may only write:
 Rust executor is the only component that executes commands. It reads pending
 `control_commands`, applies risk and mode checks, calls Bitget through existing
 REST execution helpers, reconciles, and writes results back to SQLite.
+
+## Telegram Authorization
+
+The bot reads:
+
+- `TELEGRAM_BOT_TOKEN`;
+- `TELEGRAM_ALLOWED_USER_IDS`.
+
+Values come from `.env.local` or the process environment.
+
+Authorization uses Telegram `message.from.id` only.
+
+`chat_id` is only the reply destination. It must not be used as the permission
+gate, and M6 must not require `TELEGRAM_CHAT_ID`.
+
+Unauthorized users:
+
+- receive no control capability;
+- cannot queue `control_commands`;
+- cannot create confirmation state;
+- are written to audit events when possible.
 
 ## Telegram Commands
 
@@ -126,25 +150,28 @@ clear and safe.
 
 `stop`:
 
-- Rust marks operator trading suspension in `executor_state`.
+- Rust marks operator stop state as `operator_stop:global=active` in
+  `executor_state`.
 - New opening exposure is blocked.
 - Close, cancel, reconcile, and emergency de-risking remain allowed.
 
 `resume`:
 
-- Rust clears the operator stop state.
+- Rust clears `operator_stop:global`.
 - Other risk gates still apply.
 
 `cancel_all`:
 
-- Rust cancels system-owned open orders for enabled symbols.
+- Rust cancels system-owned working orders found in SQLite.
+- It must not blindly cancel every exchange pending order.
 - Manual or imported orders are not adopted or cancelled by assumption.
 - Rust reconciles after the cancel attempt.
 
 `close_all`:
 
 - Rust cancels system-owned open orders first.
-- Rust closes system-owned positions with reduce-only orders.
+- Rust closes only positions with `ownership = 'system'`.
+- Imported or manual positions are skipped and audited.
 - Emergency close behavior may use taker execution.
 - Rust reconciles after execution.
 - If a position cannot be closed in demo liquidity conditions, Rust records the
@@ -158,7 +185,8 @@ the command and audit rows.
 Existing schema already has `control_commands`, `executor_state`, and `events`.
 
 M6 adds `cancel_all` to the `control_commands.command` check constraint through
-a schema migration. Existing databases must be migrated safely.
+a schema migration. SQLite cannot alter this existing `CHECK` constraint in
+place, so the migration must safely rebuild and migrate the table.
 
 `control_commands` remains the durable command queue:
 
@@ -179,6 +207,27 @@ twice.
 - latest smoke report path.
 
 `events` is the audit log.
+
+## Rust Control Command Processing
+
+M6 adds:
+
+```text
+process_pending_control_commands_once()
+```
+
+The Rust daemon runs pending control command processing before opening
+`trade_intents`. This ensures operator stop and emergency commands win over new
+strategy exposure.
+
+Processing rules:
+
+- accept only `pending` commands;
+- transition accepted commands to a terminal state;
+- write audit events for acceptance, success, rejection, or failure;
+- keep processing idempotent by `command_id`;
+- run reconcile after cancel or close commands;
+- never let `stop` block close, cancel, reconcile, or de-risking.
 
 ## Audit Events
 
@@ -225,8 +274,8 @@ Telegram responses should be short enough to read on a phone.
 - pending control commands;
 - latest critical or error event.
 
-`/pnl` uses SQLite state only. If realized PnL is incomplete, the response must
-say so instead of implying precision.
+`/pnl` uses SQLite state only. If realized PnL is not reliably implemented, the
+response must show `realized=n/a` and `total=n/a` instead of implying precision.
 
 `/trades` reads recent `fills` rows and shows symbol, side, size, price, fee,
 and timestamp.
@@ -247,7 +296,7 @@ The smoke run starts the existing demo components:
 
 - Rust `prodigy-executor --daemon`;
 - Python `prodigy-signal --daemon`;
-- Telegram bot/query loop when credentials are configured.
+- real Telegram bot/query loop when credentials are configured.
 
 During the run, the smoke workflow records observations and problems. It does
 not stop mid-run to fix issues.
@@ -297,26 +346,31 @@ Rust control command processing must fail safe:
 1. Existing M5 signal daemon tests still pass.
 2. Existing M4 executor daemon tests still pass.
 3. M6 remains demo-only and rejects live mode.
-4. Telegram unauthorized users cannot queue controls.
-5. `/help` lists query and control commands.
-6. `/status`, `/positions`, `/orders`, `/trades`, `/pnl`, `/risk`, `/events`,
+4. Telegram authorization uses `message.from.id`, not `chat_id`.
+5. M6 does not require `TELEGRAM_CHAT_ID`.
+6. Telegram unauthorized users cannot queue controls.
+7. Real Telegram send/receive testing works in demo mode when credentials exist.
+8. `/help` lists query and control commands.
+9. `/status`, `/positions`, `/orders`, `/trades`, `/pnl`, `/risk`, `/events`,
    `/smoke_status`, and `/smoke_report` read SQLite only.
-7. `/stop` writes a `stop` control command and audit event.
-8. Rust consumes `stop` and blocks new opening exposure.
-9. `/resume` writes a `resume` control command and audit event.
-10. Rust consumes `resume` and clears operator stop state.
-11. `/cancel_all` is accepted by the migrated schema.
-12. Rust consumes `cancel_all`, cancels system-owned open orders, and audits the result.
-13. `/close_all` without confirmation does not write a `close_all` command.
-14. `/confirm <code>` writes `close_all` only for the same whitelisted user before expiry.
-15. Wrong, expired, replayed, and cross-user confirmation attempts are rejected and audited.
-16. Rust consumes `close_all`, cancels system-owned orders, closes system-owned positions, reconciles, and audits success or failure.
-17. Control command processing is idempotent by `command_id`.
-18. Telegram failure does not block execution.
-19. The smoke workflow can run for a configured 30-120 minute window.
-20. The smoke workflow writes a Markdown report with observations and failures.
-21. Smoke run issue collection does not mutate strategy parameters or live settings.
-22. No remote open, remote parameter edit, remote model debug, or remote shell path exists.
+10. `/pnl` shows `realized=n/a` and `total=n/a` when realized PnL is unreliable.
+11. `/stop` writes a `stop` control command and audit event.
+12. Rust consumes `stop`, sets `operator_stop:global=active`, and blocks new opening exposure.
+13. `/resume` writes a `resume` control command and audit event.
+14. Rust consumes `resume` and clears `operator_stop:global`.
+15. `/cancel_all` is accepted by the migrated schema.
+16. Rust consumes `cancel_all`, cancels only system-owned SQLite working orders, and audits the result.
+17. `/close_all` without confirmation does not write a `close_all` command.
+18. `/confirm <code>` writes `close_all` only for the same whitelisted user before expiry.
+19. Wrong, expired, replayed, and cross-user confirmation attempts are rejected and audited.
+20. Rust consumes `close_all`, cancels system-owned orders, closes only system-owned positions, skips imported/manual positions, reconciles, and audits success or failure.
+21. Rust processes pending control commands before opening `trade_intents`.
+22. Control command processing is idempotent by `command_id`.
+23. Telegram failure does not block execution.
+24. The smoke workflow can run for a configured 30-120 minute window.
+25. The smoke workflow writes a Markdown report with observations and failures.
+26. Smoke run issue collection does not mutate strategy parameters or live settings.
+27. No remote open, remote parameter edit, remote model debug, or remote shell path exists.
 
 ## Final M6 Shape
 
