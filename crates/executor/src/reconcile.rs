@@ -64,6 +64,17 @@ fn system_opened_at(
     symbol: &str,
 ) -> Result<Option<String>> {
     use rusqlite::params;
+    let from_position: Option<String> = conn
+        .query_row(
+            "select opened_at from positions where symbol = ? and opened_at is not null",
+            params![symbol],
+            |row| row.get(0),
+        )
+        .ok()
+        .flatten();
+    if from_position.is_some() {
+        return Ok(from_position);
+    }
     let from_intent: Option<String> = conn
         .query_row(
             "select created_at from trade_intents where intent_id = ?",
@@ -1405,6 +1416,50 @@ mod tests {
             classified.opened_at.as_deref(),
             Some("2026-06-15T00:00:00Z"),
             "an existing opened_at must be preserved across reconcile"
+        );
+    }
+
+    #[test]
+    fn system_position_preserves_local_opened_at_when_exchange_row_omits_it() {
+        let conn = exec_db();
+        db::upsert_position(
+            &conn,
+            &PositionRecord {
+                symbol: "ETH/USDT:USDT".to_string(),
+                side: "long".to_string(),
+                notional: 150.0,
+                entry_price: 3000.0,
+                unrealized_pnl: 0.0,
+                ownership: "system".to_string(),
+                opened_at: Some("2026-06-15T00:00:00Z".to_string()),
+                adopted_at: None,
+                source_intent_id: Some("i-old".to_string()),
+                raw_json: "{}".to_string(),
+            },
+        )
+        .unwrap();
+        insert_intent(&conn, "i-newer", "open");
+        insert_order(&conn, "o-newer", "i-newer", "buy", "open", "filled", 0.10);
+
+        let exchange = PositionRecord {
+            symbol: "ETH/USDT:USDT".to_string(),
+            side: "long".to_string(),
+            notional: 300.0,
+            entry_price: 3000.0,
+            unrealized_pnl: 0.0,
+            ownership: "system".to_string(),
+            opened_at: None,
+            adopted_at: None,
+            source_intent_id: None,
+            raw_json: "{}".to_string(),
+        };
+
+        let classified =
+            classify_exchange_position(&conn, exchange, "2026-07-02T00:00:00Z").unwrap();
+
+        assert_eq!(
+            classified.opened_at.as_deref(),
+            Some("2026-06-15T00:00:00Z")
         );
     }
 
