@@ -879,7 +879,7 @@ fn sync_missing_exchange_position(
 ) -> Result<bool> {
     let (sys_base, _sys_side) = db::system_net_base_for_symbol(conn, symbol)?;
     db::clear_local_position(conn, symbol)?;
-    if !detect_override || sys_base.abs() <= f64::EPSILON {
+    if !detect_override || sys_base.abs() <= DUST_BASE {
         return Ok(false);
     }
     db::mark_system_orders_externally_closed(conn, symbol)?;
@@ -1280,6 +1280,55 @@ mod tests {
             )
             .unwrap();
         assert_eq!(position_count, 0);
+        assert!(!notify);
+        assert!(!override_active);
+        assert!(!entered_this_run);
+        assert_eq!(
+            db::get_executor_state(&conn, "manual_override:ETHUSDT").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn missing_exchange_position_ignores_system_net_dust() {
+        let conn = exec_db();
+        conn.execute(
+            "insert into trade_intents (intent_id, created_at, symbol, side, action,
+               target_notional, max_order_notional, status, source)
+             values ('i-dust', '2026-07-01T00:00:00Z', 'ETHUSDT', 'long', 'open', 100, 100,
+               'executed', 't')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "insert into orders (order_id, client_oid, intent_id, symbol, side, action,
+               order_type, status, price, size, filled_size, created_at, updated_at)
+             values ('o-dust', 'o-dust', 'i-dust', 'ETHUSDT', 'buy', 'open', 'limit',
+               'filled', 3000, ?1, ?1, '2026-07-01T00:00:00Z', '2026-07-01T00:00:00Z')",
+            rusqlite::params![DUST_BASE / 2.0],
+        )
+        .unwrap();
+        let mut override_active = false;
+        let mut entered_this_run = false;
+
+        let notify = sync_missing_exchange_position(
+            &conn,
+            "ETHUSDT",
+            "manual_override:ETHUSDT",
+            true,
+            &mut override_active,
+            &mut entered_this_run,
+        )
+        .unwrap();
+
+        let status: String = conn
+            .query_row(
+                "select status from orders where order_id='o-dust'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "filled");
         assert!(!notify);
         assert!(!override_active);
         assert!(!entered_this_run);
