@@ -150,6 +150,15 @@ fn classify_position_drift(
     }
 }
 
+/// True iff an /all-position row belongs to the configured symbol. /all-position
+/// returns every position for the productType, so a BTCUSDT row must NOT be
+/// adopted as our ETHUSDT position nor set exchange_has_position (which would
+/// mask a manual full-close of ETH). Pure over the JSON row so the filter is
+/// unit-testable without the async REST harness.
+fn position_row_is_ours(row: &serde_json::Value, bitget_symbol: &str) -> bool {
+    row.get("symbol").and_then(serde_json::Value::as_str) == Some(bitget_symbol)
+}
+
 const DUST_BASE: f64 = 1e-6;
 
 /// Verdict for a local 'submitted' system order that the exchange no longer lists
@@ -587,6 +596,14 @@ pub async fn reconcile_once(
         .cloned()
         .unwrap_or_default()
     {
+        // /all-position returns every position for the productType (ETHUSDT,
+        // BTCUSDT, ...), not just ours. Skip foreign-symbol rows so we don't
+        // mislabel a BTC position as ETHUSDT nor let it set
+        // exchange_has_position (which would mask a manual full-close of ETH).
+        // Mirrors the open-orders symbol filter above.
+        if !position_row_is_ours(&row, rest.bitget_symbol()) {
+            continue;
+        }
         let symbol = rest.bitget_symbol().to_string();
         let size = row
             .get("total")
@@ -1262,6 +1279,27 @@ mod tests {
             classified.opened_at.as_deref(),
             Some("2026-06-15T00:00:00Z"),
             "an existing opened_at must be preserved across reconcile"
+        );
+    }
+
+    #[test]
+    fn all_position_foreign_symbol_row_is_not_ours() {
+        // /all-position returns every position for the productType. A BTCUSDT row
+        // must NOT be adopted as our ETHUSDT position nor set
+        // exchange_has_position (which would mask a manual full-close of ETH).
+        // The loop skips rows where position_row_is_ours is false.
+        let eth_row = serde_json::json!({"symbol": "ETHUSDT", "total": "0.1", "holdSide": "long"});
+        let btc_row = serde_json::json!({"symbol": "BTCUSDT", "total": "0.2", "holdSide": "long"});
+        let missing_row = serde_json::json!({"total": "0.3", "holdSide": "long"});
+
+        assert!(position_row_is_ours(&eth_row, "ETHUSDT"));
+        assert!(
+            !position_row_is_ours(&btc_row, "ETHUSDT"),
+            "a foreign-symbol (BTCUSDT) row must be skipped, not written as ETHUSDT"
+        );
+        assert!(
+            !position_row_is_ours(&missing_row, "ETHUSDT"),
+            "a row with no symbol field must be skipped"
         );
     }
 
