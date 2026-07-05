@@ -48,6 +48,7 @@ pub struct ExecutorConfig {
     pub test_reset_demo_state: bool,
     pub secrets: DemoSecrets,
     pub telegram_bot_token: Option<String>,
+    pub telegram_allowed_user_ids: Vec<String>,
     pub telegram_chat_id: Option<String>,
 }
 
@@ -78,6 +79,7 @@ impl ExecutorConfig {
                 passphrase: "pass".to_string(),
             },
             telegram_bot_token: None,
+            telegram_allowed_user_ids: Vec::new(),
             telegram_chat_id: None,
         }
     }
@@ -128,6 +130,15 @@ pub fn load_env_file(path: &Path) -> Result<HashMap<String, String>> {
     Ok(parse_env_text(&text))
 }
 
+pub fn parse_allowed_user_ids(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,6 +157,14 @@ mod tests {
         assert_eq!(parsed.get("BITGET_DEMO_API_KEY").unwrap(), "key-1");
         assert_eq!(parsed.get("BITGET_DEMO_API_SECRET").unwrap(), "secret-1");
         assert_eq!(parsed.get("BITGET_DEMO_API_PASSPHRASE").unwrap(), "pass-1");
+    }
+
+    #[test]
+    fn allowed_user_ids_parser_trims_and_drops_empty_values() {
+        assert_eq!(
+            parse_allowed_user_ids(" 123, ,456,789 "),
+            vec!["123".to_string(), "456".to_string(), "789".to_string()]
+        );
     }
 
     #[test]

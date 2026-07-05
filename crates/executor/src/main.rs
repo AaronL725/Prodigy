@@ -1,5 +1,7 @@
 use anyhow::{bail, Result};
-use prodigy_executor::config::{load_env_file, DemoSecrets, ExecutorConfig};
+use prodigy_executor::config::{
+    load_env_file, parse_allowed_user_ids, DemoSecrets, ExecutorConfig,
+};
 use prodigy_executor::executor;
 use std::env;
 use std::path::{Path, PathBuf};
@@ -57,6 +59,7 @@ where
         "BITGET_DEMO_API_PASSPHRASE",
         "BITGET_DEMO_PASSPHRASE",
         "TELEGRAM_BOT_TOKEN",
+        "TELEGRAM_ALLOWED_USER_IDS",
         "TELEGRAM_CHAT_ID",
     ] {
         if let Ok(value) = env::var(key) {
@@ -138,6 +141,9 @@ where
         )?,
     };
     cfg.telegram_bot_token = read_optional(&["TELEGRAM_BOT_TOKEN"], env_file);
+    cfg.telegram_allowed_user_ids = read_optional(&["TELEGRAM_ALLOWED_USER_IDS"], env_file)
+        .map(|v| parse_allowed_user_ids(&v))
+        .unwrap_or_default();
     cfg.telegram_chat_id = read_optional(&["TELEGRAM_CHAT_ID"], env_file);
     Ok(ParsedExecutorArgs {
         cfg,
@@ -225,6 +231,19 @@ mod tests {
             parsed.cfg.db_path,
             std::path::PathBuf::from("/tmp/prodigy-test.sqlite")
         );
+    }
+
+    #[test]
+    fn parses_telegram_allowed_user_ids_without_chat_id() {
+        let mut env = fake_env();
+        env.insert("TELEGRAM_BOT_TOKEN".into(), "test-token".into());
+        env.insert("TELEGRAM_ALLOWED_USER_IDS".into(), "123, 456".into());
+
+        let parsed = parse_args_from_env(["prodigy-executor", "--daemon"], &env).unwrap();
+
+        assert_eq!(parsed.cfg.telegram_bot_token.as_deref(), Some("test-token"));
+        assert_eq!(parsed.cfg.telegram_allowed_user_ids, vec!["123", "456"]);
+        assert!(parsed.cfg.telegram_chat_id.is_none());
     }
 
     #[test]
