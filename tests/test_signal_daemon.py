@@ -746,3 +746,54 @@ def test_run_once_skips_when_state_goes_stale_during_refresh(tmp_path):
         assert conn.execute("select count(*) from trade_intents").fetchone()[0] == 0
         key = signal_processed_key("dummy-cycle", "ETHUSDT", "15m", "2026-07-04T10:00:00Z")
         assert get_executor_state(conn, key) is None
+
+
+
+def test_run_once_writes_close_for_system_position_with_reverse_signal(tmp_path):
+    # End-to-end for the M5 close loop after the Rust reconcile opened_at fix:
+    # a SYSTEM position (ownership='system', source_intent_id set, opened_at
+    # populated — exactly what reconcile now writes) must NOT be skipped as
+    # ambiguous, and a reverse signal must produce a close intent.
+    db_path = tmp_path / "prodigy.sqlite"
+    with connect(db_path) as conn:
+        init_db(conn)
+        conn.execute(
+            """
+            insert into equity_snapshots (
+              snapshot_id, created_at, equity, available_margin, unrealized_pnl, realized_pnl_24h
+            ) values ('s1', '2026-07-04T10:15:30Z', 1000, 1000, 0, 0)
+            """
+        )
+        conn.execute(
+            """
+            insert into positions (
+              symbol, side, notional, entry_price, unrealized_pnl,
+              ownership, opened_at, adopted_at, source_intent_id, updated_at
+            ) values (
+              'ETHUSDT', 'long', 300.0, 3000.0, 10.0,
+              'system', '2026-07-01T00:00:00Z', NULL, 'intent-open', '2026-07-04T10:15:30Z'
+            )
+            """
+        )
+        conn.commit()
+
+    result = run_once(
+        RunOnceConfig(
+            db_path=db_path,
+            data_root=tmp_path / "data",
+            research_symbol="ETH/USDT:USDT",
+            exchange_symbol="ETHUSDT",
+            source="dummy-cycle",
+            clock=_clock(),
+            now=pd.Timestamp("2026-07-04T10:16:00Z"),
+            refresh_data=lambda: None,
+            score_loader=lambda: (-0.8, "2026-07-04T10:00:00Z"),
+        )
+    )
+
+    assert result == "close_intent_written"
+    with connect(db_path) as conn:
+        row = conn.execute(
+            "select action, side, target_notional from trade_intents"
+        ).fetchone()
+    assert dict(row) == {"action": "close", "side": "long", "target_notional": 0.0}
