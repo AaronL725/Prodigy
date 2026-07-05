@@ -20,6 +20,7 @@ dependencies = [
 prodigy-data = "prodigy.cli.data:main"
 prodigy-ml = "prodigy.cli.ml:main"
 prodigy-signal = "prodigy.cli.signal:main"
+prodigy-smoke = "prodigy.cli.smoke:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
