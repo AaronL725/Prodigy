@@ -9,6 +9,7 @@
 
 use anyhow::Result;
 use rusqlite::Connection;
+use sha2::{Digest, Sha256};
 
 /// Map a single command line to its read-only reply, or `None` if it isn't a
 /// recognized command (no reply). Remote trading controls are refused.
@@ -239,13 +240,218 @@ fn smoke_report_response(conn: &Connection) -> Result<String> {
     ))
 }
 
+fn audit(conn: &Connection, message: &str, payload_json: &str) -> Result<()> {
+    crate::db::write_event(conn, "info", "telegram", message, payload_json)
+}
+
+fn with_savepoint<T>(
+    conn: &Connection,
+    name: &str,
+    f: impl FnOnce(&Connection) -> Result<T>,
+) -> Result<T> {
+    conn.execute_batch(&format!("savepoint {name}"))?;
+    match f(conn) {
+        Ok(value) => {
+            conn.execute_batch(&format!("release {name}"))?;
+            Ok(value)
+        }
+        Err(err) => {
+            conn.execute_batch(&format!("rollback to {name}"))?;
+            conn.execute_batch(&format!("release {name}"))?;
+            Err(err)
+        }
+    }
+}
+
+fn queue_control_command(conn: &Connection, command: &str, requested_by: &str) -> Result<String> {
+    with_savepoint(conn, "telegram_queue_control", |conn| {
+        let command_id: String =
+            conn.query_row("select lower(hex(randomblob(16)))", [], |r| r.get(0))?;
+        conn.execute(
+            "insert into control_commands (
+               command_id, created_at, command, status, requested_by
+             ) values (?, datetime('now'), ?, 'pending', ?)",
+            rusqlite::params![command_id, command, requested_by],
+        )?;
+        audit(
+            conn,
+            "telegram control command queued",
+            &serde_json::json!({
+                "command_id": command_id,
+                "command": command,
+                "requested_by": requested_by,
+            })
+            .to_string(),
+        )?;
+        Ok(command_id)
+    })
+}
+
+fn sha256_hex(value: &str) -> String {
+    let digest = Sha256::digest(value.as_bytes());
+    digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn start_close_all_confirmation(
+    conn: &Connection,
+    requested_by: &str,
+    now_ms: i64,
+) -> Result<String> {
+    let code: String = conn.query_row("select lower(hex(randomblob(3)))", [], |r| r.get(0))?;
+    let value = serde_json::json!({
+        "status": "pending",
+        "requested_by": requested_by,
+        "code_hash": sha256_hex(&code),
+        "expires_ms": now_ms + 60_000,
+    })
+    .to_string();
+    crate::db::set_executor_state(conn, &format!("close_all_confirm:{requested_by}"), &value)?;
+    audit(
+        conn,
+        "telegram close_all confirmation generated",
+        &serde_json::json!({
+            "requested_by": requested_by,
+            "expires_ms": now_ms + 60_000,
+        })
+        .to_string(),
+    )?;
+    Ok(format!("confirm close_all with /confirm {code}"))
+}
+
+fn confirm_close_all(
+    conn: &Connection,
+    text: &str,
+    requested_by: &str,
+    now_ms: i64,
+) -> Result<String> {
+    let code = text.split_whitespace().nth(1).unwrap_or("");
+    let key = format!("close_all_confirm:{requested_by}");
+    let Some(raw) = crate::db::get_executor_state(conn, &key)? else {
+        audit(
+            conn,
+            "telegram close_all confirmation rejected",
+            &serde_json::json!({
+                "reason": "missing",
+                "requested_by": requested_by,
+            })
+            .to_string(),
+        )?;
+        return Ok("confirmation rejected".to_string());
+    };
+    let value: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(value) => value,
+        Err(_) => {
+            audit(
+                conn,
+                "telegram close_all confirmation rejected",
+                &serde_json::json!({
+                    "reason": "invalid_state",
+                    "requested_by": requested_by,
+                })
+                .to_string(),
+            )?;
+            return Ok("confirmation rejected".to_string());
+        }
+    };
+    if value.get("status").and_then(serde_json::Value::as_str) == Some("used") {
+        audit(
+            conn,
+            "telegram close_all confirmation rejected",
+            &serde_json::json!({
+                "reason": "used",
+                "requested_by": requested_by,
+            })
+            .to_string(),
+        )?;
+        return Ok("confirmation rejected".to_string());
+    }
+    let expires_ms = value
+        .get("expires_ms")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0);
+    let expected = value
+        .get("code_hash")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if now_ms >= expires_ms {
+        audit(
+            conn,
+            "telegram close_all confirmation expired",
+            &serde_json::json!({
+                "reason": "expired",
+                "requested_by": requested_by,
+            })
+            .to_string(),
+        )?;
+        return Ok("confirmation expired".to_string());
+    }
+    if expected != sha256_hex(code) {
+        audit(
+            conn,
+            "telegram close_all confirmation rejected",
+            &serde_json::json!({
+                "reason": "bad_code",
+                "requested_by": requested_by,
+            })
+            .to_string(),
+        )?;
+        return Ok("confirmation rejected".to_string());
+    }
+    let command_id = with_savepoint(conn, "telegram_confirm_close_all", |conn| {
+        let command_id = queue_control_command(conn, "close_all", requested_by)?;
+        audit(
+            conn,
+            "telegram close_all confirmation accepted",
+            &serde_json::json!({
+                "command_id": command_id,
+                "requested_by": requested_by,
+            })
+            .to_string(),
+        )?;
+        crate::db::set_executor_state(
+            conn,
+            &key,
+            &serde_json::json!({
+                "status": "used",
+                "requested_by": requested_by,
+                "command_id": command_id,
+                "used_ms": now_ms,
+            })
+            .to_string(),
+        )?;
+        Ok(command_id)
+    })?;
+    Ok(format!("close_all queued command_id={command_id}"))
+}
+
 fn control_response(
-    _conn: &Connection,
-    _text: &str,
-    _from_user_id: &str,
-    _now_ms: i64,
+    conn: &Connection,
+    text: &str,
+    from_user_id: &str,
+    now_ms: i64,
 ) -> Result<Option<String>> {
-    Ok(Some("control not implemented".to_string()))
+    let command = text.split_whitespace().next().unwrap_or("");
+    match command {
+        "/stop" => Ok(Some(format!(
+            "stop queued command_id={}",
+            queue_control_command(conn, "stop", from_user_id)?
+        ))),
+        "/resume" => Ok(Some(format!(
+            "resume queued command_id={}",
+            queue_control_command(conn, "resume", from_user_id)?
+        ))),
+        "/cancel_all" => Ok(Some(format!(
+            "cancel_all queued command_id={}",
+            queue_control_command(conn, "cancel_all", from_user_id)?
+        ))),
+        "/close_all" => Ok(Some(start_close_all_confirmation(
+            conn,
+            from_user_id,
+            now_ms,
+        )?)),
+        "/confirm" => Ok(Some(confirm_close_all(conn, text, from_user_id, now_ms)?)),
+        _ => Ok(None),
+    }
 }
 
 #[cfg(test)]
@@ -348,6 +554,207 @@ mod tests {
         assert!(response.contains("/status"));
         assert!(response.contains("/trades"));
         assert!(response.contains("/close_all"));
+    }
+
+    #[test]
+    fn stop_resume_and_cancel_all_queue_commands_and_events() {
+        for (text, command) in [
+            ("/stop", "stop"),
+            ("/resume", "resume"),
+            ("/cancel_all", "cancel_all"),
+        ] {
+            let conn = test_conn();
+            let response = operator_response(&conn, text, "123", &["123".to_string()], 1_000)
+                .unwrap()
+                .unwrap();
+            let row = conn
+                .query_row(
+                    "select command, status, requested_by from control_commands",
+                    [],
+                    |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                        ))
+                    },
+                )
+                .unwrap();
+            let event_count: i64 = conn
+                .query_row(
+                    "select count(*) from events where component = 'telegram'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+
+            assert!(response.contains("queued"));
+            assert_eq!(
+                row,
+                (
+                    command.to_string(),
+                    "pending".to_string(),
+                    "123".to_string()
+                )
+            );
+            assert!(event_count >= 1);
+        }
+    }
+
+    #[test]
+    fn close_all_requires_same_user_confirmation_before_queueing() {
+        let conn = test_conn();
+        let first = operator_response(&conn, "/close_all", "123", &["123".to_string()], 10_000)
+            .unwrap()
+            .unwrap();
+        assert!(first.contains("/confirm"));
+        assert_eq!(
+            conn.query_row("select count(*) from control_commands", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap(),
+            0
+        );
+        let raw_state = crate::db::get_executor_state(&conn, "close_all_confirm:123")
+            .unwrap()
+            .unwrap();
+        let state: serde_json::Value = serde_json::from_str(&raw_state).unwrap();
+        assert_eq!(state["requested_by"], "123");
+        assert_eq!(state["expires_ms"], 70_000);
+        assert!(state["code_hash"].as_str().unwrap().len() >= 64);
+
+        let code = first.split_whitespace().last().unwrap().to_string();
+        let second = operator_response(
+            &conn,
+            &format!("/confirm {code}"),
+            "123",
+            &["123".to_string()],
+            20_000,
+        )
+        .unwrap()
+        .unwrap();
+
+        let command = conn
+            .query_row("select command from control_commands", [], |r| {
+                r.get::<_, String>(0)
+            })
+            .unwrap();
+        let accepted_events: i64 = conn
+            .query_row(
+                "select count(*) from events
+                 where component = 'telegram'
+                   and message = 'telegram close_all confirmation accepted'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(second.contains("queued"));
+        assert_eq!(command, "close_all");
+        assert_eq!(accepted_events, 1);
+    }
+
+    #[test]
+    fn close_all_confirmation_rejects_wrong_user_wrong_code_and_expiry() {
+        let conn = test_conn();
+        let first = operator_response(&conn, "/close_all", "123", &["123".to_string()], 10_000)
+            .unwrap()
+            .unwrap();
+        let code = first.split_whitespace().last().unwrap().to_string();
+
+        let wrong_user = operator_response(
+            &conn,
+            &format!("/confirm {code}"),
+            "456",
+            &["123".to_string(), "456".to_string()],
+            20_000,
+        )
+        .unwrap()
+        .unwrap();
+        let wrong_code = operator_response(
+            &conn,
+            "/confirm badbad",
+            "123",
+            &["123".to_string()],
+            20_000,
+        )
+        .unwrap()
+        .unwrap();
+        let expired = operator_response(
+            &conn,
+            &format!("/confirm {code}"),
+            "123",
+            &["123".to_string()],
+            80_001,
+        )
+        .unwrap()
+        .unwrap();
+
+        let command_count: i64 = conn
+            .query_row("select count(*) from control_commands", [], |r| r.get(0))
+            .unwrap();
+        assert!(wrong_user.contains("rejected"));
+        assert!(wrong_code.contains("rejected"));
+        assert!(expired.contains("expired"));
+        assert_eq!(command_count, 0);
+    }
+
+    #[test]
+    fn close_all_confirmation_rejects_replay_and_expiry_boundary() {
+        let conn = test_conn();
+        let first = operator_response(&conn, "/close_all", "123", &["123".to_string()], 10_000)
+            .unwrap()
+            .unwrap();
+        let code = first.split_whitespace().last().unwrap().to_string();
+
+        let at_expiry = operator_response(
+            &conn,
+            &format!("/confirm {code}"),
+            "123",
+            &["123".to_string()],
+            70_000,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(at_expiry.contains("expired"));
+
+        let first = operator_response(&conn, "/close_all", "123", &["123".to_string()], 100_000)
+            .unwrap()
+            .unwrap();
+        let code = first.split_whitespace().last().unwrap().to_string();
+        operator_response(
+            &conn,
+            &format!("/confirm {code}"),
+            "123",
+            &["123".to_string()],
+            110_000,
+        )
+        .unwrap()
+        .unwrap();
+        let replay = operator_response(
+            &conn,
+            &format!("/confirm {code}"),
+            "123",
+            &["123".to_string()],
+            120_000,
+        )
+        .unwrap()
+        .unwrap();
+        let command_count: i64 = conn
+            .query_row("select count(*) from control_commands", [], |r| r.get(0))
+            .unwrap();
+        let rejected_events: i64 = conn
+            .query_row(
+                "select count(*) from events
+                 where component = 'telegram'
+                   and message = 'telegram close_all confirmation rejected'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        assert!(replay.contains("rejected"));
+        assert_eq!(command_count, 1);
+        assert!(rejected_events >= 1);
     }
 
     #[test]
