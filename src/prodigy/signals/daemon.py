@@ -272,15 +272,17 @@ def _parse_utc(value: str | pd.Timestamp) -> pd.Timestamp | None:
     return ts.tz_convert("UTC")
 
 
-def _holding_bars(opened_at: str | None, closed_ts: str, timeframe: str) -> int:
-    # ponytail: spec says skip (no guess) when opened_at can't be read — return 0
-    # so decide_intent's expiry branch never fires for that position.
+def _holding_bars(opened_at: str | None, closed_ts: str, timeframe: str) -> int | None:
+    # Spec: when a position exists but its age (opened_at) can't be read
+    # reliably, the daemon SKIPS rather than guessing — return None so the
+    # caller treats it as an ambiguous-position transient skip (no processed
+    # marker). Only return a concrete bar count when opened_at parses.
     if opened_at is None:
-        return 0
+        return None
     opened = _parse_utc(opened_at)
     closed = _parse_utc(closed_ts)
     if opened is None or closed is None:
-        return 0
+        return None
     return max(0, int((closed - opened) / pd.Timedelta(timeframe)))
 
 
@@ -388,11 +390,16 @@ def run_once(cfg: RunOnceConfig) -> str:
         if reskip is not None:
             return reskip
         position = _position_state(conn, cfg.exchange_symbol)
-        holding_bars = (
-            _holding_bars(position.opened_at, closed_ts, cfg.timeframe)
-            if position is not None
-            else 0
-        )
+        # Spec: if a position exists but its age (opened_at) can't be read
+        # reliably, SKIP rather than guessing — a transient skip that writes NO
+        # processed marker, so the bar is re-evaluated next run. (No position =>
+        # normal open logic; _holding_bars is only consulted when position exists.)
+        if position is not None:
+            holding_bars = _holding_bars(position.opened_at, closed_ts, cfg.timeframe)
+            if holding_bars is None:
+                return "skipped_ambiguous_position"
+        else:
+            holding_bars = 0
         decision = decide_intent(score, position, holding_bars=holding_bars, cfg=cfg.signal_cfg)
         if decision is None:
             set_executor_state(conn, key, "no_signal", now.isoformat())

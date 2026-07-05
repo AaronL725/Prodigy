@@ -344,8 +344,10 @@ def test_run_once_closes_position_via_holding_expiry_from_opened_at(tmp_path):
     }
 
 
-def test_run_once_does_not_guess_holding_bars_when_opened_at_missing(tmp_path):
-    # Spec: when opened_at can't be read, daemon skips rather than guessing age.
+def test_run_once_skips_ambiguous_position_when_opened_at_missing(tmp_path):
+    # Spec: when a position exists but its age (opened_at) can't be read
+    # reliably, the daemon SKIPS rather than guessing — a transient skip that
+    # must NOT write the processed marker (the bar is re-evaluated next run).
     db_path = tmp_path / "prodigy.sqlite"
     with connect(db_path) as conn:
         init_db(conn)
@@ -378,9 +380,53 @@ def test_run_once_does_not_guess_holding_bars_when_opened_at_missing(tmp_path):
         )
     )
 
-    assert result == "no_signal"
+    assert result == "skipped_ambiguous_position"
     with connect(db_path) as conn:
         assert conn.execute("select count(*) from trade_intents").fetchone()[0] == 0
+        key = signal_processed_key("dummy-cycle", "ETHUSDT", "15m", "2026-07-04T10:00:00Z")
+        assert get_executor_state(conn, key) is None
+
+
+def test_run_once_skips_ambiguous_position_when_opened_at_unparseable(tmp_path):
+    # Same skip when opened_at is present but can't be parsed — age is still
+    # unreadable, so the daemon must not guess.
+    db_path = tmp_path / "prodigy.sqlite"
+    with connect(db_path) as conn:
+        init_db(conn)
+        conn.execute(
+            """
+            insert into equity_snapshots (
+              snapshot_id, created_at, equity, available_margin, unrealized_pnl, realized_pnl_24h
+            ) values ('s1', '2026-07-04T10:15:30Z', 1000, 1000, 0, 0)
+            """
+        )
+        conn.execute(
+            """
+            insert into positions (symbol, side, notional, entry_price, unrealized_pnl, opened_at, updated_at)
+            values ('ETHUSDT', 'long', 100.0, 100.0, 1.0, 'not-a-timestamp', '2026-07-04T10:15:30Z')
+            """
+        )
+        conn.commit()
+
+    result = run_once(
+        RunOnceConfig(
+            db_path=db_path,
+            data_root=tmp_path / "data",
+            research_symbol="ETH/USDT:USDT",
+            exchange_symbol="ETHUSDT",
+            source="dummy-cycle",
+            clock=_clock(),
+            now=pd.Timestamp("2026-07-04T10:16:00Z"),
+            refresh_data=lambda: None,
+            score_loader=lambda: (0.1, "2026-07-04T10:00:00Z"),
+        )
+    )
+
+    assert result == "skipped_ambiguous_position"
+    with connect(db_path) as conn:
+        assert conn.execute("select count(*) from trade_intents").fetchone()[0] == 0
+        key = signal_processed_key("dummy-cycle", "ETHUSDT", "15m", "2026-07-04T10:00:00Z")
+        assert get_executor_state(conn, key) is None
 
 
 def _seed_fresh_equity(db_path):
