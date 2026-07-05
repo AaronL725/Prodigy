@@ -1,10 +1,8 @@
-//! Read-only Telegram query formatting (M4).
+//! SQLite-backed Telegram query formatting.
 //!
 //! Maps the operator's `/status /positions /orders /pnl /risk` commands to
-//! short SQLite-backed replies. These are STRICTLY read-only: no rows are
-//! written, no side effects on the trading system. `/stop /resume /close_all`
-//! are explicit non-grata in M4 — remote trading control is forbidden, so
-//! they get a fixed "not supported in M4" refusal rather than acting.
+//! short SQLite-backed replies. `query_response` keeps the M4 read-only
+//! behavior; `operator_response` adds M6 authorization and operator commands.
 //!
 //! `query_response` returns `Ok(None)` for anything that isn't a recognized
 //! command, so the polling loop simply doesn't reply to noise.
@@ -27,6 +25,54 @@ pub fn query_response(conn: &Connection, text: &str) -> Result<Option<String>> {
         )),
         _ => Ok(None),
     }
+}
+
+pub fn operator_response(
+    conn: &Connection,
+    text: &str,
+    from_user_id: &str,
+    allowed_user_ids: &[String],
+    now_ms: i64,
+) -> Result<Option<String>> {
+    let command = text.split_whitespace().next().unwrap_or("");
+    if command.is_empty() {
+        return Ok(None);
+    }
+    if !allowed_user_ids.iter().any(|id| id == from_user_id) {
+        crate::db::write_event(
+            conn,
+            "warning",
+            "telegram",
+            "unauthorized telegram command",
+            &serde_json::json!({
+                "from_user_id": from_user_id,
+                "command": command,
+            })
+            .to_string(),
+        )
+        .ok();
+        return Ok(Some("unauthorized".to_string()));
+    }
+    match command {
+        "/help" => Ok(Some(help_response())),
+        "/status" => Ok(Some(status_response(conn)?)),
+        "/positions" => Ok(Some(positions_response(conn)?)),
+        "/orders" => Ok(Some(orders_response(conn)?)),
+        "/trades" => Ok(Some(trades_response(conn)?)),
+        "/pnl" => Ok(Some(pnl_response(conn)?)),
+        "/risk" => Ok(Some(risk_response(conn)?)),
+        "/events" => Ok(Some(events_response(conn)?)),
+        "/smoke_status" => Ok(Some(smoke_status_response(conn)?)),
+        "/smoke_report" => Ok(Some(smoke_report_response(conn)?)),
+        "/stop" | "/resume" | "/cancel_all" | "/close_all" | "/confirm" => {
+            control_response(conn, text, from_user_id, now_ms)
+        }
+        _ => Ok(None),
+    }
+}
+
+fn help_response() -> String {
+    "/help /status /positions /orders /trades /pnl /risk /events /smoke_status /smoke_report\ncontrols: /stop /resume /cancel_all /close_all /confirm <code>".to_string()
 }
 
 fn status_response(conn: &Connection) -> Result<String> {
@@ -90,6 +136,30 @@ fn orders_response(conn: &Connection) -> Result<String> {
     })
 }
 
+fn trades_response(conn: &Connection) -> Result<String> {
+    let mut stmt = conn.prepare(
+        "select symbol, side, price, size, fee, created_at
+         from fills order by created_at desc limit 10",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(format!(
+            "{} {} price={} size={} fee={} at={}",
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, f64>(2)?,
+            row.get::<_, f64>(3)?,
+            row.get::<_, f64>(4)?,
+            row.get::<_, String>(5)?,
+        ))
+    })?;
+    let lines = rows.collect::<Result<Vec<_>, _>>()?;
+    Ok(if lines.is_empty() {
+        "trades: none".to_string()
+    } else {
+        lines.join("\n")
+    })
+}
+
 fn pnl_response(conn: &Connection) -> Result<String> {
     let unrealized: f64 = conn.query_row(
         "select coalesce(sum(unrealized_pnl), 0) from positions",
@@ -103,13 +173,9 @@ fn pnl_response(conn: &Connection) -> Result<String> {
             |r| r.get(0),
         )
         .ok();
-    // ponytail: M4 /pnl is unrealized-only — it does NOT report realized PnL. Realized
-    // PnL per closed trade is a future-milestone concern (it needs the per-trade fills
-    // ledger aggregated by close intent); M4 surfaces only live unrealized PnL + the
-    // last REST equity snapshot. Saying so explicitly so an operator isn't misled into
-    // treating this as total account PnL.
+    // ponytail: no realized-PnL ledger yet; report unknown instead of implying total PnL.
     Ok(format!(
-        "pnl (unrealized-only, M4):\nunrealized={unrealized}\nequity={}\nrealized=n/a (not tracked in M4)",
+        "pnl:\nunrealized={unrealized}\nequity={}\nrealized=n/a\ntotal=n/a",
         equity.unwrap_or(0.0)
     ))
 }
@@ -132,6 +198,54 @@ fn risk_response(conn: &Connection) -> Result<String> {
         "risk:\nmanual_overrides={manual_overrides}\navailable_margin={}",
         available_margin.unwrap_or(0.0)
     ))
+}
+
+fn events_response(conn: &Connection) -> Result<String> {
+    let mut stmt = conn.prepare(
+        "select created_at, severity, component, message
+         from events
+         where severity in ('warning', 'error', 'critical')
+         order by created_at desc limit 10",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(format!(
+            "{} {} {}: {}",
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+        ))
+    })?;
+    let lines = rows.collect::<Result<Vec<_>, _>>()?;
+    Ok(if lines.is_empty() {
+        "events: none".to_string()
+    } else {
+        lines.join("\n")
+    })
+}
+
+fn smoke_status_response(conn: &Connection) -> Result<String> {
+    Ok(format!(
+        "smoke_status: {}",
+        crate::db::get_executor_state(conn, "smoke:status")?.unwrap_or_else(|| "n/a".to_string())
+    ))
+}
+
+fn smoke_report_response(conn: &Connection) -> Result<String> {
+    Ok(format!(
+        "smoke_report: {}",
+        crate::db::get_executor_state(conn, "smoke:last_report")?
+            .unwrap_or_else(|| "n/a".to_string())
+    ))
+}
+
+fn control_response(
+    _conn: &Connection,
+    _text: &str,
+    _from_user_id: &str,
+    _now_ms: i64,
+) -> Result<Option<String>> {
+    Ok(Some("control not implemented".to_string()))
 }
 
 #[cfg(test)]
@@ -200,12 +314,88 @@ mod tests {
     }
 
     #[test]
-    fn remote_control_commands_are_not_supported_in_m4() {
-        for command in ["/stop", "/resume", "/close_all"] {
-            let conn = test_conn();
-            let response = query_response(&conn, command).unwrap().unwrap();
-            assert!(response.contains("not supported in M4"));
-        }
+    fn unauthorized_user_gets_no_sqlite_state_and_no_control() {
+        let conn = test_conn();
+        let response = operator_response(&conn, "/bad\"cmd", "999", &["123".to_string()], 1_000)
+            .unwrap()
+            .unwrap();
+
+        let command_count: i64 = conn
+            .query_row("select count(*) from control_commands", [], |r| r.get(0))
+            .unwrap();
+        let payload: String = conn
+            .query_row(
+                "select payload_json from events where component = 'telegram'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&payload).unwrap();
+
+        assert!(response.contains("unauthorized"));
+        assert_eq!(command_count, 0);
+        assert_eq!(parsed["from_user_id"], "999");
+        assert_eq!(parsed["command"], "/bad\"cmd");
+    }
+
+    #[test]
+    fn help_lists_m6_commands_for_allowed_user() {
+        let conn = test_conn();
+        let response = operator_response(&conn, "/help", "123", &["123".to_string()], 1_000)
+            .unwrap()
+            .unwrap();
+
+        assert!(response.contains("/status"));
+        assert!(response.contains("/trades"));
+        assert!(response.contains("/close_all"));
+    }
+
+    #[test]
+    fn trades_query_reads_recent_fills() {
+        let conn = test_conn();
+        conn.execute(
+            "insert into orders (
+               order_id, client_oid, intent_id, symbol, side, action, order_type,
+               status, price, size, filled_size, created_at, updated_at
+             ) values (
+               'order-1', 'client-1', null, 'ETHUSDT', 'buy', 'open',
+               'market', 'filled', 2000.0, 0.1, 0.1, '2026-07-06T00:00:00Z', '2026-07-06T00:00:00Z'
+             )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "insert into fills (
+               fill_id, order_id, symbol, side, price, size, fee, created_at,
+               trade_id, client_oid, raw_json
+             ) values (
+               'fill-1', 'order-1', 'ETHUSDT', 'buy', 2000.0, 0.1, 0.2,
+               '2026-07-06T00:00:01Z', 'trade-1', 'client-1', '{}'
+             )",
+            [],
+        )
+        .unwrap();
+
+        let response = operator_response(&conn, "/trades", "123", &["123".to_string()], 1_000)
+            .unwrap()
+            .unwrap();
+
+        assert!(response.contains("ETHUSDT"));
+        assert!(response.contains("buy"));
+        assert!(response.contains("fee=0.2"));
+    }
+
+    #[test]
+    fn pnl_query_is_conservative_about_realized_and_total() {
+        let conn = test_conn();
+        crate::db::insert_equity_snapshot(&conn, 1000.0, 500.0, 0.0, 0.0).unwrap();
+
+        let response = operator_response(&conn, "/pnl", "123", &["123".to_string()], 1_000)
+            .unwrap()
+            .unwrap();
+
+        assert!(response.contains("realized=n/a"));
+        assert!(response.contains("total=n/a"));
     }
 
     #[test]
