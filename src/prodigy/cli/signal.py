@@ -52,6 +52,8 @@ def build_signal_daemon_config(signal_cfg: dict) -> SignalDaemonConfig:
         min_order_fraction=signal_cfg["min_order_fraction"],
         max_order_fraction=signal_cfg["max_order_fraction"],
         max_holding_bars=signal_cfg["max_holding_bars"],
+        profit_hold_score_threshold=signal_cfg["profit_hold_score_threshold"],
+        loss_hold_score_threshold=signal_cfg["loss_hold_score_threshold"],
     )
 
 
