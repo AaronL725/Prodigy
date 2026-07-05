@@ -4,6 +4,7 @@ import argparse
 import os
 import signal
 import subprocess
+import sys
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -107,7 +108,7 @@ def _commands(db_path: Path) -> list[tuple[str, list[str]]]:
             "prodigy-executor",
             ["cargo", "run", "-q", "-p", "prodigy-executor", "--", "--daemon", "--db", db],
         ),
-        ("prodigy-signal", ["prodigy-signal", "--daemon", "--db", db]),
+        ("prodigy-signal", [sys.executable, "-m", "prodigy.cli.signal", "--daemon", "--db", db]),
     ]
 
 

@@ -212,3 +212,15 @@ def test_smoke_start_process_uses_process_group_on_posix():
         assert calls[0][1]["start_new_session"] is True
     else:
         assert "start_new_session" not in calls[0][1]
+
+
+def test_smoke_commands_run_signal_with_current_python_module(tmp_path):
+    from prodigy.cli import smoke
+
+    commands = dict(smoke._commands(tmp_path / "prodigy.sqlite"))
+
+    assert commands["prodigy-signal"][:3] == [
+        smoke.sys.executable,
+        "-m",
+        "prodigy.cli.signal",
+    ]
