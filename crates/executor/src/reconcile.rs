@@ -361,7 +361,7 @@ pub async fn reconcile_once(
         // intervention. Enter per-symbol override (persisted) so auto-open pauses.
         // Skipped in test-reset mode (system cleanup, not user intervention).
         if detect_override && !override_active {
-            let mut state = override_state_from(override_active);
+            let mut state = override_state_from(override_active, &symbol);
             if let crate::manual_override::ManualOverrideDecision::Entered(sym) =
                 apply_exchange_intervention(
                     &mut state,
@@ -784,7 +784,7 @@ pub async fn reconcile_once(
                 })
                 .unwrap_or(0.0)
         };
-        let mut state = override_state_from(true);
+        let mut state = override_state_from(true, &symbol);
         if let crate::manual_override::ManualOverrideDecision::Cleared(sym) =
             crate::manual_override::maybe_clear_manual_override(
                 &mut state,
@@ -898,10 +898,10 @@ fn sync_missing_exchange_position(
 /// Build the in-memory override state from the persisted flag. The detection
 /// functions need a ManualOverrideState; we seed it from executor_state so the
 /// "already blocked → NoChange" path holds across restarts.
-fn override_state_from(active: bool) -> crate::manual_override::ManualOverrideState {
+fn override_state_from(active: bool, symbol: &str) -> crate::manual_override::ManualOverrideState {
     let mut s = crate::manual_override::ManualOverrideState::default();
     if active {
-        s.enter("ETH/USDT:USDT");
+        s.enter(symbol);
     }
     s
 }
@@ -1275,6 +1275,16 @@ mod tests {
         assert_eq!(
             db::get_executor_state(&conn, "manual_override:ETHUSDT").unwrap(),
             None
+        );
+    }
+
+    #[test]
+    fn override_state_seeds_actual_execution_symbol_for_auto_clear() {
+        let mut state = override_state_from(true, "ETHUSDT");
+
+        assert_eq!(
+            crate::manual_override::maybe_clear_manual_override(&mut state, "ETHUSDT", 0.0, 0),
+            crate::manual_override::ManualOverrideDecision::Cleared("ETHUSDT".to_string())
         );
     }
 
