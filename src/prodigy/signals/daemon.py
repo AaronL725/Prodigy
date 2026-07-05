@@ -221,6 +221,16 @@ def try_write_signal_event(db_path: str | Path, severity: str, message: str) -> 
         print(f"prodigy-signal: event write failed ({severity}): {exc}", file=sys.stderr)
 
 
+def is_transient_sqlite_error(exc: sqlite3.OperationalError) -> bool:
+    msg = str(exc).lower()
+    return "locked" in msg or "busy" in msg
+
+
+def _skip_transient_sqlite(db_path: str | Path, exc: sqlite3.OperationalError) -> str:
+    try_write_signal_event(db_path, "warning", f"sqlite transient error: {exc}")
+    return "error_sqlite_busy"
+
+
 def _normalize_closed_ts(value: str, timeframe: str) -> str:
     # Compare apples to apples: run_once builds closed_ts as an ISO "Z" string
     # floored to the timeframe boundary. The score loader reports whatever ts
@@ -330,20 +340,25 @@ def run_once(cfg: RunOnceConfig) -> str:
     closed_ts = expected_closed_bar_ts(now, cfg.timeframe)
     key = signal_processed_key(cfg.source, cfg.exchange_symbol, cfg.timeframe, closed_ts)
 
-    with connect(cfg.db_path) as conn:
-        init_db(conn)
-        # M5 limitation: the processed-key check below and the marker write in
-        # process_decision happen on SEPARATE connections (refresh/score run
-        # with no handle held), so two concurrent prodigy-signal instances could
-        # both pass this check and double-write an intent for one bar. M5 is a
-        # single-instance demo daemon by design; serial calls are idempotent
-        # (test_run_once_is_idempotent_per_closed_bar). A multi-instance
-        # deployment would need BEGIN IMMEDIATE re-check inside the write
-        # transaction — out of M5 scope (and it would contend with the Rust
-        # executor's WAL writes on the same DB).
-        pre = _gate_skip(conn, cfg, key, cfg.clock(), check_already_processed=True)
-        if pre is not None:
-            return pre
+    try:
+        with connect(cfg.db_path) as conn:
+            init_db(conn)
+            # M5 limitation: the processed-key check below and the marker write in
+            # process_decision happen on SEPARATE connections (refresh/score run
+            # with no handle held), so two concurrent prodigy-signal instances could
+            # both pass this check and double-write an intent for one bar. M5 is a
+            # single-instance demo daemon by design; serial calls are idempotent
+            # (test_run_once_is_idempotent_per_closed_bar). A multi-instance
+            # deployment would need BEGIN IMMEDIATE re-check inside the write
+            # transaction — out of M5 scope (and it would contend with the Rust
+            # executor's WAL writes on the same DB).
+            pre = _gate_skip(conn, cfg, key, cfg.clock(), check_already_processed=True)
+            if pre is not None:
+                return pre
+    except sqlite3.OperationalError as exc:
+        if is_transient_sqlite_error(exc):
+            return _skip_transient_sqlite(cfg.db_path, exc)
+        raise
 
     # ponytail: spec error handling — refresh/factor errors must write an event
     # and skip this run, NOT crash (the daemon must not crash the Rust executor;
@@ -378,43 +393,48 @@ def run_once(cfg: RunOnceConfig) -> str:
         )
         return "skipped_stale_data"
 
-    with connect(cfg.db_path) as conn:
-        init_db(conn)
-        # TOCTOU re-check: refresh + score ran outside this transaction and can
-        # take seconds; a manual_override, pending intent, unfinished order, or
-        # stale state that appeared during that window must still block the
-        # write. already_processed is owned by the caller (it can't change
-        # within a single run_once), so the re-check excludes it. None of these
-        # transient skips writes the processed marker.
-        reskip = _gate_skip(conn, cfg, key, cfg.clock(), check_already_processed=False)
-        if reskip is not None:
-            return reskip
-        position = _position_state(conn, cfg.exchange_symbol)
-        # Spec: if a position exists but its age (opened_at) can't be read
-        # reliably, SKIP rather than guessing — a transient skip that writes NO
-        # processed marker, so the bar is re-evaluated next run. (No position =>
-        # normal open logic; _holding_bars is only consulted when position exists.)
-        if position is not None:
-            holding_bars = _holding_bars(position.opened_at, closed_ts, cfg.timeframe)
-            if holding_bars is None:
-                return "skipped_ambiguous_position"
-        else:
-            holding_bars = 0
-        decision = decide_intent(score, position, holding_bars=holding_bars, cfg=cfg.signal_cfg)
-        if decision is None:
-            set_executor_state(conn, key, "no_signal", now.isoformat())
-            conn.commit()
-            return "no_signal"
-        process_decision(
-            conn=conn,
-            decision=decision,
-            processed_key=key,
-            created_at=now.isoformat().replace("+00:00", "Z"),
-            symbol=cfg.exchange_symbol,
-            source=cfg.source,
-            model_version=cfg.source,
-        )
-        return "open_intent_written" if decision.action == "open" else "close_intent_written"
+    try:
+        with connect(cfg.db_path) as conn:
+            init_db(conn)
+            # TOCTOU re-check: refresh + score ran outside this transaction and can
+            # take seconds; a manual_override, pending intent, unfinished order, or
+            # stale state that appeared during that window must still block the
+            # write. already_processed is owned by the caller (it can't change
+            # within a single run_once), so the re-check excludes it. None of these
+            # transient skips writes the processed marker.
+            reskip = _gate_skip(conn, cfg, key, cfg.clock(), check_already_processed=False)
+            if reskip is not None:
+                return reskip
+            position = _position_state(conn, cfg.exchange_symbol)
+            # Spec: if a position exists but its age (opened_at) can't be read
+            # reliably, SKIP rather than guessing — a transient skip that writes NO
+            # processed marker, so the bar is re-evaluated next run. (No position =>
+            # normal open logic; _holding_bars is only consulted when position exists.)
+            if position is not None:
+                holding_bars = _holding_bars(position.opened_at, closed_ts, cfg.timeframe)
+                if holding_bars is None:
+                    return "skipped_ambiguous_position"
+            else:
+                holding_bars = 0
+            decision = decide_intent(score, position, holding_bars=holding_bars, cfg=cfg.signal_cfg)
+            if decision is None:
+                set_executor_state(conn, key, "no_signal", now.isoformat())
+                conn.commit()
+                return "no_signal"
+            process_decision(
+                conn=conn,
+                decision=decision,
+                processed_key=key,
+                created_at=now.isoformat().replace("+00:00", "Z"),
+                symbol=cfg.exchange_symbol,
+                source=cfg.source,
+                model_version=cfg.source,
+            )
+            return "open_intent_written" if decision.action == "open" else "close_intent_written"
+    except sqlite3.OperationalError as exc:
+        if is_transient_sqlite_error(exc):
+            return _skip_transient_sqlite(cfg.db_path, exc)
+        raise
 
 
 def load_example_score(

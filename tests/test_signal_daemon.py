@@ -690,6 +690,72 @@ def test_run_once_does_not_crash_when_event_write_fails(tmp_path, monkeypatch):
         assert get_executor_state(conn, key) is None
 
 
+def test_run_once_skips_when_sqlite_busy_before_refresh(tmp_path, monkeypatch):
+    import prodigy.signals.daemon as daemon_mod
+
+    db_path = tmp_path / "prodigy.sqlite"
+    refresh_called = {"v": False}
+
+    def locked(_db_path):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(daemon_mod, "connect", locked)
+
+    result = run_once(
+        RunOnceConfig(
+            db_path=db_path,
+            data_root=tmp_path / "data",
+            research_symbol="ETH/USDT:USDT",
+            exchange_symbol="ETHUSDT",
+            source="dummy-cycle",
+            clock=_clock(),
+            now=pd.Timestamp("2026-07-04T10:16:00Z"),
+            refresh_data=lambda: refresh_called.__setitem__("v", True),
+            score_loader=lambda: (1.0, "2026-07-04T10:00:00Z"),
+        )
+    )
+
+    assert result == "error_sqlite_busy"
+    assert refresh_called["v"] is False
+
+
+def test_run_once_skips_when_sqlite_busy_during_write_recheck(tmp_path, monkeypatch):
+    import prodigy.signals.daemon as daemon_mod
+
+    db_path = tmp_path / "prodigy.sqlite"
+    _seed_fresh_equity(db_path)
+    real_connect = daemon_mod.connect
+    calls = {"n": 0}
+
+    def locked_on_write_recheck(db_path):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise sqlite3.OperationalError("database is locked")
+        return real_connect(db_path)
+
+    monkeypatch.setattr(daemon_mod, "connect", locked_on_write_recheck)
+
+    result = run_once(
+        RunOnceConfig(
+            db_path=db_path,
+            data_root=tmp_path / "data",
+            research_symbol="ETH/USDT:USDT",
+            exchange_symbol="ETHUSDT",
+            source="dummy-cycle",
+            clock=_clock(),
+            now=pd.Timestamp("2026-07-04T10:16:00Z"),
+            refresh_data=lambda: None,
+            score_loader=lambda: (1.0, "2026-07-04T10:00:00Z"),
+        )
+    )
+
+    assert result == "error_sqlite_busy"
+    with real_connect(db_path) as conn:
+        assert conn.execute("select count(*) from trade_intents").fetchone()[0] == 0
+        key = signal_processed_key("dummy-cycle", "ETHUSDT", "15m", "2026-07-04T10:00:00Z")
+        assert get_executor_state(conn, key) is None
+
+
 def test_run_once_skips_when_state_goes_stale_during_refresh(tmp_path):
     # TOCTOU for the FRESHNESS gate: the snapshot is fresh at run-start, but
     # refresh/score take real seconds and the snapshot can age past

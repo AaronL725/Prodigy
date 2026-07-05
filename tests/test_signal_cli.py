@@ -219,6 +219,38 @@ def test_daemon_loop_stops_without_extra_run_once_after_sleep(tmp_path):
     )
 
 
+def test_daemon_loop_skips_transient_sqlite_run_once_error(tmp_path, monkeypatch, capsys):
+    import sqlite3
+
+    import prodigy.cli.signal as signal_mod
+    from prodigy.cli.signal import build_parser, run_daemon_loop
+
+    db_path = tmp_path / "prodigy.sqlite"
+    args = build_parser().parse_args(
+        ["--daemon", "--max-loops", "1", "--db", str(db_path)]
+    )
+    signal_cfg = load_config("configs/default.toml")["signal"]
+
+    def locked(_cfg):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(signal_mod, "run_once", locked)
+
+    rc = run_daemon_loop(
+        args,
+        signal_cfg=signal_cfg,
+        db_path=db_path,
+        source="dummy-cycle",
+        refresh_data=lambda: None,
+        score_loader=lambda: (1.0, "2026-07-04T10:00:00Z"),
+        stop_flag=lambda: False,
+        sleep=lambda _s: None,
+    )
+
+    assert rc == 0
+    assert "error_sqlite_busy" in capsys.readouterr().out
+
+
 def test_resolve_signal_source_prefers_cli_then_config():
     from prodigy.cli.signal import resolve_signal_source
 

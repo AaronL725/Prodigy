@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import signal as os_signal
+import sqlite3
 import sys
 import time
 from typing import Callable
@@ -14,6 +15,7 @@ from prodigy.signals.daemon import (
     RunOnceConfig,
     SignalDaemonConfig,
     expected_closed_bar_ts,
+    is_transient_sqlite_error,
     load_example_score,
     run_once,
     try_write_signal_event,
@@ -102,21 +104,29 @@ def run_daemon_loop(
             # Skipped for --once, which is a one-shot run with no stop source.
             if not args.once and stop_flag():
                 break
-            result = run_once(
-                RunOnceConfig(
-                    db_path=db_path,
-                    data_root=args.data_root,
-                    research_symbol=research_symbol,
-                    exchange_symbol=exchange_symbol,
-                    source=source,
-                    now=now_factory(),
-                    refresh_data=refresh_data,
-                    score_loader=score_loader,
-                    signal_cfg=signal_daemon_cfg,
-                    max_state_age_secs=signal_cfg["max_state_age_secs"],
-                    clock=clock,
+            try:
+                result = run_once(
+                    RunOnceConfig(
+                        db_path=db_path,
+                        data_root=args.data_root,
+                        research_symbol=research_symbol,
+                        exchange_symbol=exchange_symbol,
+                        source=source,
+                        now=now_factory(),
+                        refresh_data=refresh_data,
+                        score_loader=score_loader,
+                        signal_cfg=signal_daemon_cfg,
+                        max_state_age_secs=signal_cfg["max_state_age_secs"],
+                        clock=clock,
+                    )
                 )
-            )
+            except sqlite3.OperationalError as exc:
+                if not is_transient_sqlite_error(exc):
+                    raise
+                try_write_signal_event(
+                    db_path, "warning", f"sqlite transient error: {exc}"
+                )
+                result = "error_sqlite_busy"
             print(result)
             count += 1
             if args.once:
