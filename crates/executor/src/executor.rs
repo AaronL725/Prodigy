@@ -140,6 +140,14 @@ pub async fn process_pending_intents_once(
     let intents = db::pending_intents(conn)?;
     let mut processed = 0usize;
     for intent in intents {
+        if operator_stop_blocks_action(
+            db::get_executor_state(conn, crate::control::OPERATOR_STOP_KEY)?.as_deref(),
+            &intent.action,
+        ) {
+            fail_pending_intent_for_operator_stop(conn, &intent.intent_id)?;
+            continue;
+        }
+
         // Gate FIRST: a stale public WS defers an OPEN before any REST call. The
         // daemon ticks every 250ms; if the WS is down, fetching a REST account
         // snapshot for a pending open each tick would hammer REST for nothing.
@@ -686,6 +694,18 @@ fn is_opening_action(action: &str) -> bool {
     matches!(action, "open" | "add" | "reverse")
 }
 
+fn operator_stop_blocks_action(state_value: Option<&str>, action: &str) -> bool {
+    state_value == Some("active") && is_opening_action(action)
+}
+
+fn fail_pending_intent_for_operator_stop(conn: &Connection, intent_id: &str) -> Result<bool> {
+    if !db::accept_intent(conn, intent_id)? {
+        return Ok(false);
+    }
+    db::fail_intent(conn, intent_id, "operator stop active")?;
+    Ok(true)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OrderMode {
     Maker,
@@ -1043,6 +1063,13 @@ pub async fn process_one_intent(
     market_cache: &mut MarketCache,
 ) -> Result<()> {
     if !db::accept_intent(conn, &intent.intent_id)? {
+        return Ok(());
+    }
+    if operator_stop_blocks_action(
+        db::get_executor_state(conn, crate::control::OPERATOR_STOP_KEY)?.as_deref(),
+        &intent.action,
+    ) {
+        db::fail_intent(conn, &intent.intent_id, "operator stop active")?;
         return Ok(());
     }
     // Reject unsupported actions (reduce/reverse) before any order placement.
@@ -1801,6 +1828,145 @@ mod tests {
         assert!(is_open_blocked(Some("active")));
         assert!(!is_open_blocked(None));
         assert!(!is_open_blocked(Some("cleared")));
+    }
+
+    #[test]
+    fn operator_stop_blocks_only_opening_actions_when_active() {
+        for action in ["open", "add", "reverse"] {
+            assert!(operator_stop_blocks_action(Some("active"), action));
+        }
+        for action in ["close", "reduce", "cancel"] {
+            assert!(!operator_stop_blocks_action(Some("active"), action));
+        }
+        assert!(!operator_stop_blocks_action(Some("cleared"), "open"));
+        assert!(!operator_stop_blocks_action(None, "open"));
+    }
+
+    #[test]
+    fn operator_stop_failure_claims_pending_intent_first() {
+        let conn = memory_db();
+        insert_pending_intent(&conn, "i-stop");
+
+        assert!(fail_pending_intent_for_operator_stop(&conn, "i-stop").unwrap());
+
+        assert_eq!(intent_status(&conn, "i-stop"), "failed");
+        let error: String = conn
+            .query_row(
+                "select error from trade_intents where intent_id = 'i-stop'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(error, "operator stop active");
+        assert!(
+            !db::accept_intent(&conn, "i-stop").unwrap(),
+            "stopped intent must already be terminal after the stop failure"
+        );
+    }
+
+    #[test]
+    fn operator_stop_failure_does_not_overwrite_non_pending_intent() {
+        let conn = memory_db();
+        insert_pending_intent(&conn, "i-done");
+        db::mark_intent_executed(&conn, "i-done").unwrap();
+
+        assert!(!fail_pending_intent_for_operator_stop(&conn, "i-done").unwrap());
+
+        assert_eq!(intent_status(&conn, "i-done"), "executed");
+        let error: Option<String> = conn
+            .query_row(
+                "select error from trade_intents where intent_id = 'i-done'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(error, None);
+    }
+
+    #[tokio::test]
+    async fn process_one_intent_fails_open_under_operator_stop_without_order() {
+        let conn = memory_db();
+        insert_pending_intent(&conn, "i-stop");
+        db::set_executor_state(&conn, crate::control::OPERATOR_STOP_KEY, "active").unwrap();
+        let cfg = ExecutorConfig {
+            rest_base_url: "http://127.0.0.1:9".to_string(),
+            ..ExecutorConfig::demo_for_tests()
+        };
+        let rest = BitgetRestClient::new(cfg.clone()).unwrap();
+        let mut cache = MarketCache::default();
+
+        process_one_intent(
+            &conn,
+            &cfg,
+            &rest,
+            TradeIntent {
+                intent_id: "i-stop".to_string(),
+                symbol: "ETH/USDT:USDT".to_string(),
+                side: "long".to_string(),
+                action: "open".to_string(),
+                target_notional: 100.0,
+                max_order_notional: 100.0,
+            },
+            MarketUpdate {
+                symbol: "ETHUSDT".to_string(),
+                best_bid: 3000.0,
+                best_ask: 3001.0,
+                exchange_ts_ms: 1,
+            },
+            AccountRiskSnapshot {
+                equity: 10_000.0,
+                available_margin: 10_000.0,
+                unrealized_pnl_24h: 0.0,
+                gross_notional: 0.0,
+                market_is_fresh: true,
+                private_state_is_ready: true,
+            },
+            &mut cache,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(intent_status(&conn, "i-stop"), "failed");
+        let error: String = conn
+            .query_row(
+                "select error from trade_intents where intent_id = 'i-stop'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(error, "operator stop active");
+        let orders: i64 = conn
+            .query_row("select count(*) from orders", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(orders, 0);
+    }
+
+    #[tokio::test]
+    async fn process_pending_intents_operator_stop_fails_open_before_stale_market_defer() {
+        let conn = memory_db();
+        insert_pending_intent(&conn, "i-stale-stop");
+        db::set_executor_state(&conn, crate::control::OPERATOR_STOP_KEY, "active").unwrap();
+        let cfg = ExecutorConfig {
+            rest_base_url: "http://127.0.0.1:9".to_string(),
+            ..ExecutorConfig::demo_for_tests()
+        };
+        let rest = BitgetRestClient::new(cfg.clone()).unwrap();
+        let mut cache = MarketCache::default();
+
+        let processed = process_pending_intents_once(&conn, &cfg, &rest, &mut cache, false)
+            .await
+            .unwrap();
+
+        assert_eq!(processed, 0);
+        assert_eq!(intent_status(&conn, "i-stale-stop"), "failed");
+        let error: String = conn
+            .query_row(
+                "select error from trade_intents where intent_id = 'i-stale-stop'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(error, "operator stop active");
     }
 
     #[test]

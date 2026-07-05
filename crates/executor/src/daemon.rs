@@ -225,32 +225,18 @@ pub async fn run_daemon(cfg: ExecutorConfig, options: DaemonOptions) -> Result<(
                     last_reconcile_ms = now_ms;
                 }
 
-                let mut local_cache = {
+                let local_cache = {
                     let cache = market_cache.lock().await;
                     cache.clone()
                 };
-                // Error isolation: a stale-market or REST failure here (common in
-                // the first few hundred ms before the public WS delivers, or on a
-                // transient network blip) is logged as an event and the loop
-                // continues — the daemon must not crash on a loop-iteration error.
-                // The next tick retries once the WS cache is fresh.
-                if let Err(err) = crate::executor::process_pending_intents_once(
+                process_daemon_queues_once(
                     &conn,
                     &cfg,
                     &rest,
-                    &mut local_cache,
+                    &local_cache,
                     private_ready.is_ready(),
                 )
-                .await
-                {
-                    crate::db::write_event(
-                        &conn,
-                        "error",
-                        "intent_loop",
-                        &format!("intent loop failed: {err}"),
-                        "{}",
-                    )?;
-                }
+                .await?;
             }
         }
     }
@@ -269,6 +255,53 @@ pub async fn run_daemon(cfg: ExecutorConfig, options: DaemonOptions) -> Result<(
     private_task.abort();
     telegram_task.abort();
     crate::db::write_event(&conn, "info", "daemon", "daemon stopped", "{}")?;
+    Ok(())
+}
+
+async fn process_daemon_queues_once(
+    conn: &rusqlite::Connection,
+    cfg: &ExecutorConfig,
+    rest: &crate::bitget::BitgetRestClient,
+    market_cache: &crate::executor::MarketCache,
+    private_state_ready: bool,
+) -> Result<()> {
+    let mut control_cache = market_cache.clone();
+    if let Err(err) =
+        crate::control::process_pending_control_commands_once(conn, cfg, rest, &mut control_cache)
+            .await
+    {
+        let _ = crate::db::write_event(
+            conn,
+            "error",
+            "control_loop",
+            &format!("control loop failed: {err}"),
+            "{}",
+        );
+    }
+
+    let mut intent_cache = market_cache.clone();
+    // Error isolation: a stale-market or REST failure here (common in the first
+    // few hundred ms before the public WS delivers, or on a transient network
+    // blip) is logged as an event and the loop continues — the daemon must not
+    // crash on a loop-iteration error. The next tick retries once the WS cache is
+    // fresh.
+    if let Err(err) = crate::executor::process_pending_intents_once(
+        conn,
+        cfg,
+        rest,
+        &mut intent_cache,
+        private_state_ready,
+    )
+    .await
+    {
+        crate::db::write_event(
+            conn,
+            "error",
+            "intent_loop",
+            &format!("intent loop failed: {err}"),
+            "{}",
+        )?;
+    }
     Ok(())
 }
 
@@ -827,6 +860,30 @@ mod tests {
         conn
     }
 
+    fn insert_pending_open_intent(conn: &rusqlite::Connection, intent_id: &str) {
+        conn.execute(
+            "insert into trade_intents (
+               intent_id, created_at, symbol, side, action, target_notional,
+               max_order_notional, status, source
+             ) values (?1, '2026-07-01T00:00:00Z', 'ETH/USDT:USDT',
+                       'long', 'open', 100, 100, 'pending', 'test')",
+            rusqlite::params![intent_id],
+        )
+        .unwrap();
+    }
+
+    fn intent_status_and_error(
+        conn: &rusqlite::Connection,
+        intent_id: &str,
+    ) -> (String, Option<String>) {
+        conn.query_row(
+            "select status, error from trade_intents where intent_id = ?1",
+            rusqlite::params![intent_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn daemon_options_default_runs_forever() {
         let options = DaemonOptions::default();
@@ -957,6 +1014,112 @@ mod tests {
         .unwrap_err();
 
         assert!(err.to_string().contains("demo"));
+    }
+
+    #[tokio::test]
+    async fn daemon_tick_processes_stop_before_pending_open() {
+        let conn = test_conn();
+        conn.execute(
+            "insert into control_commands (
+              command_id, created_at, command, status, requested_by
+            ) values ('cmd-stop', '2026-07-01T00:00:00Z', 'stop', 'pending', '123')",
+            [],
+        )
+        .unwrap();
+        insert_pending_open_intent(&conn, "i-open");
+        let cfg = ExecutorConfig {
+            rest_base_url: "http://127.0.0.1:9".to_string(),
+            ..ExecutorConfig::demo_for_tests()
+        };
+        let rest = crate::bitget::BitgetRestClient::new(cfg.clone()).unwrap();
+
+        process_daemon_queues_once(
+            &conn,
+            &cfg,
+            &rest,
+            &crate::executor::MarketCache::default(),
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            crate::db::get_executor_state(&conn, crate::control::OPERATOR_STOP_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("active")
+        );
+        let command_status: String = conn
+            .query_row(
+                "select status from control_commands where command_id = 'cmd-stop'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(command_status, "executed");
+        assert_eq!(
+            intent_status_and_error(&conn, "i-open"),
+            (
+                "failed".to_string(),
+                Some("operator stop active".to_string())
+            )
+        );
+        let deferred_events: i64 = conn
+            .query_row(
+                "select count(*) from events where message like 'deferred open%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(deferred_events, 0);
+    }
+
+    #[tokio::test]
+    async fn daemon_tick_logs_control_error_and_continues_to_intents() {
+        let conn = test_conn();
+        insert_pending_open_intent(&conn, "i-open");
+        let demo_cfg = ExecutorConfig {
+            rest_base_url: "http://127.0.0.1:9".to_string(),
+            ..ExecutorConfig::demo_for_tests()
+        };
+        let live_cfg = ExecutorConfig {
+            mode: TradingMode::Live,
+            ..demo_cfg.clone()
+        };
+        let rest = crate::bitget::BitgetRestClient::new(demo_cfg).unwrap();
+
+        process_daemon_queues_once(
+            &conn,
+            &live_cfg,
+            &rest,
+            &crate::executor::MarketCache::default(),
+            false,
+        )
+        .await
+        .unwrap();
+
+        let control_errors: i64 = conn
+            .query_row(
+                "select count(*) from events
+                 where component = 'control_loop'
+                   and severity = 'error'
+                   and message like 'control loop failed:%demo%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(control_errors, 1);
+        let deferred_events: i64 = conn
+            .query_row(
+                "select count(*) from events
+                 where component = 'intent_loop'
+                   and message like 'deferred open i-open:%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(deferred_events, 1);
+        assert_eq!(intent_status_and_error(&conn, "i-open").0, "pending");
     }
 
     #[test]
