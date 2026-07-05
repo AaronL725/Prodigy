@@ -100,7 +100,11 @@ fn defer_event_recently_emitted(last_emit_ms: Option<i64>, now_ms: i64) -> bool 
 /// failure here is logged but must not propagate (the caller is mid-batch and a
 /// logging error must not strand the rest of the intents — same isolation as
 /// the per-intent snapshot/equity writes above).
-fn fail_intent_after_infra_error(conn: &Connection, intent_id: &str, err: &anyhow::Error) {
+pub(crate) fn fail_intent_after_infra_error(
+    conn: &Connection,
+    intent_id: &str,
+    err: &anyhow::Error,
+) {
     let _ = db::write_event(
         conn,
         "error",
@@ -346,7 +350,7 @@ pub async fn run_once_or_loop(cfg: ExecutorConfig) -> Result<()> {
 /// inside process_one_intent (maker-retry, taker) pass `true` — those run AFTER
 /// the open was already gated at entry, and aborting a half-placed open on a WS
 /// flap would be worse than completing it (spec: refuse new OPENING exposure).
-async fn fetch_account_snapshot(
+pub(crate) async fn fetch_account_snapshot(
     rest: &BitgetRestClient,
     private_state_ready: bool,
 ) -> Result<AccountRiskSnapshot> {
@@ -421,7 +425,7 @@ async fn fetch_account_snapshot(
     })
 }
 
-async fn fetch_market_snapshot(
+pub(crate) async fn fetch_market_snapshot(
     cfg: &ExecutorConfig,
     rest: &BitgetRestClient,
 ) -> Result<MarketUpdate> {
