@@ -78,6 +78,7 @@ def run_daemon_loop(
     stop_flag: Callable[[], bool],
     now_factory: Callable[[], pd.Timestamp] = lambda: pd.Timestamp.now(tz="UTC"),
     sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], pd.Timestamp] = lambda: pd.Timestamp.now(tz="UTC"),
 ) -> int:
     """Drive run_once on the daemon cadence, exiting cleanly on stop.
 
@@ -111,6 +112,7 @@ def run_daemon_loop(
                     score_loader=score_loader,
                     signal_cfg=signal_daemon_cfg,
                     max_state_age_secs=signal_cfg["max_state_age_secs"],
+                    clock=clock,
                 )
             )
             print(result)

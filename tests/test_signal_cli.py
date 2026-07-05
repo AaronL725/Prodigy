@@ -131,6 +131,7 @@ def test_daemon_loop_exits_on_stop_flag_and_writes_shutdown_event(tmp_path):
         stop_flag=stop_flag,
         now_factory=lambda: __import__("pandas").Timestamp("2026-07-04T10:16:00Z"),
         sleep=lambda _s: None,
+        clock=lambda: __import__("pandas").Timestamp("2026-07-04T10:16:00Z"),
     )
 
     assert rc == 0
@@ -201,6 +202,7 @@ def test_daemon_loop_stops_without_extra_run_once_after_sleep(tmp_path):
         stop_flag=lambda: stop["v"],
         now_factory=now_factory,
         sleep=sleeping,
+        clock=lambda: __import__("pandas").Timestamp("2026-07-04T10:16:00Z"),
     )
 
     assert rc == 0

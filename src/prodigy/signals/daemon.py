@@ -178,6 +178,12 @@ class RunOnceConfig:
     signal_cfg: SignalDaemonConfig = SignalDaemonConfig(total_notional_cap=10_000)
     max_state_age_secs: int = 120
     timeframe: str = "15m"
+    # Live wall-clock for the freshness gate. The bar key uses cfg.now (fixed per
+    # run), but the equity_snapshots freshness check must judge age against the
+    # CURRENT time at each gate — refresh/score take real seconds and a snapshot
+    # fresh at run-start can go stale before the write connection re-checks.
+    # Injected in tests; defaults to real UTC now.
+    clock: Callable[[], pd.Timestamp] = lambda: pd.Timestamp.now(tz="UTC")
 
 
 def write_signal_event(conn: sqlite3.Connection, severity: str, message: str) -> None:
@@ -282,7 +288,7 @@ def _gate_skip(
     conn: sqlite3.Connection,
     cfg: RunOnceConfig,
     key: str,
-    now: pd.Timestamp,
+    freshness_now: pd.Timestamp,
     *,
     check_already_processed: bool,
 ) -> str | None:
@@ -296,10 +302,15 @@ def _gate_skip(
     state appearing during that window must still block the write (TOCTOU guard
     for the M5 skip rules). `check_already_processed` lets the second call reuse
     the same gate without re-asserting idempotency the caller already owns.
+
+    `freshness_now` is the LIVE wall-clock the equity_snapshots age is judged
+    against — the caller passes cfg.clock() (not the fixed bar-time cfg.now), so
+    a snapshot that ages past max_state_age_secs during refresh/score is caught
+    on the write-time re-check.
     """
     if check_already_processed and get_executor_state(conn, key) is not None:
         return "already_processed"
-    age = _latest_equity_snapshot_age_secs(conn, now)
+    age = _latest_equity_snapshot_age_secs(conn, freshness_now)
     if age is None or age > cfg.max_state_age_secs:
         return "skipped_stale_state"
     if is_manual_override_active(conn, cfg.exchange_symbol):
@@ -328,7 +339,7 @@ def run_once(cfg: RunOnceConfig) -> str:
         # deployment would need BEGIN IMMEDIATE re-check inside the write
         # transaction — out of M5 scope (and it would contend with the Rust
         # executor's WAL writes on the same DB).
-        pre = _gate_skip(conn, cfg, key, now, check_already_processed=True)
+        pre = _gate_skip(conn, cfg, key, cfg.clock(), check_already_processed=True)
         if pre is not None:
             return pre
 
@@ -373,7 +384,7 @@ def run_once(cfg: RunOnceConfig) -> str:
         # write. already_processed is owned by the caller (it can't change
         # within a single run_once), so the re-check excludes it. None of these
         # transient skips writes the processed marker.
-        reskip = _gate_skip(conn, cfg, key, now, check_already_processed=False)
+        reskip = _gate_skip(conn, cfg, key, cfg.clock(), check_already_processed=False)
         if reskip is not None:
             return reskip
         position = _position_state(conn, cfg.exchange_symbol)

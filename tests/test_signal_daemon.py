@@ -11,6 +11,13 @@ from prodigy.signals.daemon import (
 )
 
 
+def _clock(ts: str = "2026-07-04T10:16:00Z"):
+    """Deterministic clock for run_once tests: freshness judged at this fixed
+    time so a seeded snapshot's age is stable (production uses real wall-clock).
+    """
+    return lambda: pd.Timestamp(ts)
+
+
 def test_latest_closed_bar_ignores_open_bar():
     frame = pd.DataFrame(
         {
@@ -154,6 +161,7 @@ def test_run_once_skips_when_state_is_stale(tmp_path):
             research_symbol="ETH/USDT:USDT",
             exchange_symbol="ETHUSDT",
             source="dummy-cycle",
+            clock=_clock(),
             now=pd.Timestamp("2026-07-04T10:16:00Z"),
             refresh_data=lambda: None,
             score_loader=lambda: (1.0, "2026-07-04T10:00:00Z"),
@@ -186,6 +194,7 @@ def test_run_once_is_idempotent_per_closed_bar(tmp_path):
         research_symbol="ETH/USDT:USDT",
         exchange_symbol="ETHUSDT",
         source="dummy-cycle",
+        clock=_clock(),
         now=pd.Timestamp("2026-07-04T10:16:00Z"),
         refresh_data=lambda: None,
         score_loader=lambda: (1.0, "2026-07-04T10:00:00Z"),
@@ -219,6 +228,7 @@ def test_run_once_skips_manual_override(tmp_path):
             research_symbol="ETH/USDT:USDT",
             exchange_symbol="ETHUSDT",
             source="dummy-cycle",
+            clock=_clock(),
             now=pd.Timestamp("2026-07-04T10:16:00Z"),
             refresh_data=lambda: None,
             score_loader=lambda: (1.0, "2026-07-04T10:00:00Z"),
@@ -314,6 +324,7 @@ def test_run_once_closes_position_via_holding_expiry_from_opened_at(tmp_path):
             research_symbol="ETH/USDT:USDT",
             exchange_symbol="ETHUSDT",
             source="dummy-cycle",
+            clock=_clock(),
             now=pd.Timestamp("2026-07-04T10:16:00Z"),
             refresh_data=lambda: None,
             score_loader=lambda: (0.1, "2026-07-04T10:00:00Z"),
@@ -360,6 +371,7 @@ def test_run_once_does_not_guess_holding_bars_when_opened_at_missing(tmp_path):
             research_symbol="ETH/USDT:USDT",
             exchange_symbol="ETHUSDT",
             source="dummy-cycle",
+            clock=_clock(),
             now=pd.Timestamp("2026-07-04T10:16:00Z"),
             refresh_data=lambda: None,
             score_loader=lambda: (0.1, "2026-07-04T10:00:00Z"),
@@ -401,6 +413,7 @@ def test_run_once_skips_on_data_refresh_error_and_writes_event(tmp_path):
             research_symbol="ETH/USDT:USDT",
             exchange_symbol="ETHUSDT",
             source="dummy-cycle",
+            clock=_clock(),
             now=pd.Timestamp("2026-07-04T10:16:00Z"),
             refresh_data=boom,
             score_loader=lambda: (1.0, "2026-07-04T10:00:00Z"),
@@ -435,6 +448,7 @@ def test_run_once_skips_on_factor_compute_error_and_writes_event(tmp_path):
             research_symbol="ETH/USDT:USDT",
             exchange_symbol="ETHUSDT",
             source="dummy-cycle",
+            clock=_clock(),
             now=pd.Timestamp("2026-07-04T10:16:00Z"),
             refresh_data=lambda: None,
             score_loader=boom,
@@ -469,6 +483,7 @@ def test_run_once_skips_when_data_bar_is_stale(tmp_path):
             research_symbol="ETH/USDT:USDT",
             exchange_symbol="ETHUSDT",
             source="dummy-cycle",
+            clock=_clock(),
             now=pd.Timestamp("2026-07-04T10:16:00Z"),
             refresh_data=lambda: None,
             score_loader=lambda: (1.0, "2026-07-04T09:45:00Z"),
@@ -500,6 +515,7 @@ def test_run_once_writes_intent_when_data_bar_matches_expected(tmp_path):
             research_symbol="ETH/USDT:USDT",
             exchange_symbol="ETHUSDT",
             source="dummy-cycle",
+            clock=_clock(),
             now=pd.Timestamp("2026-07-04T10:16:00Z"),
             refresh_data=lambda: None,
             score_loader=lambda: (1.0, "2026-07-04T10:00:00Z"),
@@ -532,6 +548,7 @@ def test_run_once_rechecks_manual_override_after_refresh(tmp_path):
             research_symbol="ETH/USDT:USDT",
             exchange_symbol="ETHUSDT",
             source="dummy-cycle",
+            clock=_clock(),
             now=pd.Timestamp("2026-07-04T10:16:00Z"),
             refresh_data=refresh_data,
             score_loader=lambda: (1.0, "2026-07-04T10:00:00Z"),
@@ -572,6 +589,7 @@ def test_run_once_rechecks_pending_intent_after_refresh(tmp_path):
             research_symbol="ETH/USDT:USDT",
             exchange_symbol="ETHUSDT",
             source="dummy-cycle",
+            clock=_clock(),
             now=pd.Timestamp("2026-07-04T10:16:00Z"),
             refresh_data=refresh_data,
             score_loader=lambda: (1.0, "2026-07-04T10:00:00Z"),
@@ -611,6 +629,7 @@ def test_run_once_does_not_crash_when_event_write_fails(tmp_path, monkeypatch):
             research_symbol="ETH/USDT:USDT",
             exchange_symbol="ETHUSDT",
             source="dummy-cycle",
+            clock=_clock(),
             now=pd.Timestamp("2026-07-04T10:16:00Z"),
             refresh_data=refresh_data,
             score_loader=lambda: (1.0, "2026-07-04T10:00:00Z"),
@@ -619,6 +638,64 @@ def test_run_once_does_not_crash_when_event_write_fails(tmp_path, monkeypatch):
 
     # Must return the skip, not propagate the OperationalError.
     assert result == "error_data_refresh"
+    with connect(db_path) as conn:
+        assert conn.execute("select count(*) from trade_intents").fetchone()[0] == 0
+        key = signal_processed_key("dummy-cycle", "ETHUSDT", "15m", "2026-07-04T10:00:00Z")
+        assert get_executor_state(conn, key) is None
+
+
+def test_run_once_skips_when_state_goes_stale_during_refresh(tmp_path):
+    # TOCTOU for the FRESHNESS gate: the snapshot is fresh at run-start, but
+    # refresh/score take real seconds and the snapshot can age past
+    # max_state_age_secs by the time the write connection re-checks. The
+    # re-check must use the LIVE clock (after refresh), not the run-start now —
+    # otherwise a snapshot that went stale mid-run still passes and an intent is
+    # written. Inject a clock that advances past the window across the run.
+    db_path = tmp_path / "prodigy.sqlite"
+    t0 = pd.Timestamp("2026-07-04T10:15:30Z")
+    with connect(db_path) as conn:
+        init_db(conn)
+        conn.execute(
+            """
+            insert into equity_snapshots (
+              snapshot_id, created_at, equity, available_margin, unrealized_pnl, realized_pnl_24h
+            ) values ('s1', '2026-07-04T10:15:30Z', 1000, 1000, 0, 0)
+            """
+        )
+        conn.commit()
+
+    # Freshness window is 2s. Pre-check at t0 (0s old -> fresh). refresh sleeps,
+    # simulating real elapsed time; the re-check clock returns t0+10s (snapshot
+    # now 10s old -> stale).
+    clock_calls = {"n": 0}
+
+    def clock() -> pd.Timestamp:
+        clock_calls["n"] += 1
+        # First call (pre-check) -> run-start time; later calls (re-check) -> aged.
+        return t0 if clock_calls["n"] == 1 else t0 + pd.Timedelta(seconds=10)
+
+    def refresh_data() -> None:
+        # Simulate the seconds refresh/score take in real operation.
+        import time as _time
+
+        _time.sleep(0.05)
+
+    result = run_once(
+        RunOnceConfig(
+            db_path=db_path,
+            data_root=tmp_path / "data",
+            research_symbol="ETH/USDT:USDT",
+            exchange_symbol="ETHUSDT",
+            source="dummy-cycle",
+            now=pd.Timestamp("2026-07-04T10:16:00Z"),
+            refresh_data=refresh_data,
+            score_loader=lambda: (1.0, "2026-07-04T10:00:00Z"),
+            max_state_age_secs=2,
+            clock=clock,
+        )
+    )
+
+    assert result == "skipped_stale_state"
     with connect(db_path) as conn:
         assert conn.execute("select count(*) from trade_intents").fetchone()[0] == 0
         key = signal_processed_key("dummy-cycle", "ETHUSDT", "15m", "2026-07-04T10:00:00Z")
