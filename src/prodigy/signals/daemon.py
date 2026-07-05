@@ -278,12 +278,6 @@ def _holding_bars(opened_at: str | None, closed_ts: str, timeframe: str) -> int:
     return max(0, int((closed - opened) / pd.Timedelta(timeframe)))
 
 
-def run_once(cfg: RunOnceConfig) -> str:
-    now = pd.Timestamp(cfg.now)
-    now = now.tz_localize("UTC") if now.tzinfo is None else now.tz_convert("UTC")
-    closed_ts = expected_closed_bar_ts(now, cfg.timeframe)
-    key = signal_processed_key(cfg.source, cfg.exchange_symbol, cfg.timeframe, closed_ts)
-
 def _gate_skip(
     conn: sqlite3.Connection,
     cfg: RunOnceConfig,
