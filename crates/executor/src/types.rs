@@ -9,6 +9,13 @@ pub struct TradeIntent {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct ControlCommand {
+    pub command_id: String,
+    pub command: String,
+    pub requested_by: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct OrderRecord {
     pub order_id: String,
     pub exchange_order_id: Option<String>,

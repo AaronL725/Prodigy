@@ -1,7 +1,7 @@
 use anyhow::Result;
 use rusqlite::{params, Connection};
 
-use crate::types::{FillRecord, OrderRecord, PositionRecord, TradeIntent};
+use crate::types::{ControlCommand, FillRecord, OrderRecord, PositionRecord, TradeIntent};
 
 pub fn pending_intents(conn: &Connection) -> Result<Vec<TradeIntent>> {
     let mut stmt = conn.prepare(
@@ -54,6 +54,58 @@ pub fn fail_intent(conn: &Connection, intent_id: &str, reason: &str) -> Result<(
          set status = 'failed', processed_at = datetime('now'), error = ?
          where intent_id = ?",
         params![reason, intent_id],
+    )?;
+    Ok(())
+}
+
+pub fn pending_control_commands(conn: &Connection) -> Result<Vec<ControlCommand>> {
+    let mut stmt = conn.prepare(
+        "select command_id, command, requested_by
+         from control_commands
+         where status = 'pending'
+         order by created_at asc",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(ControlCommand {
+            command_id: row.get(0)?,
+            command: row.get(1)?,
+            requested_by: row.get(2)?,
+        })
+    })?;
+
+    let mut commands = Vec::new();
+    for row in rows {
+        commands.push(row?);
+    }
+    Ok(commands)
+}
+
+pub fn accept_control_command(conn: &Connection, command_id: &str) -> Result<bool> {
+    let rows = conn.execute(
+        "update control_commands
+         set status = 'accepted', processed_at = datetime('now'), error = null
+         where command_id = ? and status = 'pending'",
+        params![command_id],
+    )?;
+    Ok(rows == 1)
+}
+
+pub fn mark_control_command_executed(conn: &Connection, command_id: &str) -> Result<()> {
+    conn.execute(
+        "update control_commands
+         set status = 'executed', processed_at = datetime('now'), error = null
+         where command_id = ?",
+        params![command_id],
+    )?;
+    Ok(())
+}
+
+pub fn fail_control_command(conn: &Connection, command_id: &str, reason: &str) -> Result<()> {
+    conn.execute(
+        "update control_commands
+         set status = 'failed', processed_at = datetime('now'), error = ?
+         where command_id = ?",
+        params![reason, command_id],
     )?;
     Ok(())
 }
@@ -220,6 +272,36 @@ pub fn refresh_position_from_ws(conn: &Connection, position: &PositionRecord) ->
         ],
     )?;
     Ok(())
+}
+
+pub fn system_positions(conn: &Connection) -> Result<Vec<PositionRecord>> {
+    let mut stmt = conn.prepare(
+        "select symbol, side, notional, entry_price, unrealized_pnl,
+           ownership, opened_at, adopted_at, source_intent_id, raw_json
+         from positions
+         where ownership = 'system'
+         order by symbol",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(PositionRecord {
+            symbol: row.get(0)?,
+            side: row.get(1)?,
+            notional: row.get(2)?,
+            entry_price: row.get(3)?,
+            unrealized_pnl: row.get(4)?,
+            ownership: row.get(5)?,
+            opened_at: row.get(6)?,
+            adopted_at: row.get(7)?,
+            source_intent_id: row.get(8)?,
+            raw_json: row.get(9)?,
+        })
+    })?;
+
+    let mut positions = Vec::new();
+    for row in rows {
+        positions.push(row?);
+    }
+    Ok(positions)
 }
 
 /// client_oids of orders we already have locally (used to detect exchange orders
@@ -457,6 +539,15 @@ pub fn mark_order_externally_cancelled(conn: &Connection, client_oid: &str) -> R
     Ok(())
 }
 
+pub fn mark_system_order_cancelled_by_command(conn: &Connection, client_oid: &str) -> Result<()> {
+    conn.execute(
+        "update orders set status = 'cancelled', updated_at = datetime('now')
+         where client_oid = ? and intent_id is not null",
+        params![client_oid],
+    )?;
+    Ok(())
+}
+
 /// Insert a fill record. Idempotent by fill_id (PK) via insert-or-ignore.
 pub fn insert_fill(conn: &Connection, fill: &FillRecord) -> Result<()> {
     conn.execute(
@@ -565,6 +656,46 @@ mod tests {
 
         assert!(accept_intent(&conn, "i1").unwrap());
         assert!(!accept_intent(&conn, "i1").unwrap());
+    }
+
+    #[test]
+    fn pending_control_commands_are_accepted_idempotently() {
+        let conn = memory_db();
+        conn.execute(
+            "insert into control_commands (
+              command_id, created_at, command, status, requested_by
+            ) values ('cmd-1', '2026-07-06T00:00:00Z', 'stop', 'pending', '123')",
+            [],
+        )
+        .unwrap();
+
+        let pending = pending_control_commands(&conn).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].command, "stop");
+        assert!(accept_control_command(&conn, "cmd-1").unwrap());
+        assert!(!accept_control_command(&conn, "cmd-1").unwrap());
+    }
+
+    #[test]
+    fn system_positions_lists_only_system_owned_positions() {
+        let conn = memory_db();
+        conn.execute(
+            "insert into positions (
+              symbol, side, notional, entry_price, unrealized_pnl, updated_at,
+              ownership, opened_at, adopted_at, source_intent_id, raw_json
+            ) values
+            ('ETHUSDT', 'long', 100, 2000, 1, 'now', 'system', 'now', null, 'i1', '{}'),
+            ('ADAUSDT', 'long', 100, 2000, 1, 'now', 'system', 'now', null, 'i2', '{}'),
+            ('BTCUSDT', 'long', 100, 2000, 1, 'now', 'imported', 'now', 'now', null, '{}')",
+            [],
+        )
+        .unwrap();
+
+        let positions = system_positions(&conn).unwrap();
+
+        assert_eq!(positions.len(), 2);
+        assert_eq!(positions[0].symbol, "ADAUSDT");
+        assert_eq!(positions[1].symbol, "ETHUSDT");
     }
 
     #[test]
