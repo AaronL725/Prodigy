@@ -338,9 +338,6 @@ pub async fn reconcile_once(
     // order NOT in this set was cancelled outside the executor (manual cancel).
     let mut exchange_pending_client_oids: HashSet<String> = HashSet::new();
 
-    let account = rest.get_account_snapshot().await?;
-    insert_rest_account_equity_snapshot(conn, &account)?;
-
     // Open orders: insert any exchange order we don't already have locally.
     let open_orders = rest
         .get(
@@ -826,6 +823,8 @@ pub async fn reconcile_once(
     let summary = format!(
         "{{\"repaired_orders\":{repaired_orders},\"repaired_positions\":{repaired_positions},\"repaired_fills\":{repaired_fills}}}"
     );
+    let account = rest.get_account_snapshot().await?;
+    insert_rest_account_equity_snapshot(conn, &account)?;
     db::write_event(
         conn,
         "info",
@@ -1238,6 +1237,22 @@ mod tests {
             )
             .unwrap();
         assert_eq!(row, (1, 1234.5, 1000.25, -3.5));
+    }
+
+    #[test]
+    fn reconcile_writes_equity_marker_only_after_repairs_succeed() {
+        let source = include_str!("reconcile.rs");
+        let marker_write = source
+            .find("insert_rest_account_equity_snapshot(conn, &account)?;")
+            .expect("production marker write should exist");
+        let summary = source
+            .find("let summary = format!")
+            .expect("completion summary should exist");
+
+        assert!(
+            marker_write > summary,
+            "equity snapshot freshness marker must be written after order/fill/position reconcile succeeds"
+        );
     }
 
     #[test]
