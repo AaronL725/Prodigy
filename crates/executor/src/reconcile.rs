@@ -729,45 +729,24 @@ pub async fn reconcile_once(
     // clear-then-re-enter override (flapping). Only ENTER override if it isn't
     // already active. Skipped in test-reset mode (system cleanup, not user
     // intervention).
-    if detect_override && !exchange_has_position {
-        let (sys_base, _sys_side) = db::system_net_base_for_symbol(conn, &symbol)?;
-        if sys_base.abs() > f64::EPSILON {
-            db::mark_system_orders_externally_closed(conn, &symbol)?;
-            // Exchange state wins: the exchange no longer holds this position, so
-            // remove the local positions row too — otherwise local /positions and
-            // PnL queries keep reporting a position Bitget closed.
-            db::clear_local_position(conn, &symbol)?;
-            if !override_active {
-                db::set_executor_state(conn, &override_key, "active")?;
-                override_active = true;
-                entered_this_run = true;
-                db::write_event(
-                    conn,
-                    "warning",
-                    "executor",
-                    "manual override entered (position externally closed)",
-                    &format!("{{\"symbol\":\"{symbol}\"}}"),
-                )?;
-                notify::send_telegram(
-                    telegram_token,
-                    telegram_chat,
-                    "manual_override_entered",
-                    &format!("manual override entered for {symbol} (position externally closed)"),
-                )
-                .await
-                .ok();
-            } else {
-                // Override already active (e.g. from a prior reduce/add); still
-                // record that the position was externally closed this pass.
-                db::write_event(
-                    conn,
-                    "warning",
-                    "executor",
-                    "position externally closed while override active",
-                    &format!("{{\"symbol\":\"{symbol}\"}}"),
-                )?;
-            }
-        }
+    if !exchange_has_position
+        && sync_missing_exchange_position(
+            conn,
+            &symbol,
+            &override_key,
+            detect_override,
+            &mut override_active,
+            &mut entered_this_run,
+        )?
+    {
+        notify::send_telegram(
+            telegram_token,
+            telegram_chat,
+            "manual_override_entered",
+            &format!("manual override entered for {symbol} (position externally closed)"),
+        )
+        .await
+        .ok();
     }
 
     // Auto-clear the per-symbol override once the exchange has no position and no
@@ -877,6 +856,43 @@ fn insert_rest_account_equity_snapshot(
             .unwrap_or(0.0),
         0.0,
     )
+}
+
+fn sync_missing_exchange_position(
+    conn: &Connection,
+    symbol: &str,
+    override_key: &str,
+    detect_override: bool,
+    override_active: &mut bool,
+    entered_this_run: &mut bool,
+) -> Result<bool> {
+    let (sys_base, _sys_side) = db::system_net_base_for_symbol(conn, symbol)?;
+    db::clear_local_position(conn, symbol)?;
+    if !detect_override || sys_base.abs() <= f64::EPSILON {
+        return Ok(false);
+    }
+    db::mark_system_orders_externally_closed(conn, symbol)?;
+    if !*override_active {
+        db::set_executor_state(conn, override_key, "active")?;
+        *override_active = true;
+        *entered_this_run = true;
+        db::write_event(
+            conn,
+            "warning",
+            "executor",
+            "manual override entered (position externally closed)",
+            &format!("{{\"symbol\":\"{symbol}\"}}"),
+        )?;
+        return Ok(true);
+    }
+    db::write_event(
+        conn,
+        "warning",
+        "executor",
+        "position externally closed while override active",
+        &format!("{{\"symbol\":\"{symbol}\"}}"),
+    )?;
+    Ok(false)
 }
 
 /// Build the in-memory override state from the persisted flag. The detection
@@ -1211,6 +1227,55 @@ mod tests {
             )
             .unwrap();
         assert_eq!(row, (1, 1234.5, 1000.25, -3.5));
+    }
+
+    #[test]
+    fn missing_exchange_position_clears_stale_local_position_without_override_when_net_zero() {
+        let conn = exec_db();
+        db::upsert_position(
+            &conn,
+            &PositionRecord {
+                symbol: "ETHUSDT".to_string(),
+                side: "long".to_string(),
+                notional: 300.0,
+                entry_price: 3000.0,
+                unrealized_pnl: 0.0,
+                ownership: "system".to_string(),
+                opened_at: Some("2026-07-01T00:00:00Z".to_string()),
+                adopted_at: None,
+                source_intent_id: Some("i-open".to_string()),
+                raw_json: "{}".to_string(),
+            },
+        )
+        .unwrap();
+        let mut override_active = false;
+        let mut entered_this_run = false;
+
+        let notify = sync_missing_exchange_position(
+            &conn,
+            "ETHUSDT",
+            "manual_override:ETHUSDT",
+            true,
+            &mut override_active,
+            &mut entered_this_run,
+        )
+        .unwrap();
+
+        let position_count: i64 = conn
+            .query_row(
+                "select count(*) from positions where symbol='ETHUSDT'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(position_count, 0);
+        assert!(!notify);
+        assert!(!override_active);
+        assert!(!entered_this_run);
+        assert_eq!(
+            db::get_executor_state(&conn, "manual_override:ETHUSDT").unwrap(),
+            None
+        );
     }
 
     #[test]
