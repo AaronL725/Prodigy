@@ -31,8 +31,20 @@ fn classify_exchange_position(
     let traced = system_ownership_intent(conn, &exchange_position.symbol)?;
     match traced {
         Some(intent_id) => {
-            exchange_position.source_intent_id = Some(intent_id);
+            exchange_position.source_intent_id = Some(intent_id.clone());
             exchange_position.ownership = "system".to_string();
+            // Critical: a system position must carry a concrete opened_at so the
+            // Python signal daemon can evaluate holding expiry and (after the
+            // round-4 ambiguous-position skip) not permanently skip the close
+            // path. The exchange all-position row has no opened_at, and
+            // upsert_position overwrites the column, so derive one here: preserve
+            // an already-populated opened_at (the open time is fixed across
+            // re-reconciles); else fall back to the system open intent's
+            // created_at, then the open order's created_at.
+            if exchange_position.opened_at.is_none() {
+                exchange_position.opened_at =
+                    system_opened_at(conn, &intent_id, &exchange_position.symbol)?;
+            }
         }
         None => {
             exchange_position.ownership = "imported".to_string();
@@ -41,6 +53,39 @@ fn classify_exchange_position(
         }
     }
     Ok(exchange_position)
+}
+
+/// opened_at for a system position when the exchange row omits it: the open
+/// intent's created_at, falling back to the earliest filled open order's
+/// created_at. Returns None only if neither is recorded (genuinely ambiguous).
+fn system_opened_at(
+    conn: &rusqlite::Connection,
+    intent_id: &str,
+    symbol: &str,
+) -> Result<Option<String>> {
+    use rusqlite::params;
+    let from_intent: Option<String> = conn
+        .query_row(
+            "select created_at from trade_intents where intent_id = ?",
+            params![intent_id],
+            |row| row.get(0),
+        )
+        .ok()
+        .flatten();
+    if from_intent.is_some() {
+        return Ok(from_intent);
+    }
+    let from_order: Option<String> = conn
+        .query_row(
+            "select created_at from orders
+             where symbol = ? and intent_id = ? and action = 'open' and filled_size > 0
+             order by created_at asc limit 1",
+            params![symbol, intent_id],
+            |row| row.get(0),
+        )
+        .ok()
+        .flatten();
+    Ok(from_order)
 }
 
 /// Determine whether an exchange position for this symbol is system-owned.
@@ -1143,6 +1188,73 @@ mod tests {
                 .unwrap()
                 .as_deref(),
             Some("i-filled")
+        );
+    }
+
+    #[test]
+    fn system_position_gets_opened_at_from_its_open_intent() {
+        // Critical: a system position must carry a concrete opened_at so the
+        // Python signal daemon can evaluate holding expiry and NOT skip it as
+        // an ambiguous position. The exchange all-position row has no opened_at,
+        // so reconcile must derive one: from the traced system open intent's
+        // created_at (the test fixture seeds '2026-07-01T00:00:00Z').
+        let conn = exec_db();
+        insert_intent(&conn, "i-open", "open");
+        insert_order(&conn, "o1", "i-open", "buy", "open", "filled", 0.10);
+
+        let exchange = PositionRecord {
+            symbol: "ETH/USDT:USDT".to_string(),
+            side: "long".to_string(),
+            notional: 300.0,
+            entry_price: 3000.0,
+            unrealized_pnl: 0.0,
+            ownership: "system".to_string(),
+            opened_at: None,
+            adopted_at: None,
+            source_intent_id: None,
+            raw_json: "{}".to_string(),
+        };
+
+        let classified =
+            classify_exchange_position(&conn, exchange, "2026-07-02T00:00:00Z").unwrap();
+
+        assert_eq!(classified.ownership, "system");
+        assert_eq!(
+            classified.opened_at.as_deref(),
+            Some("2026-07-01T00:00:00Z"),
+            "system position opened_at must be derived from the open intent"
+        );
+    }
+
+    #[test]
+    fn system_position_preserves_existing_opened_at() {
+        // A re-reconcile must NOT overwrite an already-populated opened_at with a
+        // fresh value (the open time is fixed; re-deriving from a later
+        // created_at would age the position incorrectly). Reuse the local value.
+        let conn = exec_db();
+        insert_intent(&conn, "i-open", "open");
+        insert_order(&conn, "o1", "i-open", "buy", "open", "filled", 0.10);
+
+        let exchange = PositionRecord {
+            symbol: "ETH/USDT:USDT".to_string(),
+            side: "long".to_string(),
+            notional: 300.0,
+            entry_price: 3000.0,
+            unrealized_pnl: 0.0,
+            ownership: "system".to_string(),
+            opened_at: Some("2026-06-15T00:00:00Z".to_string()),
+            adopted_at: None,
+            source_intent_id: None,
+            raw_json: "{}".to_string(),
+        };
+
+        let classified =
+            classify_exchange_position(&conn, exchange, "2026-07-02T00:00:00Z").unwrap();
+
+        assert_eq!(
+            classified.opened_at.as_deref(),
+            Some("2026-06-15T00:00:00Z"),
+            "an existing opened_at must be preserved across reconcile"
         );
     }
 
