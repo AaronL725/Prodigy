@@ -327,6 +327,9 @@ pub async fn reconcile_once(
     // order NOT in this set was cancelled outside the executor (manual cancel).
     let mut exchange_pending_client_oids: HashSet<String> = HashSet::new();
 
+    let account = rest.get_account_snapshot().await?;
+    insert_rest_account_equity_snapshot(conn, &account)?;
+
     // Open orders: insert any exchange order we don't already have locally.
     let open_orders = rest
         .get(
@@ -851,6 +854,31 @@ fn str_field(value: &serde_json::Value, key: &str) -> String {
         .to_string()
 }
 
+fn insert_rest_account_equity_snapshot(
+    conn: &Connection,
+    account: &serde_json::Value,
+) -> Result<()> {
+    let data = account
+        .get("data")
+        .ok_or_else(|| anyhow::anyhow!("account snapshot missing data field"))?;
+    let parse_required = |key: &str| -> Result<f64> {
+        data.get(key)
+            .and_then(serde_json::Value::as_str)
+            .and_then(|v| v.parse::<f64>().ok())
+            .ok_or_else(|| anyhow::anyhow!("account snapshot missing/unparseable {key}"))
+    };
+    db::insert_equity_snapshot(
+        conn,
+        parse_required("accountEquity")?,
+        parse_required("available")?,
+        data.get("unrealizedPL")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.0),
+        0.0,
+    )
+}
+
 /// Build the in-memory override state from the persisted flag. The detection
 /// functions need a ManualOverrideState; we seed it from executor_state so the
 /// "already blocked → NoChange" path holds across restarts.
@@ -1160,6 +1188,29 @@ mod tests {
             rusqlite::params![order_id, intent_id, side, action, status, filled],
         )
         .unwrap();
+    }
+
+    #[test]
+    fn rest_account_snapshot_persists_equity_without_pending_intents() {
+        let conn = exec_db();
+        let account = serde_json::json!({
+            "data": {
+                "accountEquity": "1234.5",
+                "available": "1000.25",
+                "unrealizedPL": "-3.5"
+            }
+        });
+
+        insert_rest_account_equity_snapshot(&conn, &account).unwrap();
+
+        let row: (i64, f64, f64, f64) = conn
+            .query_row(
+                "select count(*), equity, available_margin, unrealized_pnl from equity_snapshots",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(row, (1, 1234.5, 1000.25, -3.5));
     }
 
     #[test]
