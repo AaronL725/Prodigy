@@ -499,10 +499,10 @@ pub fn mark_system_orders_externally_closed(conn: &Connection, symbol: &str) -> 
     Ok(changed)
 }
 
-/// System orders (intent_id set) still in a working ('submitted') state for a
-/// symbol. Reconcile compares these against the exchange pending list: a working
-/// system order the exchange no longer lists was either cancelled outside the
-/// executor (manual cancel) OR filled but briefly absent from pending. Reconcile
+/// System orders (intent_id set) still in a local working state for a symbol.
+/// Reconcile compares these against the exchange pending list: a working system
+/// order the exchange no longer lists was either cancelled outside the executor
+/// (manual cancel) OR filled but briefly absent from pending. Reconcile
 /// second-confirms via order detail, using the returned ordered size to tell full
 /// vs partial fill. Returns (client_oid, order_id, ordered_size) triples.
 pub fn local_working_system_orders(
@@ -511,7 +511,8 @@ pub fn local_working_system_orders(
 ) -> Result<Vec<(String, String, f64)>> {
     let mut stmt = conn.prepare(
         "select client_oid, order_id, coalesce(size, 0) from orders
-         where symbol = ? and intent_id is not null and status = 'submitted'",
+         where symbol = ? and intent_id is not null and status in ('submitted', 'live')
+         order by order_id",
     )?;
     let rows = stmt.query_map(params![symbol], |row| {
         Ok((
@@ -1223,7 +1224,7 @@ mod tests {
     }
 
     #[test]
-    fn working_system_orders_lists_only_submitted_system_orders() {
+    fn working_system_orders_lists_local_working_system_orders() {
         // C2: a system pending order the client cancels in the Bitget UI vanishes
         // from the exchange pending list. Reconcile finds our still-'submitted'
         // system orders and, if they're no longer pending on the exchange, marks
@@ -1264,12 +1265,25 @@ mod tests {
             [],
         )
         .unwrap();
+        // A private-WS-refreshed system order can carry Bitget's raw "live"
+        // status and is still working.
+        conn.execute(
+            "insert into orders (order_id, client_oid, intent_id, symbol, side, action,
+               order_type, status, price, size, filled_size, created_at, updated_at)
+             values ('o4','c4','i1','ETH/USDT:USDT','buy','open','limit','live',
+               3000, 0.07, 0.0, '2026-07-01T00:00:00Z', '2026-07-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
 
         let working = local_working_system_orders(&conn, "ETH/USDT:USDT").unwrap();
-        assert_eq!(working.len(), 1);
+        assert_eq!(working.len(), 2);
         assert_eq!(working[0].0, "c1"); // client_oid
         assert_eq!(working[0].1, "o1"); // order_id
         assert!((working[0].2 - 0.05).abs() < 1e-9); // ordered size
+        assert_eq!(working[1].0, "c4");
+        assert_eq!(working[1].1, "o4");
+        assert!((working[1].2 - 0.07).abs() < 1e-9);
     }
 
     #[test]
