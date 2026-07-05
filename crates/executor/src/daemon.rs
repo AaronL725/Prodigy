@@ -71,8 +71,8 @@ pub async fn run_daemon(cfg: ExecutorConfig, options: DaemonOptions) -> Result<(
     cfg.validate_demo_only()?;
     let conn = rusqlite::Connection::open(&cfg.db_path)?;
     // ponytail: WAL persists in the DB file header (idempotent; matches src/prodigy/db.py).
-    // M4 has Python writing intents, the daemon R/W, the private WS writing, and Telegram
-    // reading — all concurrent. WAL lets those readers/writers proceed in parallel instead of
+    // M6 has Python writing intents, the daemon R/W, the private WS writing, and Telegram
+    // operator polling — all concurrent. WAL lets those readers/writers proceed in parallel instead of
     // serializing on a single rollback journal; busy_timeout makes them wait out SQLITE_BUSY.
     if let Err(err) = conn.pragma_update(None, "journal_mode", "wal") {
         // WAL is the assumed journal mode for concurrent Python/daemon/WS/Telegram
@@ -479,14 +479,30 @@ pub async fn run_public_ws_loop(
     }
 }
 
-/// Optional read-only Telegram polling loop (M4). Runs ONLY when both
-/// `telegram_bot_token` and `telegram_chat_id` are configured — otherwise it
-/// returns immediately, since Telegram is not an execution dependency. It
-/// long-polls `getUpdates`, filters to the operator's chat_id only (other
-/// chats get no reply), and answers recognized `/status /positions /orders
-/// /pnl /risk` commands via `telegram_query::query_response`. `/stop /resume
-/// /close_all` are refused by the query layer (M4 forbids remote trading
-/// control).
+#[derive(Debug, Clone)]
+struct TelegramUpdateParts {
+    update_id: i64,
+    from_user_id: String,
+    reply_chat_id: String,
+    text: String,
+}
+
+fn telegram_update_parts(update: &serde_json::Value) -> Option<TelegramUpdateParts> {
+    let message = update.get("message")?;
+    Some(TelegramUpdateParts {
+        update_id: update.get("update_id")?.as_i64()?,
+        from_user_id: message.get("from")?.get("id")?.as_i64()?.to_string(),
+        reply_chat_id: message.get("chat")?.get("id")?.as_i64()?.to_string(),
+        text: message.get("text")?.as_str()?.to_string(),
+    })
+}
+
+/// Optional Telegram operator polling loop (M6). Runs ONLY when
+/// `telegram_bot_token` is configured and `telegram_allowed_user_ids` is
+/// non-empty — otherwise it returns immediately, since Telegram is not an
+/// execution dependency. It long-polls `getUpdates`, authorizes by
+/// `message.from.id`, replies to `message.chat.id`, and handles recognized
+/// commands via `telegram_query::operator_response`.
 ///
 /// Error isolation: EVERY network/parse/SQLite error here is logged and the
 /// loop continues — a flaky getUpdates or a transient DB lock must NEVER crash
@@ -497,11 +513,12 @@ pub async fn run_telegram_query_loop(
     cfg: ExecutorConfig,
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
-    let (Some(token), Some(chat_id)) =
-        (cfg.telegram_bot_token.clone(), cfg.telegram_chat_id.clone())
-    else {
+    let Some(token) = cfg.telegram_bot_token.clone() else {
         return Ok(());
     };
+    if cfg.telegram_allowed_user_ids.is_empty() {
+        return Ok(());
+    }
     let client = reqwest::Client::new();
     let mut offset: i64 = 0;
     let mut shutdown = shutdown;
@@ -530,22 +547,10 @@ pub async fn run_telegram_query_loop(
                         {
                             offset = id + 1;
                         }
-                        let message = update.get("message").unwrap_or(&serde_json::Value::Null);
-                        let chat = message
-                            .get("chat")
-                            .and_then(|c| c.get("id"))
-                            .and_then(serde_json::Value::as_i64)
-                            .map(|v| v.to_string());
-                        // Security gate: only the operator's configured chat
-                        // gets any reply; messages from any other chat are
-                        // ignored (offset still advances so they aren't redelivered).
-                        if chat.as_deref() != Some(chat_id.as_str()) {
-                            continue;
-                        }
-                        let Some(text) = message.get("text").and_then(serde_json::Value::as_str)
-                        else {
+                        let Some(parts) = telegram_update_parts(update) else {
                             continue;
                         };
+                        offset = parts.update_id + 1;
                         match rusqlite::Connection::open(&cfg.db_path) {
                             Ok(conn) => {
                                 if let Err(err) = conn
@@ -555,8 +560,14 @@ pub async fn run_telegram_query_loop(
                                     eprintln!("telegram sqlite busy_timeout error: {err}");
                                     continue;
                                 }
-                                let reply = match crate::telegram_query::query_response(&conn, text)
-                                {
+                                let now_ms = crate::bitget::now_ms().parse::<i64>().unwrap_or(0);
+                                let reply = match crate::telegram_query::operator_response(
+                                    &conn,
+                                    &parts.text,
+                                    &parts.from_user_id,
+                                    &cfg.telegram_allowed_user_ids,
+                                    now_ms,
+                                ) {
                                     Ok(reply) => reply,
                                     Err(err) => {
                                         eprintln!("telegram query error: {err}");
@@ -572,7 +583,7 @@ pub async fn run_telegram_query_loop(
                                     let _ = client
                                         .post(send_url)
                                         .form(&[
-                                            ("chat_id", chat_id.as_str()),
+                                            ("chat_id", parts.reply_chat_id.as_str()),
                                             ("text", reply.as_str()),
                                         ])
                                         .send()
@@ -895,6 +906,25 @@ mod tests {
     fn should_run_reconcile_when_interval_elapsed() {
         assert!(should_run_reconcile(10_000, 0, 10));
         assert!(!should_run_reconcile(9_999, 0, 10));
+    }
+
+    #[test]
+    fn telegram_update_parts_use_from_id_for_auth_and_chat_id_for_reply() {
+        let update = serde_json::json!({
+            "update_id": 42,
+            "message": {
+                "from": { "id": 123 },
+                "chat": { "id": 999 },
+                "text": "/status"
+            }
+        });
+
+        let parts = telegram_update_parts(&update).unwrap();
+
+        assert_eq!(parts.update_id, 42);
+        assert_eq!(parts.from_user_id, "123");
+        assert_eq!(parts.reply_chat_id, "999");
+        assert_eq!(parts.text, "/status");
     }
 
     #[test]
