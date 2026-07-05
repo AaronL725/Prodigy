@@ -564,12 +564,18 @@ pub fn parse_private_ws_message(text: &str, cfg: &ExecutorConfig) -> Result<Priv
     Ok(update)
 }
 
-/// Map a private-WS message instId (e.g. "ETHUSDT") to the configured display
-/// symbol (e.g. "ETH/USDT:USDT"). A foreign instId falls through to the raw
-/// string — never silently relabel a non-configured symbol as ETH.
+/// Map a private-WS message instId to the SQLite execution-layer symbol. The
+/// execution layer (orders/positions/manual_override) uses ONE symbol — the
+/// exchange symbol (bitget_symbol, e.g. "ETHUSDT") — matching what REST
+/// reconcile, trade_intents, and the Python signal daemon all read. Returning
+/// the display symbol (ETH/USDT:USDT) here split the convention: WS-written
+/// positions/orders landed under a different key than REST reconcile's, and the
+/// Python daemon (which reads ETHUSDT) couldn't see them. A foreign instId
+/// falls through to the raw string — never silently relabel a non-configured
+/// symbol.
 fn resolve_symbol(cfg: &ExecutorConfig, inst_id: &str) -> String {
     if inst_id == cfg.bitget_symbol {
-        cfg.symbol.clone()
+        cfg.bitget_symbol.clone()
     } else {
         inst_id.to_string()
     }
@@ -769,8 +775,9 @@ mod tests {
         assert_eq!(update.orders.len(), 1);
         assert_eq!(update.orders[0].client_oid, "client-1");
         assert_eq!(update.orders[0].status, "live");
-        // de-hardcoded symbol: instId ETHUSDT resolves to the configured display symbol.
-        assert_eq!(update.orders[0].symbol, "ETH/USDT:USDT");
+        // Execution-layer symbol: instId ETHUSDT resolves to the exchange symbol
+        // (bitget_symbol), matching REST reconcile / trade_intents / the Python daemon.
+        assert_eq!(update.orders[0].symbol, "ETHUSDT");
     }
 
     #[test]
@@ -805,7 +812,7 @@ mod tests {
 
         assert_eq!(update.positions.len(), 1);
         let pos = &update.positions[0];
-        assert_eq!(pos.symbol, "ETH/USDT:USDT");
+        assert_eq!(pos.symbol, "ETHUSDT");
         assert_eq!(pos.side, "long");
         assert!((pos.entry_price - 3000.0).abs() < 1e-9);
         assert!((pos.notional - 150.0).abs() < 1e-9);
