@@ -797,3 +797,44 @@ def test_run_once_writes_close_for_system_position_with_reverse_signal(tmp_path)
             "select action, side, target_notional from trade_intents"
         ).fetchone()
     assert dict(row) == {"action": "close", "side": "long", "target_notional": 0.0}
+
+
+
+def test_run_once_sees_reconcile_written_manual_override_under_ethusdt(tmp_path):
+    # Round-6 contract: Rust reconcile now writes manual_override:ETHUSDT (the
+    # bitget_symbol), matching the symbol Python reads (cfg.exchange_symbol) and
+    # the symbol the executor's own open-gate reads (intent.symbol). A reconcile-
+    # written override under ETHUSDT MUST be honored by the Python daemon — it
+    # skips and writes NO marker (transient), so the bar re-evaluates next run.
+    db_path = tmp_path / "prodigy.sqlite"
+    with connect(db_path) as conn:
+        init_db(conn)
+        conn.execute(
+            """
+            insert into equity_snapshots (
+              snapshot_id, created_at, equity, available_margin, unrealized_pnl, realized_pnl_24h
+            ) values ('s1', '2026-07-04T10:15:30Z', 1000, 1000, 0, 0)
+            """
+        )
+        set_executor_state(conn, "manual_override:ETHUSDT", "active", "2026-07-04T10:15:30Z")
+        conn.commit()
+
+    result = run_once(
+        RunOnceConfig(
+            db_path=db_path,
+            data_root=tmp_path / "data",
+            research_symbol="ETH/USDT:USDT",
+            exchange_symbol="ETHUSDT",
+            source="dummy-cycle",
+            clock=_clock(),
+            now=pd.Timestamp("2026-07-04T10:16:00Z"),
+            refresh_data=lambda: None,
+            score_loader=lambda: (1.0, "2026-07-04T10:00:00Z"),
+        )
+    )
+
+    assert result == "skipped_manual_override"
+    with connect(db_path) as conn:
+        assert conn.execute("select count(*) from trade_intents").fetchone()[0] == 0
+        key = signal_processed_key("dummy-cycle", "ETHUSDT", "15m", "2026-07-04T10:00:00Z")
+        assert get_executor_state(conn, key) is None

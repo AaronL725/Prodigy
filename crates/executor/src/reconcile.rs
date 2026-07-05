@@ -292,7 +292,14 @@ pub async fn reconcile_once(
     let local_oids = db::local_order_client_oids(conn)?;
     let mut repaired_orders = 0u32;
     let mut repaired_positions = 0u32;
-    let symbol = rest.display_symbol().to_string();
+    // M5 contract: shared execution-state symbols (positions.symbol,
+    // manual_override:*) use the EXCHANGE symbol (bitget_symbol, e.g. ETHUSDT) —
+    // the same symbol orders/intents already carry. Using display_symbol
+    // (ETH/USDT:USDT) here made reconcile-written positions/overrides invisible
+    // to the Python signal daemon AND to this crate's own open-gate
+    // (executor.rs reads manual_override:{intent.symbol} = ETHUSDT). Unify on
+    // bitget_symbol so the SQLite handoff matches across the loop.
+    let symbol = rest.bitget_symbol().to_string();
     let override_key = format!("manual_override:{symbol}");
     let mut override_active = matches!(
         db::get_executor_state(conn, &override_key)?.as_deref(),
@@ -378,7 +385,7 @@ pub async fn reconcile_once(
             exchange_order_id: Some(order_id),
             client_oid: client_oid.clone(),
             intent_id: None,
-            symbol: rest.display_symbol().to_string(),
+            symbol: rest.bitget_symbol().to_string(),
             side: str_field(&row, "side"),
             action: str_field(&row, "tradeSide"),
             order_type: str_field(&row, "orderType"),
@@ -580,7 +587,7 @@ pub async fn reconcile_once(
         .cloned()
         .unwrap_or_default()
     {
-        let symbol = rest.display_symbol().to_string();
+        let symbol = rest.bitget_symbol().to_string();
         let size = row
             .get("total")
             .or_else(|| row.get("available"))
@@ -618,7 +625,7 @@ pub async fn reconcile_once(
         // Remember the exchange returned a live position for our symbol, so the
         // post-loop manual-full-close check (which fires when NO row comes back)
         // knows this symbol still has exposure on the exchange.
-        if record.symbol == rest.display_symbol() && size.abs() > DUST_BASE {
+        if record.symbol == rest.bitget_symbol() && size.abs() > DUST_BASE {
             exchange_has_position = true;
         }
         db::upsert_position(conn, &record)?;
