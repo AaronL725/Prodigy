@@ -96,18 +96,51 @@ pub fn close_all_confirm_keyboard() -> serde_json::Value {
 /// Map a single command line to its read-only reply, or `None` if it isn't a
 /// recognized command (no reply). Remote trading controls are refused.
 pub fn query_response(conn: &Connection, text: &str) -> Result<Option<String>> {
+    Ok(query_reply(conn, text)?.map(|reply| reply.text))
+}
+
+pub fn query_reply(conn: &Connection, text: &str) -> Result<Option<TelegramReply>> {
     let command = text.split_whitespace().next().unwrap_or("");
     match command {
-        "/status" => Ok(Some(status_response(conn)?)),
-        "/positions" => Ok(Some(positions_response(conn)?)),
-        "/orders" => Ok(Some(orders_response(conn)?)),
-        "/pnl" => Ok(Some(pnl_response(conn)?)),
-        "/risk" => Ok(Some(risk_response(conn)?)),
-        "/stop" | "/resume" | "/close_all" => Ok(Some(
+        "/status" => Ok(Some(status_reply(conn)?)),
+        "/positions" => Ok(Some(positions_reply(conn)?)),
+        "/orders" => Ok(Some(orders_reply(conn)?)),
+        "/pnl" => Ok(Some(pnl_reply(conn)?)),
+        "/risk" => Ok(Some(risk_reply(conn)?)),
+        "/trades" => Ok(Some(trades_reply(conn)?)),
+        "/events" => Ok(Some(events_reply(conn)?)),
+        "/smoke_status" => Ok(Some(smoke_status_reply(conn)?)),
+        "/help" => Ok(Some(help_reply())),
+        "/stop" | "/resume" | "/close_all" => Ok(Some(TelegramReply::plain(
             "remote trading controls are not supported in M4".to_string(),
-        )),
+        ))),
         _ => Ok(None),
     }
+}
+
+fn row(label: &str, value: impl ToString) -> String {
+    format!(
+        "<b>{}</b> — <b>{}</b>",
+        html_escape(label),
+        html_escape(&value.to_string())
+    )
+}
+
+fn muted(label: &str, value: impl ToString) -> String {
+    format!(
+        "{} — {}",
+        html_escape(label),
+        html_escape(&value.to_string())
+    )
+}
+
+fn html_card(title: &str, rows: Vec<String>, footer: Option<String>) -> TelegramReply {
+    let mut text = format!("◆ {}\n\n{}", html_escape(title), rows.join("\n"));
+    if let Some(footer) = footer {
+        text.push_str("\n\n— ");
+        text.push_str(&html_escape(&footer));
+    }
+    TelegramReply::html(text, Some(navigation_keyboard()))
 }
 
 pub fn operator_response(
@@ -137,15 +170,15 @@ pub fn operator_response(
         return Ok(Some("unauthorized".to_string()));
     }
     match command {
-        "/help" => Ok(Some(help_response())),
-        "/status" => Ok(Some(status_response(conn)?)),
-        "/positions" => Ok(Some(positions_response(conn)?)),
-        "/orders" => Ok(Some(orders_response(conn)?)),
-        "/trades" => Ok(Some(trades_response(conn)?)),
-        "/pnl" => Ok(Some(pnl_response(conn)?)),
-        "/risk" => Ok(Some(risk_response(conn)?)),
-        "/events" => Ok(Some(events_response(conn)?)),
-        "/smoke_status" => Ok(Some(smoke_status_response(conn)?)),
+        "/help" => Ok(Some(help_reply().text)),
+        "/status" => Ok(Some(status_reply(conn)?.text)),
+        "/positions" => Ok(Some(positions_reply(conn)?.text)),
+        "/orders" => Ok(Some(orders_reply(conn)?.text)),
+        "/trades" => Ok(Some(trades_reply(conn)?.text)),
+        "/pnl" => Ok(Some(pnl_reply(conn)?.text)),
+        "/risk" => Ok(Some(risk_reply(conn)?.text)),
+        "/events" => Ok(Some(events_reply(conn)?.text)),
+        "/smoke_status" => Ok(Some(smoke_status_reply(conn)?.text)),
         "/stop" | "/resume" | "/cancel_all" | "/close_all" | "/confirm" => {
             match control_response(conn, text, from_user_id, now_ms) {
                 Ok(reply) => Ok(reply),
@@ -156,11 +189,24 @@ pub fn operator_response(
     }
 }
 
-fn help_response() -> String {
-    "/help /status /positions /orders /trades /pnl /risk /events /smoke_status\ncontrols: /stop /resume /cancel_all /close_all /confirm <code>".to_string()
+fn help_reply() -> TelegramReply {
+    html_card(
+        "HELP",
+        vec![
+            muted(
+                "READ",
+                "/help /status /positions /orders /trades /pnl /risk /events /smoke_status",
+            ),
+            muted(
+                "CONTROL",
+                "/stop /resume /cancel_all /close_all /confirm <code>",
+            ),
+        ],
+        None,
+    )
 }
 
-fn status_response(conn: &Connection) -> Result<String> {
+fn status_reply(conn: &Connection) -> Result<TelegramReply> {
     let pending: i64 = conn.query_row(
         "select count(*) from trade_intents where status = 'pending'",
         [],
@@ -172,13 +218,20 @@ fn status_response(conn: &Connection) -> Result<String> {
         |r| r.get(0),
     )?;
     let manual_overrides = active_manual_override_count(conn)?;
-    Ok(format!(
-        "status:\ndaemon={}\nsignal={}\nreconcile={}\noperator_stop={}\nmanual_overrides={manual_overrides}\npending_intents={pending}\npending_controls={pending_controls}\nlatest_error={}",
-        latest_daemon_status(conn)?,
-        latest_signal_status(conn)?,
-        latest_reconcile_status(conn)?,
-        operator_stop_state(conn)?,
-        latest_critical_error(conn)?,
+    Ok(html_card(
+        "PRODIGY OPERATOR",
+        vec![
+            row("MODE", "DEMO"),
+            row("DAEMON", latest_daemon_status(conn)?),
+            row("SIGNAL", latest_signal_status(conn)?),
+            row("RECONCILE", latest_reconcile_status(conn)?),
+            row("OPERATOR STOP", operator_stop_state(conn)?),
+            row("MANUAL OVERRIDES", manual_overrides),
+            row("PENDING INTENTS", pending),
+            row("PENDING CONTROLS", pending_controls),
+            row("LATEST ERROR", latest_critical_error(conn)?),
+        ],
+        None,
     ))
 }
 
@@ -284,31 +337,33 @@ fn latest_critical_error(conn: &Connection) -> Result<String> {
         .unwrap_or_else(|| "n/a".to_string()))
 }
 
-fn positions_response(conn: &Connection) -> Result<String> {
+fn positions_reply(conn: &Connection) -> Result<TelegramReply> {
     let mut stmt = conn.prepare(
         "select symbol, side, notional, entry_price, unrealized_pnl, ownership
          from positions order by symbol",
     )?;
-    let rows = stmt.query_map([], |row| {
-        Ok(format!(
-            "{} {} notional={} entry={} upnl={} ownership={}",
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, f64>(2)?,
-            row.get::<_, f64>(3)?,
-            row.get::<_, f64>(4)?,
-            row.get::<_, String>(5)?,
+    let rows = stmt.query_map([], |r| {
+        Ok(row(
+            "POSITION",
+            format!(
+                "{} {} notional={} entry={} upnl={} ownership={}",
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, f64>(2)?,
+                r.get::<_, f64>(3)?,
+                r.get::<_, f64>(4)?,
+                r.get::<_, String>(5)?,
+            ),
         ))
     })?;
-    let lines = rows.collect::<Result<Vec<_>, _>>()?;
-    Ok(if lines.is_empty() {
-        "positions: none".to_string()
-    } else {
-        lines.join("\n")
-    })
+    let mut lines = rows.collect::<Result<Vec<_>, _>>()?;
+    if lines.is_empty() {
+        lines.push(row("POSITIONS", "NONE"));
+    }
+    Ok(html_card("POSITIONS", lines, None))
 }
 
-fn orders_response(conn: &Connection) -> Result<String> {
+fn orders_reply(conn: &Connection) -> Result<TelegramReply> {
     let mut stmt = conn.prepare(
         "with working as (
            select client_oid, symbol, side, action, status, size, filled_size, updated_at, 0 as bucket
@@ -330,51 +385,55 @@ fn orders_response(conn: &Connection) -> Result<String> {
          )
          order by bucket asc, updated_at desc",
     )?;
-    let rows = stmt.query_map([], |row| {
-        Ok(format!(
-            "{} {} {} {} status={} size={} filled={}",
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
-            row.get::<_, String>(4)?,
-            row.get::<_, f64>(5)?,
-            row.get::<_, f64>(6)?,
+    let rows = stmt.query_map([], |r| {
+        Ok(row(
+            "ORDER",
+            format!(
+                "{} {} {} {} status={} size={} filled={}",
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, f64>(5)?,
+                r.get::<_, f64>(6)?,
+            ),
         ))
     })?;
-    let lines = rows.collect::<Result<Vec<_>, _>>()?;
-    Ok(if lines.is_empty() {
-        "orders: none".to_string()
-    } else {
-        lines.join("\n")
-    })
+    let mut lines = rows.collect::<Result<Vec<_>, _>>()?;
+    if lines.is_empty() {
+        lines.push(row("ORDERS", "NONE"));
+    }
+    Ok(html_card("ORDERS", lines, None))
 }
 
-fn trades_response(conn: &Connection) -> Result<String> {
+fn trades_reply(conn: &Connection) -> Result<TelegramReply> {
     let mut stmt = conn.prepare(
         "select symbol, side, price, size, fee, created_at
          from fills order by created_at desc limit 10",
     )?;
-    let rows = stmt.query_map([], |row| {
-        Ok(format!(
-            "{} {} price={} size={} fee={} at={}",
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, f64>(2)?,
-            row.get::<_, f64>(3)?,
-            row.get::<_, f64>(4)?,
-            row.get::<_, String>(5)?,
+    let rows = stmt.query_map([], |r| {
+        Ok(row(
+            "TRADE",
+            format!(
+                "{} {} price={} size={} fee={} at={}",
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, f64>(2)?,
+                r.get::<_, f64>(3)?,
+                r.get::<_, f64>(4)?,
+                r.get::<_, String>(5)?,
+            ),
         ))
     })?;
-    let lines = rows.collect::<Result<Vec<_>, _>>()?;
-    Ok(if lines.is_empty() {
-        "trades: none".to_string()
-    } else {
-        lines.join("\n")
-    })
+    let mut lines = rows.collect::<Result<Vec<_>, _>>()?;
+    if lines.is_empty() {
+        lines.push(row("TRADES", "NONE"));
+    }
+    Ok(html_card("TRADES", lines, None))
 }
 
-fn pnl_response(conn: &Connection) -> Result<String> {
+fn pnl_reply(conn: &Connection) -> Result<TelegramReply> {
     let unrealized: f64 = conn.query_row(
         "select coalesce(sum(unrealized_pnl), 0) from positions",
         [],
@@ -388,13 +447,19 @@ fn pnl_response(conn: &Connection) -> Result<String> {
         )
         .ok();
     // ponytail: no realized-PnL ledger yet; report unknown instead of implying total PnL.
-    Ok(format!(
-        "pnl:\nunrealized={unrealized}\nequity={}\nrealized=n/a\ntotal=n/a",
-        equity.unwrap_or(0.0)
+    Ok(html_card(
+        "PNL",
+        vec![
+            row("UNREALIZED", unrealized),
+            row("EQUITY", equity.unwrap_or(0.0)),
+            row("REALIZED", "n/a"),
+            row("TOTAL", "n/a"),
+        ],
+        None,
     ))
 }
 
-fn risk_response(conn: &Connection) -> Result<String> {
+fn risk_reply(conn: &Connection) -> Result<TelegramReply> {
     let manual_overrides = active_manual_override_count(conn)?;
     let operator_stop = operator_stop_state(conn)?;
     let equity: Option<(f64, f64, f64)> = conn
@@ -449,39 +514,56 @@ fn risk_response(conn: &Connection) -> Result<String> {
     } else {
         "ok"
     };
-    Ok(format!(
-        "risk:\nrisk_state={risk_state}\nequity={equity_text}\navailable_margin={available_text}\nmargin_state={margin_state}\nmanual_overrides={manual_overrides}\noperator_stop={operator_stop}\ntrading_suspension={trading_suspension}"
+    Ok(html_card(
+        "RISK",
+        vec![
+            row("RISK STATE", risk_state),
+            row("EQUITY", equity_text),
+            row("AVAILABLE MARGIN", available_text),
+            row("MARGIN STATE", margin_state),
+            row("MANUAL OVERRIDES", manual_overrides),
+            row("OPERATOR STOP", operator_stop),
+            row("TRADING SUSPENSION", trading_suspension),
+        ],
+        None,
     ))
 }
 
-fn events_response(conn: &Connection) -> Result<String> {
+fn events_reply(conn: &Connection) -> Result<TelegramReply> {
     let mut stmt = conn.prepare(
         "select created_at, severity, component, message
          from events
          where severity in ('warning', 'error', 'critical')
          order by created_at desc limit 10",
     )?;
-    let rows = stmt.query_map([], |row| {
-        Ok(format!(
-            "{} {} {}: {}",
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
+    let rows = stmt.query_map([], |r| {
+        Ok(row(
+            "EVENT",
+            format!(
+                "{} {} {}: {}",
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+            ),
         ))
     })?;
-    let lines = rows.collect::<Result<Vec<_>, _>>()?;
-    Ok(if lines.is_empty() {
-        "events: none".to_string()
-    } else {
-        lines.join("\n")
-    })
+    let mut lines = rows.collect::<Result<Vec<_>, _>>()?;
+    if lines.is_empty() {
+        lines.push(row("EVENTS", "NONE"));
+    }
+    Ok(html_card("EVENTS", lines, None))
 }
 
-fn smoke_status_response(conn: &Connection) -> Result<String> {
-    Ok(format!(
-        "smoke_status: {}",
-        crate::db::get_executor_state(conn, "smoke:status")?.unwrap_or_else(|| "n/a".to_string())
+fn smoke_status_reply(conn: &Connection) -> Result<TelegramReply> {
+    Ok(html_card(
+        "SMOKE STATUS",
+        vec![row(
+            "STATUS",
+            crate::db::get_executor_state(conn, "smoke:status")?
+                .unwrap_or_else(|| "n/a".to_string()),
+        )],
+        None,
     ))
 }
 
@@ -764,14 +846,68 @@ mod tests {
     }
 
     #[test]
+    fn status_reply_uses_editorial_html_layout_and_navigation_keyboard() {
+        let conn = test_conn();
+        crate::db::write_event(&conn, "info", "daemon", "daemon started", "{}").unwrap();
+
+        let reply = query_reply(&conn, "/status").unwrap().unwrap();
+
+        assert_eq!(reply.parse_mode, Some("HTML"));
+        assert!(reply.text.contains("◆ PRODIGY OPERATOR"));
+        assert!(reply.text.contains("<b>MODE</b>"));
+        assert!(reply.text.contains("<b>DEMO</b>"));
+        assert!(reply.text.contains("<b>DAEMON</b>"));
+        assert!(reply.reply_markup.is_some());
+    }
+
+    #[test]
+    fn pnl_reply_keeps_realized_and_total_conservative() {
+        let conn = test_conn();
+        conn.execute(
+            "insert into equity_snapshots (
+               snapshot_id, created_at, equity, available_margin, unrealized_pnl, realized_pnl_24h
+             ) values ('s1', '2026-07-06T00:00:00Z', 1000, 900, 2.5, 0)",
+            [],
+        )
+        .unwrap();
+
+        let reply = query_reply(&conn, "/pnl").unwrap().unwrap();
+
+        assert_eq!(reply.parse_mode, Some("HTML"));
+        assert!(reply.text.contains("◆ PNL"));
+        assert!(reply.text.contains("<b>REALIZED</b>"));
+        assert!(reply.text.contains("<b>n/a</b>"));
+        assert!(reply.text.contains("<b>TOTAL</b>"));
+    }
+
+    #[test]
+    fn dynamic_values_are_escaped_in_position_reply() {
+        let conn = test_conn();
+        conn.execute(
+            "insert into positions (
+              symbol, side, notional, entry_price, unrealized_pnl, updated_at,
+              ownership, raw_json
+            ) values ('BAD<&>SYM', 'long', 100.0, 2000.0, 3.5, 'now', 'system', '{}')",
+            [],
+        )
+        .unwrap();
+
+        let reply = query_reply(&conn, "/positions").unwrap().unwrap();
+
+        assert!(reply.text.contains("BAD&lt;&amp;&gt;SYM"));
+        assert!(!reply.text.contains("BAD<&>SYM"));
+    }
+
+    #[test]
     fn status_query_reads_sqlite_without_side_effects() {
         let conn = test_conn();
         crate::db::write_event(&conn, "info", "daemon", "daemon started", "{}").unwrap();
 
         let response = query_response(&conn, "/status").unwrap().unwrap();
 
-        assert!(response.contains("status"));
-        assert!(response.contains("daemon"));
+        assert!(response.contains("◆ PRODIGY OPERATOR"));
+        assert!(response.contains("<b>DAEMON</b>"));
+        assert!(response.contains("daemon started"));
     }
 
     #[test]
@@ -816,15 +952,15 @@ mod tests {
 
         let response = query_response(&conn, "/status").unwrap().unwrap();
 
-        assert!(response.contains("daemon=daemon started at 2026-07-06T00:00:00Z"));
-        assert!(response.contains("signal=no_signal at 2026-07-06T00:02:00Z"));
-        assert!(response.contains("reconcile=2026-07-06T00:01:00Z"));
-        assert!(response.contains("operator_stop=active"));
-        assert!(response.contains("manual_overrides=1"));
-        assert!(response.contains("pending_intents=1"));
-        assert!(response.contains("pending_controls=2"));
+        assert!(response.contains("<b>DAEMON</b> — <b>daemon started at 2026-07-06T00:00:00Z</b>"));
+        assert!(response.contains("<b>SIGNAL</b> — <b>no_signal at 2026-07-06T00:02:00Z</b>"));
+        assert!(response.contains("<b>RECONCILE</b> — <b>2026-07-06T00:01:00Z</b>"));
+        assert!(response.contains("<b>OPERATOR STOP</b> — <b>active</b>"));
+        assert!(response.contains("<b>MANUAL OVERRIDES</b> — <b>1</b>"));
+        assert!(response.contains("<b>PENDING INTENTS</b> — <b>1</b>"));
+        assert!(response.contains("<b>PENDING CONTROLS</b> — <b>2</b>"));
         assert!(response
-            .contains("latest_error=critical executor: risk gate failed at 2026-07-06T00:03:00Z"));
+            .contains("<b>LATEST ERROR</b> — <b>critical executor: risk gate failed at 2026-07-06T00:03:00Z</b>"));
     }
 
     #[test]
@@ -909,7 +1045,16 @@ mod tests {
 
         let response = query_response(&conn, "/orders").unwrap().unwrap();
 
-        assert!(response.lines().next().unwrap().contains("old-working"));
+        let lines: Vec<_> = response.lines().collect();
+        let old_working = lines
+            .iter()
+            .position(|line| line.contains("old-working"))
+            .unwrap();
+        let newest_recent = lines
+            .iter()
+            .position(|line| line.contains("recent-10"))
+            .unwrap();
+        assert!(old_working < newest_recent);
         assert_eq!(response.matches("old-working").count(), 1);
     }
 
@@ -1323,8 +1468,8 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        assert!(response.contains("realized=n/a"));
-        assert!(response.contains("total=n/a"));
+        assert!(response.contains("<b>REALIZED</b> — <b>n/a</b>"));
+        assert!(response.contains("<b>TOTAL</b> — <b>n/a</b>"));
     }
 
     #[test]
@@ -1342,8 +1487,8 @@ mod tests {
 
         let response = query_response(&conn, "/pnl").unwrap().unwrap();
 
-        assert!(response.contains("unrealized=0"));
-        assert!(response.contains("equity=1000"));
+        assert!(response.contains("<b>UNREALIZED</b> — <b>0</b>"));
+        assert!(response.contains("<b>EQUITY</b> — <b>1000</b>"));
     }
 
     #[test]
@@ -1354,8 +1499,8 @@ mod tests {
 
         let response = query_response(&conn, "/risk").unwrap().unwrap();
 
-        assert!(response.contains("manual_overrides=1"));
-        assert!(response.contains("available_margin=500"));
+        assert!(response.contains("<b>MANUAL OVERRIDES</b> — <b>1</b>"));
+        assert!(response.contains("<b>AVAILABLE MARGIN</b> — <b>500</b>"));
     }
 
     #[test]
@@ -1381,12 +1526,12 @@ mod tests {
 
         let response = query_response(&conn, "/risk").unwrap().unwrap();
 
-        assert!(response.contains("risk_state=blocked"));
-        assert!(response.contains("equity=1000"));
-        assert!(response.contains("available_margin=25"));
-        assert!(response.contains("margin_state=low"));
-        assert!(response.contains("manual_overrides=2"));
-        assert!(response.contains("operator_stop=active"));
-        assert!(response.contains("trading_suspension=active"));
+        assert!(response.contains("<b>RISK STATE</b> — <b>blocked</b>"));
+        assert!(response.contains("<b>EQUITY</b> — <b>1000</b>"));
+        assert!(response.contains("<b>AVAILABLE MARGIN</b> — <b>25</b>"));
+        assert!(response.contains("<b>MARGIN STATE</b> — <b>low</b>"));
+        assert!(response.contains("<b>MANUAL OVERRIDES</b> — <b>2</b>"));
+        assert!(response.contains("<b>OPERATOR STOP</b> — <b>active</b>"));
+        assert!(response.contains("<b>TRADING SUSPENSION</b> — <b>active</b>"));
     }
 }
