@@ -109,7 +109,6 @@ Unauthorized users:
 - `/risk` - risk state, margin state, manual override, and trading suspension.
 - `/events` - recent important events.
 - `/smoke_status` - active smoke run status.
-- `/smoke_report` - latest smoke report summary and path.
 
 Queries read SQLite only. Query failure must not affect execution.
 
@@ -352,7 +351,7 @@ Rust control command processing must fail safe:
 7. Real Telegram send/receive testing works in demo mode when credentials exist.
 8. `/help` lists query and control commands.
 9. `/status`, `/positions`, `/orders`, `/trades`, `/pnl`, `/risk`, `/events`,
-   `/smoke_status`, and `/smoke_report` read SQLite only.
+   and `/smoke_status` read SQLite only.
 10. `/pnl` shows `realized=n/a` and `total=n/a` when realized PnL is unreliable.
 11. `/stop` writes a `stop` control command and audit event.
 12. Rust consumes `stop`, sets `operator_stop:global=active`, and blocks new opening exposure.

@@ -64,7 +64,6 @@ pub fn operator_response(
         "/risk" => Ok(Some(risk_response(conn)?)),
         "/events" => Ok(Some(events_response(conn)?)),
         "/smoke_status" => Ok(Some(smoke_status_response(conn)?)),
-        "/smoke_report" => Ok(Some(smoke_report_response(conn)?)),
         "/stop" | "/resume" | "/cancel_all" | "/close_all" | "/confirm" => {
             control_response(conn, text, from_user_id, now_ms)
         }
@@ -73,7 +72,7 @@ pub fn operator_response(
 }
 
 fn help_response() -> String {
-    "/help /status /positions /orders /trades /pnl /risk /events /smoke_status /smoke_report\ncontrols: /stop /resume /cancel_all /close_all /confirm <code>".to_string()
+    "/help /status /positions /orders /trades /pnl /risk /events /smoke_status\ncontrols: /stop /resume /cancel_all /close_all /confirm <code>".to_string()
 }
 
 fn status_response(conn: &Connection) -> Result<String> {
@@ -229,14 +228,6 @@ fn smoke_status_response(conn: &Connection) -> Result<String> {
     Ok(format!(
         "smoke_status: {}",
         crate::db::get_executor_state(conn, "smoke:status")?.unwrap_or_else(|| "n/a".to_string())
-    ))
-}
-
-fn smoke_report_response(conn: &Connection) -> Result<String> {
-    Ok(format!(
-        "smoke_report: {}",
-        crate::db::get_executor_state(conn, "smoke:last_report")?
-            .unwrap_or_else(|| "n/a".to_string())
     ))
 }
 
@@ -554,6 +545,27 @@ mod tests {
         assert!(response.contains("/status"));
         assert!(response.contains("/trades"));
         assert!(response.contains("/close_all"));
+    }
+
+    #[test]
+    fn smoke_report_is_not_a_telegram_command() {
+        let conn = test_conn();
+        crate::db::set_executor_state(&conn, "smoke:last_report", "reports/local.md").unwrap();
+
+        let help = operator_response(&conn, "/help", "123", &["123".to_string()], 1_000)
+            .unwrap()
+            .unwrap();
+        let response = operator_response(
+            &conn,
+            "/smoke_report",
+            "123",
+            &["123".to_string()],
+            1_000,
+        )
+        .unwrap();
+
+        assert!(!help.contains("/smoke_report"));
+        assert!(response.is_none());
     }
 
     #[test]
