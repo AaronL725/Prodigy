@@ -1466,13 +1466,13 @@ If Step 3 required small fixes in Rust files, include them in the commit with th
 
 Before reporting completion:
 
-- [ ] Slash commands still work.
-- [ ] Buttons map to existing command semantics only.
-- [ ] `/close_all` cannot queue without a second confirmation action.
-- [ ] Button confirmation is same-user, expiring, one-use, and audited.
-- [ ] Telegram callbacks never call Bitget.
-- [ ] Telegram command menu contains existing commands only.
-- [ ] Dynamic values are HTML-escaped.
-- [ ] No new dependencies were added.
-- [ ] No live trading path was added.
-- [ ] Full verification commands pass.
+- [x] Slash commands still work.
+- [x] Buttons map to existing command semantics only.
+- [x] `/close_all` cannot queue without a second confirmation action.
+- [x] Button confirmation is same-user, expiring, one-use, and audited.
+- [x] Telegram callbacks never call Bitget.
+- [x] Telegram command menu contains existing commands only.
+- [x] Dynamic values are HTML-escaped.
+- [x] No new dependencies were added.
+- [x] No live trading path was added.
+- [x] Full verification commands pass.
