@@ -596,6 +596,10 @@ fn telegram_operator_http_timeout() -> Duration {
     Duration::from_secs(15)
 }
 
+fn telegram_command_registration_timeout() -> Duration {
+    Duration::from_secs(2)
+}
+
 /// Optional Telegram operator polling loop (M6). Runs ONLY when
 /// `telegram_bot_token` is configured and `telegram_allowed_user_ids` is
 /// non-empty — otherwise it returns immediately, since Telegram is not an
@@ -622,6 +626,7 @@ pub async fn run_telegram_query_loop(
     let set_commands_url = format!("https://api.telegram.org/bot{token}/setMyCommands");
     let _ = client
         .post(set_commands_url)
+        .timeout(telegram_command_registration_timeout())
         .json(&crate::telegram_query::bot_commands_payload())
         .send()
         .await;
@@ -1163,6 +1168,12 @@ mod tests {
             std::time::Duration::from_secs(15)
         );
         assert!(telegram_operator_http_timeout() > std::time::Duration::from_secs(10));
+    }
+
+    #[test]
+    fn telegram_command_registration_timeout_is_shorter_than_long_poll() {
+        assert!(telegram_command_registration_timeout() < telegram_operator_http_timeout());
+        assert!(telegram_command_registration_timeout() <= std::time::Duration::from_secs(2));
     }
 
     #[test]

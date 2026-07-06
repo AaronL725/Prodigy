@@ -135,8 +135,8 @@ pub fn query_reply(conn: &Connection, text: &str) -> Result<Option<TelegramReply
         "/events" => Ok(Some(events_reply(conn)?)),
         "/smoke_status" => Ok(Some(smoke_status_reply(conn)?)),
         "/help" => Ok(Some(help_reply())),
-        "/stop" | "/resume" | "/close_all" => Ok(Some(TelegramReply::plain(
-            "remote trading controls are not supported in M4".to_string(),
+        "/stop" | "/resume" | "/cancel_all" | "/close_all" => Ok(Some(TelegramReply::plain(
+            "operator controls require authorized Telegram access".to_string(),
         ))),
         _ => Ok(None),
     }
@@ -2095,6 +2095,18 @@ mod tests {
         // ponytail: None = "don't reply" — the polling loop only sends on Some,
         // so noise from other chats or stray text never spams the operator.
         assert!(query_response(&conn, "hello world").unwrap().is_none());
+    }
+
+    #[test]
+    fn query_response_refuses_all_controls_without_stale_milestone_copy() {
+        let conn = test_conn();
+
+        for command in ["/stop", "/resume", "/cancel_all", "/close_all"] {
+            let response = query_response(&conn, command).unwrap().unwrap();
+
+            assert!(response.contains("operator controls require authorized Telegram access"));
+            assert!(!response.contains("M4"));
+        }
     }
 
     #[test]
