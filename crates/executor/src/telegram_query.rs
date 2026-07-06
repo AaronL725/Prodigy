@@ -11,6 +11,88 @@ use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TelegramReply {
+    pub text: String,
+    pub parse_mode: Option<&'static str>,
+    pub reply_markup: Option<serde_json::Value>,
+}
+
+impl TelegramReply {
+    pub fn html(text: String, reply_markup: Option<serde_json::Value>) -> Self {
+        Self {
+            text,
+            parse_mode: Some("HTML"),
+            reply_markup,
+        }
+    }
+
+    pub fn plain(text: String) -> Self {
+        Self {
+            text,
+            parse_mode: None,
+            reply_markup: None,
+        }
+    }
+}
+
+pub fn html_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn button(text: &str, callback_data: &str) -> serde_json::Value {
+    serde_json::json!({
+        "text": text,
+        "callback_data": callback_data,
+    })
+}
+
+fn inline_keyboard(rows: Vec<Vec<serde_json::Value>>) -> serde_json::Value {
+    serde_json::json!({ "inline_keyboard": rows })
+}
+
+pub fn navigation_keyboard() -> serde_json::Value {
+    inline_keyboard(vec![
+        vec![
+            button("Status", "tgux:status"),
+            button("PnL", "tgux:pnl"),
+            button("Risk", "tgux:risk"),
+        ],
+        vec![
+            button("Positions", "tgux:positions"),
+            button("Orders", "tgux:orders"),
+            button("Trades", "tgux:trades"),
+        ],
+        vec![
+            button("Events", "tgux:events"),
+            button("Smoke", "tgux:smoke"),
+            button("Help", "tgux:help"),
+        ],
+        vec![button("Control", "tgux:control")],
+    ])
+}
+
+pub fn control_keyboard() -> serde_json::Value {
+    inline_keyboard(vec![
+        vec![button("Stop", "tgux:stop"), button("Resume", "tgux:resume")],
+        vec![
+            button("Cancel All", "tgux:cancel_all"),
+            button("Close All", "tgux:close_all"),
+        ],
+        vec![button("Back", "tgux:status")],
+    ])
+}
+
+pub fn close_all_confirm_keyboard() -> serde_json::Value {
+    inline_keyboard(vec![
+        vec![button("Confirm Close All", "tgux:confirm_close_all")],
+        vec![button("Cancel", "tgux:cancel_close_all")],
+    ])
+}
+
 /// Map a single command line to its read-only reply, or `None` if it isn't a
 /// recognized command (no reply). Remote trading controls are refused.
 pub fn query_response(conn: &Connection, text: &str) -> Result<Option<String>> {
@@ -634,6 +716,51 @@ mod tests {
         conn.execute_batch(include_str!("../../../schema/002_execution.sql"))
             .unwrap();
         conn
+    }
+
+    #[test]
+    fn html_escape_escapes_dynamic_telegram_values() {
+        assert_eq!(html_escape("ETH<&>USDT"), "ETH&lt;&amp;&gt;USDT");
+    }
+
+    #[test]
+    fn navigation_keyboard_contains_query_and_control_buttons() {
+        let keyboard = navigation_keyboard();
+        let text = serde_json::to_string(&keyboard).unwrap();
+
+        for callback in [
+            "tgux:status",
+            "tgux:pnl",
+            "tgux:risk",
+            "tgux:positions",
+            "tgux:orders",
+            "tgux:trades",
+            "tgux:events",
+            "tgux:smoke",
+            "tgux:help",
+            "tgux:control",
+        ] {
+            assert!(text.contains(callback), "missing {callback}");
+        }
+    }
+
+    #[test]
+    fn control_keyboard_contains_only_existing_control_commands() {
+        let keyboard = control_keyboard();
+        let text = serde_json::to_string(&keyboard).unwrap();
+
+        for callback in [
+            "tgux:stop",
+            "tgux:resume",
+            "tgux:cancel_all",
+            "tgux:close_all",
+        ] {
+            assert!(text.contains(callback), "missing {callback}");
+        }
+        assert!(text.contains("tgux:status"), "missing Back callback");
+        assert!(!text.contains("open"));
+        assert!(!text.contains("set_param"));
+        assert!(!text.contains("live"));
     }
 
     #[test]
