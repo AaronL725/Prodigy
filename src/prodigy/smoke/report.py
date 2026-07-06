@@ -52,7 +52,15 @@ def build_smoke_report(
             """
         ).fetchall()
 
-    issue_lines = [f"- {issue}" for issue in issues] or ["- none"]
+    report_issues = list(issues)
+    if counts["positions"] > 0:
+        report_issues.append(f"residual positions: {counts['positions']}")
+    working_orders = sum(
+        count for status, count in statuses["orders"] if status in {"submitted", "live"}
+    )
+    if working_orders > 0:
+        report_issues.append(f"residual working orders: {working_orders}")
+    issue_lines = [f"- {issue}" for issue in report_issues] or ["- none"]
     event_lines = [
         f"- {row['created_at']} | {row['severity']} | {row['component']} | {row['message']}"
         for row in events

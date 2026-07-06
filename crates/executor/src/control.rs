@@ -36,10 +36,15 @@ pub fn enqueue_close_all_intents(
     conn: &rusqlite::Connection,
     command_id: &str,
     requested_by: &str,
+    symbol: &str,
 ) -> Result<usize> {
     audit_skipped_non_system_positions(conn, command_id, requested_by)?;
+    audit_skipped_unsupported_system_positions(conn, command_id, requested_by, symbol)?;
     let mut queued = 0usize;
-    for position in crate::db::system_positions(conn)? {
+    for position in crate::db::system_positions(conn)?
+        .into_iter()
+        .filter(|position| position.symbol == symbol)
+    {
         queued += conn.execute(
             "insert or ignore into trade_intents (
                intent_id, created_at, symbol, side, action, target_notional,
@@ -55,6 +60,43 @@ pub fn enqueue_close_all_intents(
         )?;
     }
     Ok(queued)
+}
+
+fn audit_skipped_unsupported_system_positions(
+    conn: &rusqlite::Connection,
+    command_id: &str,
+    requested_by: &str,
+    supported_symbol: &str,
+) -> Result<usize> {
+    let mut stmt = conn.prepare(
+        "select symbol, side
+         from positions
+         where ownership = 'system' and symbol <> ?
+         order by symbol",
+    )?;
+    let rows = stmt.query_map([supported_symbol], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut skipped = 0usize;
+    for row in rows {
+        let (symbol, side) = row?;
+        crate::db::write_event(
+            conn,
+            "warning",
+            "control",
+            "close_all skipped unsupported system position",
+            &serde_json::json!({
+                "command_id": command_id,
+                "requested_by": requested_by,
+                "symbol": symbol,
+                "side": side,
+                "supported_symbol": supported_symbol
+            })
+            .to_string(),
+        )?;
+        skipped += 1;
+    }
+    Ok(skipped)
 }
 
 fn audit_skipped_non_system_positions(
@@ -333,7 +375,12 @@ async fn apply_close_all(
 ) -> Result<()> {
     apply_cancel_all(conn, cfg, rest, &command.command_id).await?;
     reconcile_control(conn, cfg, rest).await?;
-    let queued = enqueue_close_all_intents(conn, &command.command_id, &command.requested_by)?;
+    let queued = enqueue_close_all_intents(
+        conn,
+        &command.command_id,
+        &command.requested_by,
+        &cfg.bitget_symbol,
+    )?;
     crate::db::write_event(
         conn,
         "info",
@@ -407,7 +454,10 @@ fn ensure_close_all_finished(
         ));
     }
 
-    let positions = crate::db::system_positions(conn)?;
+    let positions: Vec<_> = crate::db::system_positions(conn)?
+        .into_iter()
+        .filter(|position| position.symbol == cfg.bitget_symbol)
+        .collect();
     if !positions.is_empty() {
         return Err(anyhow::anyhow!(
             "close_all left {} system positions",
@@ -454,7 +504,7 @@ mod tests {
     }
 
     #[test]
-    fn close_all_intents_are_created_only_for_system_positions() {
+    fn close_all_intents_are_created_only_for_configured_system_symbol() {
         let conn = conn();
         conn.execute(
             "insert into positions (
@@ -462,12 +512,13 @@ mod tests {
               ownership, opened_at, adopted_at, source_intent_id, raw_json
             ) values
             ('ETHUSDT', 'long', 100, 2000, 1, 'now', 'system', 'now', null, 'i1', '{}'),
-            ('BTCUSDT', 'short', 100, 2000, 1, 'now', 'imported', 'now', 'now', null, '{}')",
+            ('BTCUSDT', 'short', 100, 30000, 1, 'now', 'system', 'now', null, 'i2', '{}'),
+            ('SOLUSDT', 'short', 100, 2000, 1, 'now', 'imported', 'now', 'now', null, '{}')",
             [],
         )
         .unwrap();
 
-        enqueue_close_all_intents(&conn, "cmd-1", "123").unwrap();
+        enqueue_close_all_intents(&conn, "cmd-1", "123", "ETHUSDT").unwrap();
 
         let rows: Vec<(String, String, String)> = conn
             .prepare("select symbol, side, action from trade_intents order by symbol")
@@ -484,6 +535,19 @@ mod tests {
                 "close".to_string()
             )]
         );
+        let skipped_symbols: Vec<String> = conn
+            .prepare(
+                "select json_extract(payload_json, '$.symbol')
+                 from events
+                 where message = 'close_all skipped unsupported system position'
+                 order by event_id",
+            )
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(skipped_symbols, vec!["BTCUSDT".to_string()]);
     }
 
     #[test]
@@ -500,7 +564,7 @@ mod tests {
         )
         .unwrap();
 
-        enqueue_close_all_intents(&conn, "cmd-1", "123").unwrap();
+        enqueue_close_all_intents(&conn, "cmd-1", "123", "ETHUSDT").unwrap();
 
         let events: Vec<(String, String)> = conn
             .prepare("select message, payload_json from events order by created_at")

@@ -36,6 +36,25 @@ def _seed_smoke_db(db_path):
                     'demo warning recorded', '{}')
             """
         )
+        conn.execute(
+            """
+            insert into positions (
+              symbol, side, notional, entry_price, unrealized_pnl, updated_at,
+              ownership, opened_at, raw_json
+            ) values ('ETHUSDT', 'long', 100, 2000, 1, '2026-07-06T00:25:00Z',
+                      'imported', '2026-07-06T00:25:00Z', '{}')
+            """
+        )
+        conn.execute(
+            """
+            insert into orders (
+              order_id, client_oid, intent_id, symbol, side, action, order_type,
+              status, price, size, filled_size, created_at, updated_at
+            ) values ('order-1', 'client-1', 'intent-1', 'ETHUSDT', 'buy', 'open',
+                      'limit', 'submitted', 2000, 0.1, 0,
+                      '2026-07-06T00:26:00Z', '2026-07-06T00:26:00Z')
+            """
+        )
         conn.commit()
 
 
@@ -57,6 +76,8 @@ def test_build_smoke_report_summarizes_sqlite_state(tmp_path):
     assert "- control_commands_total: 1" in report
     assert "- executed: 1" in report
     assert "- executor exited early with code 1" in report
+    assert "- residual positions: 1" in report
+    assert "- residual working orders: 1" in report
     assert "2026-07-06T00:20:00Z | warning | executor | demo warning recorded" in report
 
 

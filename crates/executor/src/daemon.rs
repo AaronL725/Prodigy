@@ -277,6 +277,7 @@ async fn process_daemon_queues_once(
             &format!("control loop failed: {err}"),
             "{}",
         );
+        return Ok(());
     }
 
     let mut intent_cache = market_cache.clone();
@@ -1105,7 +1106,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn daemon_tick_logs_control_error_and_continues_to_intents() {
+    async fn daemon_tick_logs_control_error_and_skips_intents() {
         let conn = test_conn();
         insert_pending_open_intent(&conn, "i-open");
         let demo_cfg = ExecutorConfig {
@@ -1139,7 +1140,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(control_errors, 1);
-        let deferred_events: i64 = conn
+        let intent_loop_events: i64 = conn
             .query_row(
                 "select count(*) from events
                  where component = 'intent_loop'
@@ -1148,7 +1149,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(deferred_events, 1);
+        assert_eq!(intent_loop_events, 0);
         assert_eq!(intent_status_and_error(&conn, "i-open").0, "pending");
     }
 
