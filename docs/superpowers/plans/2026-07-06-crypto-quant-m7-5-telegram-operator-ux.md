@@ -14,22 +14,64 @@
 
 - Modify: `crates/executor/src/telegram_query.rs`
   - Add a small `TelegramReply` value type.
-  - Add HTML escaping and dark editorial formatting helpers.
-  - Add inline keyboard builders.
+  - Add HTML escaping and refined dark editorial formatting helpers.
+  - Add inline keyboard builders, including bounded pagination controls.
   - Preserve existing `query_response()` and `operator_response()` string APIs for tests/backward compatibility.
   - Add richer reply APIs for the daemon loop.
-  - Add callback handling for read-only and control buttons.
+  - Add callback handling for read-only, paginated list, and control buttons.
   - Add button-based `/close_all` confirmation and cancellation.
   - Add a pure `bot_commands_payload()` helper for setMyCommands.
 - Modify: `crates/executor/src/daemon.rs`
   - Parse Telegram `callback_query` updates in addition to text messages.
   - Send HTML parse mode and inline keyboard reply markup.
   - Answer callback queries promptly.
-  - Register bot commands once at Telegram loop startup, best effort.
+  - Register bot commands once at Telegram loop startup, best effort, with a short request timeout.
 - Modify: `tests/test_executor_integration.py`
   - Extend the existing dangerous-scope scan so M7.5 still forbids remote open, live enablement, remote parameter editing, model debug, shell, and direct Telegram-to-Bitget paths.
 
 No schema migration, no new dependencies, no new command names, no live path, no remote open, no parameter editing, no model debug, no shell.
+
+---
+
+## Current Version Notes From Operator Feedback
+
+The task list below records the original TDD implementation path. The current
+branch also includes post-plan operator feedback commits; where older snippets
+below still show all-uppercase labels, unpaged list callbacks, `/confirm` in
+the help body, or stale M4 refusal copy, this section and the design spec are
+the source of truth.
+
+Reviewed unplanned commits:
+
+- `46acb8c fix: tighten telegram operator compatibility edges`
+  - `query_response()` now rejects `/stop`, `/resume`, `/cancel_all`, and
+    `/close_all` with current authorization wording.
+  - `setMyCommands` remains best effort but uses a short request timeout so
+    Telegram polling is not delayed by the long HTTP client timeout.
+- `457ba33 fix: polish telegram operator reply formatting`
+  - All `◆` headings render as bold Title Case.
+  - `/help` no longer advertises `/confirm <code>`; `/confirm` remains a
+    fallback command path.
+  - Status-style replies use bold Title Case labels and unbold values.
+  - Position/order/trade/PnL replies use spaced multi-line rows; numeric
+    fields are bold.
+  - PnL and UPnL values show green/red/neutral markers.
+  - Orders include price and position size; trades include position size.
+  - Realized and total PnL stay `n/a` until a reliable realized-PnL ledger
+    exists.
+- `894a2a9 fix: paginate telegram operator lists`
+  - Orders, trades, and events are paginated at 8 rows per page, capped at 5
+    pages / 40 displayed rows.
+  - Callback data supports `tgux:orders:<page>`, `tgux:trades:<page>`, and
+    `tgux:events:<page>`; slash commands still open page 1.
+- `2bffbea fix: keep pagination label in buttons only`
+  - Page numbers are shown in inline keyboard buttons only, not in the message
+    body.
+
+Additional current-version tests should cover help text, Title Case/bold label
+formatting, dense numeric rows, PnL markers, bounded pagination, page labels in
+buttons only, compatibility control refusal, and the short command-registration
+timeout.
 
 ---
 
@@ -229,10 +271,9 @@ Add these tests:
         let reply = query_reply(&conn, "/status").unwrap().unwrap();
 
         assert_eq!(reply.parse_mode, Some("HTML"));
-        assert!(reply.text.contains("◆ PRODIGY OPERATOR"));
-        assert!(reply.text.contains("<b>MODE</b>"));
-        assert!(reply.text.contains("<b>DEMO</b>"));
-        assert!(reply.text.contains("<b>DAEMON</b>"));
+        assert!(reply.text.contains("◆ <b>Prodigy Operator</b>"));
+        assert!(reply.text.contains("<b>Mode</b> — DEMO"));
+        assert!(reply.text.contains("<b>Daemon</b>"));
         assert!(reply.reply_markup.is_some());
     }
 
@@ -250,10 +291,9 @@ Add these tests:
         let reply = query_reply(&conn, "/pnl").unwrap().unwrap();
 
         assert_eq!(reply.parse_mode, Some("HTML"));
-        assert!(reply.text.contains("◆ PNL"));
-        assert!(reply.text.contains("<b>REALIZED</b>"));
-        assert!(reply.text.contains("<b>n/a</b>"));
-        assert!(reply.text.contains("<b>TOTAL</b>"));
+        assert!(reply.text.contains("◆ <b>Pnl</b>"));
+        assert!(reply.text.contains("Realized — n/a"));
+        assert!(reply.text.contains("Total — n/a"));
     }
 
     #[test]
@@ -299,15 +339,15 @@ pub fn query_reply(conn: &Connection, text: &str) -> Result<Option<TelegramReply
     match command {
         "/status" => Ok(Some(status_reply(conn)?)),
         "/positions" => Ok(Some(positions_reply(conn)?)),
-        "/orders" => Ok(Some(orders_reply(conn)?)),
+        "/orders" => Ok(Some(orders_reply(conn, 1)?)),
         "/pnl" => Ok(Some(pnl_reply(conn)?)),
         "/risk" => Ok(Some(risk_reply(conn)?)),
-        "/trades" => Ok(Some(trades_reply(conn)?)),
-        "/events" => Ok(Some(events_reply(conn)?)),
+        "/trades" => Ok(Some(trades_reply(conn, 1)?)),
+        "/events" => Ok(Some(events_reply(conn, 1)?)),
         "/smoke_status" => Ok(Some(smoke_status_reply(conn)?)),
         "/help" => Ok(Some(help_reply())),
-        "/stop" | "/resume" | "/close_all" => Ok(Some(TelegramReply::plain(
-            "remote trading controls are not supported in M4".to_string(),
+        "/stop" | "/resume" | "/cancel_all" | "/close_all" => Ok(Some(TelegramReply::plain(
+            "operator controls require authorized Telegram access".to_string(),
         ))),
         _ => Ok(None),
     }
@@ -321,7 +361,7 @@ Add:
 ```rust
 fn row(label: &str, value: impl ToString) -> String {
     format!(
-        "<b>{}</b> — <b>{}</b>",
+        "<b>{}</b> — {}",
         html_escape(label),
         html_escape(&value.to_string())
     )
@@ -608,14 +648,24 @@ pub fn operator_callback_reply(
         return Ok(Some(TelegramReply::plain("unauthorized".to_string())));
     }
 
+    if let Some(page) = callback_page(callback_data, "tgux:orders:") {
+        return orders_reply(conn, page).map(Some);
+    }
+    if let Some(page) = callback_page(callback_data, "tgux:trades:") {
+        return trades_reply(conn, page).map(Some);
+    }
+    if let Some(page) = callback_page(callback_data, "tgux:events:") {
+        return events_reply(conn, page).map(Some);
+    }
+
     match callback_data {
         "tgux:status" => query_reply(conn, "/status"),
         "tgux:pnl" => query_reply(conn, "/pnl"),
         "tgux:risk" => query_reply(conn, "/risk"),
         "tgux:positions" => query_reply(conn, "/positions"),
-        "tgux:orders" => query_reply(conn, "/orders"),
-        "tgux:trades" => query_reply(conn, "/trades"),
-        "tgux:events" => query_reply(conn, "/events"),
+        "tgux:orders" => orders_reply(conn, 1).map(Some),
+        "tgux:trades" => trades_reply(conn, 1).map(Some),
+        "tgux:events" => events_reply(conn, 1).map(Some),
         "tgux:smoke" => query_reply(conn, "/smoke_status"),
         "tgux:help" => Ok(Some(help_reply())),
         "tgux:control" => Ok(Some(control_panel_reply())),
@@ -1070,6 +1120,7 @@ Add tests in `crates/executor/src/telegram_query.rs`:
             "resume",
             "cancel_all",
             "close_all",
+            "confirm",
         ] {
             assert!(text.contains(&format!("\"command\":\"{command}\"")), "missing {command}");
         }
@@ -1180,7 +1231,8 @@ pub fn bot_commands_payload() -> serde_json::Value {
             { "command": "stop", "description": "Stop new opening exposure" },
             { "command": "resume", "description": "Resume new opening exposure" },
             { "command": "cancel_all", "description": "Cancel system working orders" },
-            { "command": "close_all", "description": "Confirm and close system positions" }
+            { "command": "close_all", "description": "Confirm and close system positions" },
+            { "command": "confirm", "description": "Confirm pending close-all fallback" }
         ]
     })
 }
@@ -1194,6 +1246,7 @@ In `run_telegram_query_loop`, after creating `client`, call:
 let set_commands_url = format!("https://api.telegram.org/bot{token}/setMyCommands");
 let _ = client
     .post(set_commands_url)
+    .timeout(telegram_command_registration_timeout())
     .json(&crate::telegram_query::bot_commands_payload())
     .send()
     .await;
@@ -1351,6 +1404,61 @@ git commit -m "test: extend telegram UX safety scope scan"
 ```
 
 If Step 3 required small fixes in Rust files, include them in the commit with the scope scan.
+
+---
+
+### Task 7: Apply Operator Feedback Refinements
+
+**Files:**
+- Modify: `crates/executor/src/telegram_query.rs`
+- Modify: `crates/executor/src/daemon.rs`
+
+- [x] **Step 1: Tighten compatibility edges**
+
+  Add failing coverage for the legacy `query_response()` control-refusal path
+  and command-registration timeout, then fix:
+
+  - reject `/cancel_all` with the other controls;
+  - replace stale M4 refusal copy with current authorization wording;
+  - keep `setMyCommands` best effort but bound it with a short timeout.
+
+  Commit: `46acb8c fix: tighten telegram operator compatibility edges`.
+
+- [x] **Step 2: Apply live operator formatting feedback**
+
+  Add failing formatting tests before changing output, then refine Telegram
+  replies:
+
+  - bold every `◆` heading and render it in Title Case;
+  - remove `/confirm <code>` from `/help` while preserving the fallback;
+  - render `/help` groups as bold `Read` and `Control`;
+  - use bold Title Case labels and unbold values in status-style replies;
+  - format positions, orders, trades, and PnL as spaced multi-line rows;
+  - bold numeric values and add green/red/neutral markers for PnL/UPnL;
+  - include price and position size in orders;
+  - include position size in trades;
+  - keep realized and total PnL as `n/a` until a reliable realized-PnL ledger
+    exists.
+
+  Commit: `457ba33 fix: polish telegram operator reply formatting`.
+
+- [x] **Step 3: Paginate high-cardinality operator lists**
+
+  Add failing tests for page callbacks and row bounds, then implement:
+
+  - 8 rows per page;
+  - maximum 5 pages / 40 displayed rows;
+  - `tgux:orders:<page>`, `tgux:trades:<page>`, and `tgux:events:<page>`;
+  - slash commands open page 1.
+
+  Commit: `894a2a9 fix: paginate telegram operator lists`.
+
+- [x] **Step 4: Keep pagination labels in buttons only**
+
+  Add failing tests that reject body footer page labels, then keep page numbers
+  only in inline keyboard buttons.
+
+  Commit: `2bffbea fix: keep pagination label in buttons only`.
 
 ---
 

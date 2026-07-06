@@ -15,16 +15,20 @@ the only component that executes controls.
 
 ## Style Direction
 
-Use the selected **Editorial Symbols** direction:
+Use the selected **Editorial Symbols** direction, refined after operator
+testing:
 
 - Dark-client friendly message composition.
-- Sparse luxury cues: `◆`, `—`, `●`, uppercase section labels.
-- Minimal emoji. Use clear warning symbols only for risk or danger states.
+- Sparse luxury cues: `◆`, `—`, `●`, Title Case section labels.
+- Minimal emoji. Use green/red status lights next to PnL/UPnL; reserve other
+  symbols for risk or danger states.
 - No fake branding, no logo imitation, and no excessive gold/ornament text.
-- Headings use uppercase editorial labels.
-- Data rows use a two-column label/value layout:
-  - left: `MODE`, `DAEMON`, `RISK`, `EQUITY`;
-  - right: `DEMO`, `RUNNING`, `CLEAR`, `1,000.00`.
+- Headings use `◆ <b>Title Case</b>`.
+- Status-style rows use a two-column label/value layout:
+  - left: bold Title Case labels such as `Mode`, `Daemon`, `Risk`, `Equity`;
+  - right: unbold values such as `Demo`, `Running`, `Clear`, `1,000.00`.
+- Dense market rows may use multi-line label/value blocks; numeric fields
+  should be bold.
 
 Telegram cannot enforce custom fonts, background colors, or CSS. The
 implementation should use Telegram-native capabilities only:
@@ -68,14 +72,27 @@ Query replies should be formatted as concise HTML messages:
 - `/status`: first-screen system summary with daemon, signal, reconcile,
   operator stop, manual override count, pending counts, and latest error.
 - `/pnl`: conservative PnL card with unrealized, equity, realized `n/a`, total
-  `n/a` unless reliable realized PnL exists.
-- `/risk`: risk state summary first, then contributing states.
-- `/positions`: compact list grouped by symbol, side, ownership, notional,
-  entry, and unrealized PnL.
-- `/orders`: working system orders first, then recent orders.
-- `/trades`: recent fills with symbol, side, price, size, fee, and timestamp.
+  `n/a` unless reliable realized PnL exists; show a green/red/neutral marker
+  next to PnL values.
+- `/risk`: risk state summary first, then contributing states, using the same
+  status-style row treatment.
+- `/positions`: compact multi-line rows grouped by symbol, side, ownership,
+  notional, entry, and unrealized PnL; use Title Case `Position` labels, bold
+  numeric values, and green/red markers for UPnL.
+- `/orders`: working system orders first, then recent orders, including price,
+  order size, filled size, and status.
+- `/trades`: recent fills with symbol, side, price, size, fee, position size,
+  and timestamp.
 - `/events`: warning/error/critical events only, newest first.
-- `/smoke_status`: local smoke status only.
+- `/smoke_status`: local smoke status only, using the same status-style row
+  treatment.
+
+High-cardinality read-only lists must paginate:
+
+- `/orders`, `/trades`, and `/events` show 8 rows per page.
+- Show at most 5 pages / 40 rows.
+- Page labels belong in inline keyboard buttons only; do not add body footer
+  text like `— Page 3`.
 
 Every read-only reply should include an inline keyboard with the most useful
 navigation buttons:
@@ -111,6 +128,9 @@ Safety rules stay unchanged:
 - Every control path must write audit events.
 
 Button presses must run through the same authorization check as slash commands.
+The legacy read-only `query_response()` compatibility path must reject control
+commands, including `/cancel_all`, with current non-milestone wording rather
+than stale M4 copy.
 
 ## Close-All Confirmation
 
@@ -147,7 +167,9 @@ operator-only command names for remote open, parameter editing, model debug,
 shell, or live enablement.
 
 If command registration fails, write or log a warning but do not block the bot
-loop or trading executor.
+loop or trading executor. Command registration should use a short request
+timeout because it is best-effort startup decoration, not a prerequisite for
+polling.
 
 ## Callback Handling
 
@@ -158,8 +180,11 @@ Callback data should be small and explicit:
 - `tgux:risk`
 - `tgux:positions`
 - `tgux:orders`
+- `tgux:orders:<page>`
 - `tgux:trades`
+- `tgux:trades:<page>`
 - `tgux:events`
+- `tgux:events:<page>`
 - `tgux:smoke`
 - `tgux:help`
 - `tgux:control`
@@ -197,7 +222,15 @@ Buttons are UI affordances only. They must not create a second control path.
 Add tests around behavior, not visual snapshots:
 
 - HTML formatter escapes dynamic values.
-- `/status`, `/pnl`, and `/risk` contain the new editorial layout markers.
+- `/help` omits `/confirm <code>` from the command list while preserving the
+  fallback path.
+- `/status`, `/pnl`, and `/risk` contain the refined editorial layout markers:
+  bold Title Case headings and labels, unbold values, and PnL markers where
+  applicable.
+- `/positions`, `/orders`, `/trades`, and `/pnl` use dense multi-line rows with
+  bold numeric values.
+- `/orders`, `/trades`, and `/events` paginate at 8 rows per page, cap at 5
+  pages / 40 rows, and keep page labels in buttons only.
 - Inline keyboard contains read-only and control buttons.
 - Read-only callbacks return the same data as slash commands.
 - Control callbacks queue the same commands as slash commands.
@@ -206,7 +239,10 @@ Add tests around behavior, not visual snapshots:
 - `Confirm Close All` callback is same-user, one-use, and expiry checked.
 - `Cancel Close All` clears/rejects the pending confirmation without queueing.
 - `setMyCommands` payload contains existing commands only.
+- `setMyCommands` is best effort and uses a short timeout.
 - Telegram HTTP failures do not block execution.
+- The legacy `query_response()` compatibility path rejects `/cancel_all` with
+  other controls.
 - Scope scan still rejects remote open, live enablement, remote parameter
   editing, model debug, and shell paths.
 
@@ -229,6 +265,8 @@ M7.5 does not:
 - Telegram replies are easier to read on mobile and follow the approved dark
   editorial style.
 - Query and control buttons are available.
+- Orders, trades, and events remain usable with high row counts through bounded
+  pagination.
 - `Close All` is button-confirmed and still safe.
 - Command menu registration is implemented or cleanly skipped on failure.
 - All Telegram control paths still write audit events.
