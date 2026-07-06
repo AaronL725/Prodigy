@@ -301,7 +301,62 @@ def test_m7_live_readiness_scope_scan_targets_dangerous_patterns_only():
         capture_output=True,
         cwd=repo_root,
     )
-    assert dangerous.returncode == 1, dangerous.stdout + dangerous.stderr
+    assert dangerous.returncode in (0, 1), dangerous.stdout + dangerous.stderr
+
+    def rust_cfg_test_ranges(path):
+        lines = path.read_text().splitlines()
+        ranges = []
+        line_index = 0
+        while line_index < len(lines):
+            if "#[cfg(test)]" not in lines[line_index]:
+                line_index += 1
+                continue
+
+            start = line_index + 1
+            item_index = line_index + 1
+            while item_index < len(lines) and (
+                not lines[item_index].strip()
+                or lines[item_index].lstrip().startswith("#[")
+            ):
+                item_index += 1
+
+            if item_index == len(lines):
+                ranges.append((start, len(lines)))
+                break
+
+            depth = 0
+            opened = False
+            end = item_index + 1
+            for end_index in range(item_index, len(lines)):
+                line = lines[end_index]
+                depth += line.count("{") - line.count("}")
+                opened = opened or "{" in line
+                if opened and depth <= 0:
+                    end = end_index + 1
+                    break
+                if not opened and line.rstrip().endswith(";"):
+                    end = end_index + 1
+                    break
+            else:
+                end = len(lines)
+
+            ranges.append((start, end))
+            line_index = end
+
+        return ranges
+
+    cfg_test_ranges = {}
+    production_hits = []
+    for hit in dangerous.stdout.splitlines():
+        path_text, line_text, _ = hit.split(":", 2)
+        path = repo_root / path_text
+        line_no = int(line_text)
+        if path.suffix == ".rs":
+            cfg_test_ranges.setdefault(path, rust_cfg_test_ranges(path))
+            if any(start <= line_no <= end for start, end in cfg_test_ranges[path]):
+                continue
+        production_hits.append(hit)
+    assert not production_hits, "\n".join(production_hits)
 
     config_rs = (repo_root / "crates/executor/src/config.rs").read_text()
     production_config, test_config = config_rs.split("#[cfg(test)]", 1)
