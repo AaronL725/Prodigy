@@ -839,6 +839,31 @@ mod tests {
     }
 
     #[test]
+    fn remote_open_param_model_shell_and_live_commands_are_not_operator_commands() {
+        let conn = test_conn();
+        for text in [
+            "/open long",
+            "/buy ETHUSDT",
+            "/set_param leverage 1",
+            "/model_debug",
+            "/shell ls",
+            "/live on",
+        ] {
+            let response =
+                operator_response(&conn, text, "123", &["123".to_string()], 1_000).unwrap();
+            assert!(
+                response.is_none(),
+                "{text} should not be a Telegram operator command"
+            );
+        }
+
+        let command_count: i64 = conn
+            .query_row("select count(*) from control_commands", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(command_count, 0);
+    }
+
+    #[test]
     fn stop_resume_and_cancel_all_queue_commands_and_events() {
         for (text, command) in [
             ("/stop", "stop"),
