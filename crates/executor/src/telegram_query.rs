@@ -142,29 +142,102 @@ pub fn query_reply(conn: &Connection, text: &str) -> Result<Option<TelegramReply
     }
 }
 
+fn title_label(label: &str) -> String {
+    label
+        .split_whitespace()
+        .map(|word| {
+            let mut chars = word.chars();
+            match chars.next() {
+                Some(first) => format!("{}{}", first.to_uppercase(), chars.as_str().to_lowercase()),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn row(label: &str, value: impl ToString) -> String {
     format!(
-        "<b>{}</b> — <b>{}</b>",
-        html_escape(label),
+        "<b>{}</b> — {}",
+        html_escape(&title_label(label)),
         html_escape(&value.to_string())
     )
 }
 
 fn muted(label: &str, value: impl ToString) -> String {
+    row(label, value)
+}
+
+fn item_header(label: &str, value: impl ToString) -> String {
     format!(
-        "{} — {}",
-        html_escape(label),
+        "<b>{}</b> — {}",
+        html_escape(&title_label(label)),
         html_escape(&value.to_string())
     )
 }
 
-fn html_card(title: &str, rows: Vec<String>, footer: Option<String>) -> TelegramReply {
-    let mut text = format!("◆ {}\n\n{}", html_escape(title), rows.join("\n"));
+fn metric_row(label: &str, value: impl ToString) -> String {
+    format!(
+        "{} — <b>{}</b>",
+        html_escape(&title_label(label)),
+        html_escape(&value.to_string())
+    )
+}
+
+fn plain_row(label: &str, value: impl ToString) -> String {
+    format!(
+        "{} — {}",
+        html_escape(&title_label(label)),
+        html_escape(&value.to_string())
+    )
+}
+
+fn optional_metric_row(label: &str, value: Option<f64>) -> String {
+    match value {
+        Some(value) => metric_row(label, value),
+        None => plain_row(label, "n/a"),
+    }
+}
+
+fn pnl_marker(value: f64) -> &'static str {
+    if value > 0.0 {
+        "🟢"
+    } else if value < 0.0 {
+        "🔴"
+    } else {
+        "●"
+    }
+}
+
+fn pnl_metric_row(label: &str, value: f64) -> String {
+    format!(
+        "{} {} — <b>{}</b>",
+        html_escape(&title_label(label)),
+        pnl_marker(value),
+        html_escape(&value.to_string())
+    )
+}
+
+fn html_card_with_keyboard(
+    title: &str,
+    rows: Vec<String>,
+    footer: Option<String>,
+    reply_markup: Option<serde_json::Value>,
+) -> TelegramReply {
+    let mut text = format!("◆ <b>{}</b>", html_escape(&title_label(title)));
+    if !rows.is_empty() {
+        text.push_str("\n\n");
+        text.push_str(&rows.join("\n"));
+    }
     if let Some(footer) = footer {
         text.push_str("\n\n— ");
         text.push_str(&html_escape(&footer));
     }
-    TelegramReply::html(text, Some(navigation_keyboard()))
+    TelegramReply::html(text, reply_markup)
+}
+
+fn html_card(title: &str, rows: Vec<String>, footer: Option<String>) -> TelegramReply {
+    html_card_with_keyboard(title, rows, footer, Some(navigation_keyboard()))
 }
 
 pub fn operator_response(
@@ -270,8 +343,15 @@ pub fn operator_callback_reply(
 }
 
 fn control_panel_reply() -> TelegramReply {
-    TelegramReply::html(
-        "◆ <b>CONTROL</b>\n\n<b>STOP</b> — block new opening exposure\n<b>RESUME</b> — clear operator stop\n<b>CANCEL ALL</b> — system working orders only\n<b>CLOSE ALL</b> — system positions only".to_string(),
+    html_card_with_keyboard(
+        "CONTROL",
+        vec![
+            row("STOP", "block new opening exposure"),
+            row("RESUME", "clear operator stop"),
+            row("CANCEL ALL", "system working orders only"),
+            row("CLOSE ALL", "system positions only"),
+        ],
+        None,
         Some(control_keyboard()),
     )
 }
@@ -284,10 +364,7 @@ fn help_reply() -> TelegramReply {
                 "READ",
                 "/help /status /positions /orders /trades /pnl /risk /events /smoke_status",
             ),
-            muted(
-                "CONTROL",
-                "/stop /resume /cancel_all /close_all /confirm <code>",
-            ),
+            muted("CONTROL", "/stop /resume /cancel_all /close_all"),
         ],
         None,
     )
@@ -430,41 +507,43 @@ fn positions_reply(conn: &Connection) -> Result<TelegramReply> {
          from positions order by symbol",
     )?;
     let rows = stmt.query_map([], |r| {
-        Ok(row(
-            "POSITION",
-            format!(
-                "{} {} notional={} entry={} upnl={} ownership={}",
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, f64>(2)?,
-                r.get::<_, f64>(3)?,
-                r.get::<_, f64>(4)?,
-                r.get::<_, String>(5)?,
-            ),
+        let symbol = r.get::<_, String>(0)?;
+        let side = r.get::<_, String>(1)?;
+        let notional = r.get::<_, f64>(2)?;
+        let entry = r.get::<_, f64>(3)?;
+        let upnl = r.get::<_, f64>(4)?;
+        let ownership = r.get::<_, String>(5)?;
+        Ok(format!(
+            "{}\n{}\n{}\n{}\n{}",
+            item_header("POSITION", format!("{symbol} {side}")),
+            metric_row("NOTIONAL", notional),
+            metric_row("ENTRY", entry),
+            pnl_metric_row("UPNL", upnl),
+            plain_row("OWNERSHIP", ownership),
         ))
     })?;
     let mut lines = rows.collect::<Result<Vec<_>, _>>()?;
     if lines.is_empty() {
         lines.push(row("POSITIONS", "NONE"));
     }
-    Ok(html_card("POSITIONS", lines, None))
+    Ok(html_card("POSITIONS", vec![lines.join("\n\n")], None))
 }
 
 fn orders_reply(conn: &Connection) -> Result<TelegramReply> {
     let mut stmt = conn.prepare(
         "with working as (
-           select client_oid, symbol, side, action, status, size, filled_size, updated_at, 0 as bucket
+           select client_oid, symbol, side, action, status, price, size, filled_size, updated_at, 0 as bucket
            from orders
            where intent_id is not null and status in ('submitted', 'live')
          ),
          recent as (
-           select client_oid, symbol, side, action, status, size, filled_size, updated_at, 1 as bucket
+           select client_oid, symbol, side, action, status, price, size, filled_size, updated_at, 1 as bucket
            from orders
            where client_oid not in (select client_oid from working)
            order by updated_at desc
            limit 10
          )
-         select client_oid, symbol, side, action, status, size, filled_size
+         select client_oid, symbol, side, action, status, price, size, filled_size
          from (
            select * from working
            union all
@@ -473,25 +552,23 @@ fn orders_reply(conn: &Connection) -> Result<TelegramReply> {
          order by bucket asc, updated_at desc",
     )?;
     let rows = stmt.query_map([], |r| {
-        Ok(row(
-            "ORDER",
-            format!(
-                "{} {} {} {} status={} size={} filled={}",
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, String>(3)?,
-                r.get::<_, String>(4)?,
-                r.get::<_, f64>(5)?,
-                r.get::<_, f64>(6)?,
-            ),
+        Ok(format!(
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+            item_header("ORDER", r.get::<_, String>(0)?),
+            plain_row("SYMBOL", r.get::<_, String>(1)?),
+            plain_row("SIDE", r.get::<_, String>(2)?),
+            plain_row("ACTION", r.get::<_, String>(3)?),
+            plain_row("STATUS", r.get::<_, String>(4)?),
+            optional_metric_row("PRICE", r.get::<_, Option<f64>>(5)?),
+            metric_row("POSITION", r.get::<_, f64>(6)?),
+            metric_row("FILLED", r.get::<_, f64>(7)?),
         ))
     })?;
     let mut lines = rows.collect::<Result<Vec<_>, _>>()?;
     if lines.is_empty() {
         lines.push(row("ORDERS", "NONE"));
     }
-    Ok(html_card("ORDERS", lines, None))
+    Ok(html_card("ORDERS", vec![lines.join("\n\n")], None))
 }
 
 fn trades_reply(conn: &Connection) -> Result<TelegramReply> {
@@ -500,24 +577,22 @@ fn trades_reply(conn: &Connection) -> Result<TelegramReply> {
          from fills order by created_at desc limit 10",
     )?;
     let rows = stmt.query_map([], |r| {
-        Ok(row(
-            "TRADE",
-            format!(
-                "{} {} price={} size={} fee={} at={}",
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, f64>(2)?,
-                r.get::<_, f64>(3)?,
-                r.get::<_, f64>(4)?,
-                r.get::<_, String>(5)?,
-            ),
+        let symbol = r.get::<_, String>(0)?;
+        let side = r.get::<_, String>(1)?;
+        Ok(format!(
+            "{}\n{}\n{}\n{}\n{}",
+            item_header("TRADE", format!("{symbol} {side}")),
+            metric_row("PRICE", r.get::<_, f64>(2)?),
+            metric_row("POSITION", r.get::<_, f64>(3)?),
+            metric_row("FEE", r.get::<_, f64>(4)?),
+            plain_row("AT", r.get::<_, String>(5)?),
         ))
     })?;
     let mut lines = rows.collect::<Result<Vec<_>, _>>()?;
     if lines.is_empty() {
         lines.push(row("TRADES", "NONE"));
     }
-    Ok(html_card("TRADES", lines, None))
+    Ok(html_card("TRADES", vec![lines.join("\n\n")], None))
 }
 
 fn pnl_reply(conn: &Connection) -> Result<TelegramReply> {
@@ -537,10 +612,10 @@ fn pnl_reply(conn: &Connection) -> Result<TelegramReply> {
     Ok(html_card(
         "PNL",
         vec![
-            row("UNREALIZED", unrealized),
-            row("EQUITY", equity.unwrap_or(0.0)),
-            row("REALIZED", "n/a"),
-            row("TOTAL", "n/a"),
+            pnl_metric_row("UNREALIZED", unrealized),
+            metric_row("EQUITY", equity.unwrap_or(0.0)),
+            plain_row("REALIZED", "n/a"),
+            plain_row("TOTAL", "n/a"),
         ],
         None,
     ))
@@ -731,10 +806,15 @@ fn start_close_all_confirmation_reply(
             .to_string(),
         )
     })?;
-    Ok(TelegramReply::html(
-        format!(
-            "◆ <b>CONFIRM CLOSE ALL</b>\n\nsystem positions only\nmanual/imported skipped/audited\nexpires 60s\n\nfallback /confirm {code}"
-        ),
+    Ok(html_card_with_keyboard(
+        "CONFIRM CLOSE ALL",
+        vec![
+            row("SCOPE", "system positions only"),
+            row("IMPORTED", "manual/imported skipped/audited"),
+            row("EXPIRES", "60s"),
+            row("FALLBACK", format!("/confirm {code}")),
+        ],
+        None,
         Some(close_all_confirm_keyboard(&code)),
     ))
 }
@@ -801,9 +881,9 @@ fn confirm_close_all_button(
     requested_by: &str,
     now_ms: i64,
 ) -> Result<TelegramReply> {
-    Ok(TelegramReply::html(
+    Ok(control_result_reply(
+        "CLOSE ALL",
         confirm_close_all(conn, code, requested_by, now_ms)?,
-        Some(control_keyboard()),
     ))
 }
 
@@ -965,7 +1045,29 @@ fn cancel_close_all_button(
         )?;
         Ok("close_all confirmation cancelled".to_string())
     })?;
-    Ok(TelegramReply::html(text, Some(control_keyboard())))
+    Ok(control_result_reply("CLOSE ALL", text))
+}
+
+fn control_result_reply(title: &str, result: impl ToString) -> TelegramReply {
+    html_card_with_keyboard(
+        title,
+        vec![row("RESULT", result)],
+        None,
+        Some(control_keyboard()),
+    )
+}
+
+fn control_queued_reply(command: &str, command_id: String) -> TelegramReply {
+    html_card_with_keyboard(
+        "CONTROL",
+        vec![
+            row("COMMAND", command),
+            row("STATUS", "queued"),
+            row("COMMAND ID", command_id),
+        ],
+        None,
+        Some(control_keyboard()),
+    )
 }
 
 fn control_reply(
@@ -976,31 +1078,22 @@ fn control_reply(
 ) -> Result<Option<TelegramReply>> {
     let command = text.split_whitespace().next().unwrap_or("");
     match command {
-        "/stop" => Ok(Some(TelegramReply::html(
-            format!(
-                "stop queued command_id={}",
-                queue_control_command(conn, "stop", from_user_id)?
-            ),
-            Some(control_keyboard()),
+        "/stop" => Ok(Some(control_queued_reply(
+            "stop",
+            queue_control_command(conn, "stop", from_user_id)?,
         ))),
-        "/resume" => Ok(Some(TelegramReply::html(
-            format!(
-                "resume queued command_id={}",
-                queue_control_command(conn, "resume", from_user_id)?
-            ),
-            Some(control_keyboard()),
+        "/resume" => Ok(Some(control_queued_reply(
+            "resume",
+            queue_control_command(conn, "resume", from_user_id)?,
         ))),
-        "/cancel_all" => Ok(Some(TelegramReply::html(
-            format!(
-                "cancel_all queued command_id={}",
-                queue_control_command(conn, "cancel_all", from_user_id)?
-            ),
-            Some(control_keyboard()),
+        "/cancel_all" => Ok(Some(control_queued_reply(
+            "cancel_all",
+            queue_control_command(conn, "cancel_all", from_user_id)?,
         ))),
         "/close_all" => start_close_all_confirmation_reply(conn, from_user_id, now_ms).map(Some),
-        "/confirm" => Ok(Some(TelegramReply::html(
+        "/confirm" => Ok(Some(control_result_reply(
+            "CLOSE ALL",
             confirm_close_all_code(conn, text, from_user_id, now_ms)?,
-            Some(control_keyboard()),
         ))),
         _ => Ok(None),
     }
@@ -1135,11 +1228,137 @@ mod tests {
         let reply = query_reply(&conn, "/status").unwrap().unwrap();
 
         assert_eq!(reply.parse_mode, Some("HTML"));
-        assert!(reply.text.contains("◆ PRODIGY OPERATOR"));
-        assert!(reply.text.contains("<b>MODE</b>"));
-        assert!(reply.text.contains("<b>DEMO</b>"));
-        assert!(reply.text.contains("<b>DAEMON</b>"));
+        assert!(reply.text.contains("◆ <b>Prodigy Operator</b>"));
+        assert!(reply.text.contains("<b>Mode</b>"));
+        assert!(reply.text.contains("DEMO"));
+        assert!(reply.text.contains("<b>Daemon</b>"));
         assert!(reply.reply_markup.is_some());
+    }
+
+    #[test]
+    fn help_uses_title_case_bold_labels_and_omits_confirm_fallback() {
+        let conn = test_conn();
+
+        let reply = query_reply(&conn, "/help").unwrap().unwrap();
+
+        assert!(reply.text.starts_with("◆ <b>Help</b>"));
+        assert!(reply.text.contains("<b>Read</b> — /help /status"));
+        assert!(reply
+            .text
+            .contains("<b>Control</b> — /stop /resume /cancel_all /close_all"));
+        assert!(!reply.text.contains("/confirm"));
+    }
+
+    #[test]
+    fn status_title_and_rows_use_bold_title_case_labels_only() {
+        let conn = test_conn();
+        crate::db::write_event(&conn, "info", "daemon", "daemon started", "{}").unwrap();
+
+        let reply = query_reply(&conn, "/status").unwrap().unwrap();
+
+        assert!(reply.text.starts_with("◆ <b>Prodigy Operator</b>"));
+        assert!(reply.text.contains("<b>Mode</b> — DEMO"));
+        assert!(reply.text.contains("<b>Daemon</b> — daemon started"));
+        assert!(!reply.text.contains("<b>DEMO</b>"));
+        assert!(!reply.text.contains("<b>MODE</b>"));
+    }
+
+    #[test]
+    fn position_order_trade_and_pnl_replies_use_spaced_numeric_layout() {
+        let conn = test_conn();
+        conn.execute(
+            "insert into positions (
+              symbol, side, notional, entry_price, unrealized_pnl, updated_at,
+              ownership, raw_json
+            ) values
+            ('ETHUSDT', 'long', 100.0, 2000.0, 3.5, 'now', 'system', '{}'),
+            ('BTCUSDT', 'short', 50.0, 1000.0, -4.0, 'now', 'imported', '{}')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "insert into orders (
+               order_id, client_oid, intent_id, symbol, side, action, order_type,
+               status, price, size, filled_size, created_at, updated_at
+             ) values (
+               'order-1', 'client-xyz', null, 'ETHUSDT', 'buy', 'open',
+               'market', 'filled', 2000.0, 0.5, 0.5, 'now', 'now'
+             )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "insert into fills (
+               fill_id, order_id, symbol, side, price, size, fee, created_at,
+               trade_id, client_oid, raw_json
+             ) values (
+               'fill-1', 'order-1', 'ETHUSDT', 'buy', 2000.0, 0.5, 0.2,
+               '2026-07-06T00:00:01Z', 'trade-1', 'client-xyz', '{}'
+             )",
+            [],
+        )
+        .unwrap();
+
+        let positions = query_reply(&conn, "/positions").unwrap().unwrap().text;
+        assert!(positions.starts_with("◆ <b>Positions</b>"));
+        assert!(positions.contains(
+            "<b>Position</b> — ETHUSDT long\nNotional — <b>100</b>\nEntry — <b>2000</b>\nUpnl 🟢 — <b>3.5</b>\nOwnership — system"
+        ));
+        assert!(positions.contains("Upnl 🔴 — <b>-4</b>"));
+
+        let orders = query_reply(&conn, "/orders").unwrap().unwrap().text;
+        assert!(orders.starts_with("◆ <b>Orders</b>"));
+        assert!(orders.contains("<b>Order</b> — client-xyz"));
+        assert!(orders.contains("Price — <b>2000</b>"));
+        assert!(orders.contains("Position — <b>0.5</b>"));
+
+        let trades = query_reply(&conn, "/trades").unwrap().unwrap().text;
+        assert!(trades.starts_with("◆ <b>Trades</b>"));
+        assert!(trades.contains("<b>Trade</b> — ETHUSDT buy"));
+        assert!(trades.contains("Position — <b>0.5</b>"));
+
+        let pnl = query_reply(&conn, "/pnl").unwrap().unwrap().text;
+        assert!(pnl.starts_with("◆ <b>Pnl</b>"));
+        assert!(pnl.contains("Unrealized 🔴 — <b>-0.5</b>"));
+        assert!(pnl.contains("Equity — <b>0</b>"));
+    }
+
+    #[test]
+    fn risk_events_smoke_control_and_close_all_use_status_style_cards() {
+        let conn = test_conn();
+        crate::db::insert_equity_snapshot(&conn, 1000.0, 500.0, -2.0, 0.0).unwrap();
+        crate::db::set_executor_state(&conn, "smoke:status", "ready").unwrap();
+        crate::db::write_event(&conn, "warning", "telegram", "sample warning", "{}").unwrap();
+
+        let risk = query_reply(&conn, "/risk").unwrap().unwrap().text;
+        assert!(risk.starts_with("◆ <b>Risk</b>"));
+        assert!(risk.contains("<b>Risk State</b> — ok"));
+        assert!(!risk.contains("<b>ok</b>"));
+
+        let events = query_reply(&conn, "/events").unwrap().unwrap().text;
+        assert!(events.starts_with("◆ <b>Events</b>"));
+        assert!(events.contains("<b>Event</b> — "));
+        assert!(events.contains("sample warning"));
+
+        let smoke = query_reply(&conn, "/smoke_status").unwrap().unwrap().text;
+        assert!(smoke.starts_with("◆ <b>Smoke Status</b>"));
+        assert!(smoke.contains("<b>Status</b> — ready"));
+
+        let control =
+            operator_callback_reply(&conn, "tgux:control", "123", &["123".to_string()], 1_000)
+                .unwrap()
+                .unwrap()
+                .text;
+        assert!(control.starts_with("◆ <b>Control</b>"));
+        assert!(control.contains("<b>Stop</b> — block new opening exposure"));
+
+        let close_all =
+            operator_callback_reply(&conn, "tgux:close_all", "123", &["123".to_string()], 1_000)
+                .unwrap()
+                .unwrap()
+                .text;
+        assert!(close_all.starts_with("◆ <b>Confirm Close All</b>"));
+        assert!(close_all.contains("<b>Fallback</b> — /confirm "));
     }
 
     #[test]
@@ -1360,7 +1579,7 @@ mod tests {
                 .unwrap()
                 .unwrap();
 
-        assert!(first.text.contains("CONFIRM CLOSE ALL"));
+        assert!(first.text.contains("Confirm Close All"));
         assert!(serde_json::to_string(&first.reply_markup)
             .unwrap()
             .contains("tgux:confirm_close_all"));
@@ -1487,10 +1706,9 @@ mod tests {
         let reply = query_reply(&conn, "/pnl").unwrap().unwrap();
 
         assert_eq!(reply.parse_mode, Some("HTML"));
-        assert!(reply.text.contains("◆ PNL"));
-        assert!(reply.text.contains("<b>REALIZED</b>"));
-        assert!(reply.text.contains("<b>n/a</b>"));
-        assert!(reply.text.contains("<b>TOTAL</b>"));
+        assert!(reply.text.contains("◆ <b>Pnl</b>"));
+        assert!(reply.text.contains("Realized — n/a"));
+        assert!(reply.text.contains("Total — n/a"));
     }
 
     #[test]
@@ -1518,8 +1736,8 @@ mod tests {
 
         let response = query_response(&conn, "/status").unwrap().unwrap();
 
-        assert!(response.contains("◆ PRODIGY OPERATOR"));
-        assert!(response.contains("<b>DAEMON</b>"));
+        assert!(response.contains("◆ <b>Prodigy Operator</b>"));
+        assert!(response.contains("<b>Daemon</b>"));
         assert!(response.contains("daemon started"));
     }
 
@@ -1565,15 +1783,16 @@ mod tests {
 
         let response = query_response(&conn, "/status").unwrap().unwrap();
 
-        assert!(response.contains("<b>DAEMON</b> — <b>daemon started at 2026-07-06T00:00:00Z</b>"));
-        assert!(response.contains("<b>SIGNAL</b> — <b>no_signal at 2026-07-06T00:02:00Z</b>"));
-        assert!(response.contains("<b>RECONCILE</b> — <b>2026-07-06T00:01:00Z</b>"));
-        assert!(response.contains("<b>OPERATOR STOP</b> — <b>active</b>"));
-        assert!(response.contains("<b>MANUAL OVERRIDES</b> — <b>1</b>"));
-        assert!(response.contains("<b>PENDING INTENTS</b> — <b>1</b>"));
-        assert!(response.contains("<b>PENDING CONTROLS</b> — <b>2</b>"));
-        assert!(response
-            .contains("<b>LATEST ERROR</b> — <b>critical executor: risk gate failed at 2026-07-06T00:03:00Z</b>"));
+        assert!(response.contains("<b>Daemon</b> — daemon started at 2026-07-06T00:00:00Z"));
+        assert!(response.contains("<b>Signal</b> — no_signal at 2026-07-06T00:02:00Z"));
+        assert!(response.contains("<b>Reconcile</b> — 2026-07-06T00:01:00Z"));
+        assert!(response.contains("<b>Operator Stop</b> — active"));
+        assert!(response.contains("<b>Manual Overrides</b> — 1"));
+        assert!(response.contains("<b>Pending Intents</b> — 1"));
+        assert!(response.contains("<b>Pending Controls</b> — 2"));
+        assert!(response.contains(
+            "<b>Latest Error</b> — critical executor: risk gate failed at 2026-07-06T00:03:00Z"
+        ));
     }
 
     #[test]
@@ -1614,7 +1833,7 @@ mod tests {
 
         assert!(response.contains("client-xyz"));
         assert!(response.contains("ETH/USDT:USDT"));
-        assert!(response.contains("status=filled"));
+        assert!(response.contains("Status — filled"));
     }
 
     #[test]
@@ -2073,7 +2292,7 @@ mod tests {
 
         assert!(response.contains("ETHUSDT"));
         assert!(response.contains("buy"));
-        assert!(response.contains("fee=0.2"));
+        assert!(response.contains("Fee — <b>0.2</b>"));
     }
 
     #[test]
@@ -2085,8 +2304,8 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        assert!(response.contains("<b>REALIZED</b> — <b>n/a</b>"));
-        assert!(response.contains("<b>TOTAL</b> — <b>n/a</b>"));
+        assert!(response.contains("Realized — n/a"));
+        assert!(response.contains("Total — n/a"));
     }
 
     #[test]
@@ -2116,8 +2335,8 @@ mod tests {
 
         let response = query_response(&conn, "/pnl").unwrap().unwrap();
 
-        assert!(response.contains("<b>UNREALIZED</b> — <b>0</b>"));
-        assert!(response.contains("<b>EQUITY</b> — <b>1000</b>"));
+        assert!(response.contains("Unrealized ● — <b>0</b>"));
+        assert!(response.contains("Equity — <b>1000</b>"));
     }
 
     #[test]
@@ -2128,8 +2347,8 @@ mod tests {
 
         let response = query_response(&conn, "/risk").unwrap().unwrap();
 
-        assert!(response.contains("<b>MANUAL OVERRIDES</b> — <b>1</b>"));
-        assert!(response.contains("<b>AVAILABLE MARGIN</b> — <b>500</b>"));
+        assert!(response.contains("<b>Manual Overrides</b> — 1"));
+        assert!(response.contains("<b>Available Margin</b> — 500"));
     }
 
     #[test]
@@ -2155,12 +2374,12 @@ mod tests {
 
         let response = query_response(&conn, "/risk").unwrap().unwrap();
 
-        assert!(response.contains("<b>RISK STATE</b> — <b>blocked</b>"));
-        assert!(response.contains("<b>EQUITY</b> — <b>1000</b>"));
-        assert!(response.contains("<b>AVAILABLE MARGIN</b> — <b>25</b>"));
-        assert!(response.contains("<b>MARGIN STATE</b> — <b>low</b>"));
-        assert!(response.contains("<b>MANUAL OVERRIDES</b> — <b>2</b>"));
-        assert!(response.contains("<b>OPERATOR STOP</b> — <b>active</b>"));
-        assert!(response.contains("<b>TRADING SUSPENSION</b> — <b>active</b>"));
+        assert!(response.contains("<b>Risk State</b> — blocked"));
+        assert!(response.contains("<b>Equity</b> — 1000"));
+        assert!(response.contains("<b>Available Margin</b> — 25"));
+        assert!(response.contains("<b>Margin State</b> — low"));
+        assert!(response.contains("<b>Manual Overrides</b> — 2"));
+        assert!(response.contains("<b>Operator Stop</b> — active"));
+        assert!(response.contains("<b>Trading Suspension</b> — active"));
     }
 }
