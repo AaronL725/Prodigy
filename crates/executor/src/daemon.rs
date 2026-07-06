@@ -498,6 +498,14 @@ fn telegram_update_parts(update: &serde_json::Value) -> Option<TelegramUpdatePar
     })
 }
 
+fn telegram_http_client(timeout: Duration) -> Result<reqwest::Client> {
+    Ok(reqwest::Client::builder().timeout(timeout).build()?)
+}
+
+fn telegram_operator_http_timeout() -> Duration {
+    Duration::from_secs(15)
+}
+
 /// Optional Telegram operator polling loop (M6). Runs ONLY when
 /// `telegram_bot_token` is configured and `telegram_allowed_user_ids` is
 /// non-empty — otherwise it returns immediately, since Telegram is not an
@@ -520,7 +528,7 @@ pub async fn run_telegram_query_loop(
     if cfg.telegram_allowed_user_ids.is_empty() {
         return Ok(());
     }
-    let client = reqwest::Client::new();
+    let client = telegram_http_client(telegram_operator_http_timeout())?;
     let mut offset: i64 = 0;
     let mut shutdown = shutdown;
     loop {
@@ -926,6 +934,35 @@ mod tests {
         assert_eq!(parts.from_user_id, "123");
         assert_eq!(parts.reply_chat_id, "999");
         assert_eq!(parts.text, "/status");
+    }
+
+    #[tokio::test]
+    async fn telegram_operator_http_client_times_out_hung_requests() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((_stream, _)) = listener.accept() {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+            }
+        });
+
+        let client = telegram_http_client(std::time::Duration::from_millis(50)).unwrap();
+        let err = client
+            .get(format!("http://{addr}/hang"))
+            .send()
+            .await
+            .unwrap_err();
+
+        assert!(err.is_timeout());
+    }
+
+    #[test]
+    fn telegram_operator_http_timeout_covers_long_poll() {
+        assert_eq!(
+            telegram_operator_http_timeout(),
+            std::time::Duration::from_secs(15)
+        );
+        assert!(telegram_operator_http_timeout() > std::time::Duration::from_secs(10));
     }
 
     #[test]
