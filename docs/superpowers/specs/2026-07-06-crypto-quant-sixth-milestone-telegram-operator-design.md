@@ -286,6 +286,9 @@ normal polling noise.
 
 M6 includes a short smoke reliability workflow.
 
+Smoke reports are local files only. There is no Telegram `/smoke_report`
+command in M6.
+
 Duration:
 
 - default: 60 minutes;

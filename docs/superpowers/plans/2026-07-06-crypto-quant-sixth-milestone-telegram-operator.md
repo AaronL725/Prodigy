@@ -1850,6 +1850,9 @@ git commit -m "test: verify M6 scope boundaries"
 **Files:**
 - Generated: `reports/m6-demo-smoke-*.md`
 
+Smoke reports are local Markdown files only. Do not add or restore a Telegram
+`/smoke_report` command.
+
 - [ ] **Step 1: Confirm demo-only environment**
 
 Run:
