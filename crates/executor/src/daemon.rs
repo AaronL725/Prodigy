@@ -538,21 +538,58 @@ struct TelegramUpdateParts {
     update_id: i64,
     from_user_id: String,
     reply_chat_id: String,
-    text: String,
+    text: Option<String>,
+    callback_query_id: Option<String>,
+    callback_data: Option<String>,
 }
 
 fn telegram_update_parts(update: &serde_json::Value) -> Option<TelegramUpdateParts> {
-    let message = update.get("message")?;
+    let update_id = update.get("update_id")?.as_i64()?;
+    if let Some(message) = update.get("message") {
+        return Some(TelegramUpdateParts {
+            update_id,
+            from_user_id: message.get("from")?.get("id")?.as_i64()?.to_string(),
+            reply_chat_id: message.get("chat")?.get("id")?.as_i64()?.to_string(),
+            text: Some(message.get("text")?.as_str()?.to_string()),
+            callback_query_id: None,
+            callback_data: None,
+        });
+    }
+    let callback = update.get("callback_query")?;
     Some(TelegramUpdateParts {
-        update_id: update.get("update_id")?.as_i64()?,
-        from_user_id: message.get("from")?.get("id")?.as_i64()?.to_string(),
-        reply_chat_id: message.get("chat")?.get("id")?.as_i64()?.to_string(),
-        text: message.get("text")?.as_str()?.to_string(),
+        update_id,
+        from_user_id: callback.get("from")?.get("id")?.as_i64()?.to_string(),
+        reply_chat_id: callback
+            .get("message")?
+            .get("chat")?
+            .get("id")?
+            .as_i64()?
+            .to_string(),
+        text: None,
+        callback_query_id: Some(callback.get("id")?.as_str()?.to_string()),
+        callback_data: Some(callback.get("data")?.as_str()?.to_string()),
     })
 }
 
 fn telegram_http_client(timeout: Duration) -> Result<reqwest::Client> {
     Ok(reqwest::Client::builder().timeout(timeout).build()?)
+}
+
+fn telegram_send_message_form(
+    chat_id: &str,
+    reply: &crate::telegram_query::TelegramReply,
+) -> Vec<(String, String)> {
+    let mut form = vec![
+        ("chat_id".to_string(), chat_id.to_string()),
+        ("text".to_string(), reply.text.clone()),
+    ];
+    if let Some(parse_mode) = reply.parse_mode {
+        form.push(("parse_mode".to_string(), parse_mode.to_string()));
+    }
+    if let Some(markup) = &reply.reply_markup {
+        form.push(("reply_markup".to_string(), markup.to_string()));
+    }
+    form
 }
 
 fn telegram_operator_http_timeout() -> Duration {
@@ -582,6 +619,12 @@ pub async fn run_telegram_query_loop(
         return Ok(());
     }
     let client = telegram_http_client(telegram_operator_http_timeout())?;
+    let set_commands_url = format!("https://api.telegram.org/bot{token}/setMyCommands");
+    let _ = client
+        .post(set_commands_url)
+        .json(&crate::telegram_query::bot_commands_payload())
+        .send()
+        .await;
     let mut offset: i64 = 0;
     let mut shutdown = shutdown;
     loop {
@@ -613,6 +656,15 @@ pub async fn run_telegram_query_loop(
                             continue;
                         };
                         offset = parts.update_id + 1;
+                        if let Some(callback_query_id) = &parts.callback_query_id {
+                            let answer_url =
+                                format!("https://api.telegram.org/bot{token}/answerCallbackQuery");
+                            let _ = client
+                                .post(answer_url)
+                                .form(&[("callback_query_id", callback_query_id.as_str())])
+                                .send()
+                                .await;
+                        }
                         match rusqlite::Connection::open(&cfg.db_path) {
                             Ok(conn) => {
                                 if let Err(err) = conn
@@ -623,13 +675,27 @@ pub async fn run_telegram_query_loop(
                                     continue;
                                 }
                                 let now_ms = crate::bitget::now_ms().parse::<i64>().unwrap_or(0);
-                                let reply = match crate::telegram_query::operator_response(
-                                    &conn,
-                                    &parts.text,
-                                    &parts.from_user_id,
-                                    &cfg.telegram_allowed_user_ids,
-                                    now_ms,
-                                ) {
+                                let reply = match if let Some(callback_data) =
+                                    parts.callback_data.as_deref()
+                                {
+                                    crate::telegram_query::operator_callback_reply(
+                                        &conn,
+                                        callback_data,
+                                        &parts.from_user_id,
+                                        &cfg.telegram_allowed_user_ids,
+                                        now_ms,
+                                    )
+                                } else if let Some(text) = parts.text.as_deref() {
+                                    crate::telegram_query::operator_reply(
+                                        &conn,
+                                        text,
+                                        &parts.from_user_id,
+                                        &cfg.telegram_allowed_user_ids,
+                                        now_ms,
+                                    )
+                                } else {
+                                    Ok(None)
+                                } {
                                     Ok(reply) => reply,
                                     Err(err) => {
                                         eprintln!("telegram query error: {err}");
@@ -639,17 +705,12 @@ pub async fn run_telegram_query_loop(
                                 if let Some(reply) = reply {
                                     let send_url =
                                         format!("https://api.telegram.org/bot{token}/sendMessage");
+                                    let form =
+                                        telegram_send_message_form(&parts.reply_chat_id, &reply);
                                     // ponytail: best-effort send — a failed
                                     // sendMessage is dropped on the floor; the
                                     // operator can re-issue the command.
-                                    let _ = client
-                                        .post(send_url)
-                                        .form(&[
-                                            ("chat_id", parts.reply_chat_id.as_str()),
-                                            ("text", reply.as_str()),
-                                        ])
-                                        .send()
-                                        .await;
+                                    let _ = client.post(send_url).form(&form).send().await;
                                 }
                             }
                             Err(err) => eprintln!("telegram sqlite open error: {err}"),
@@ -1027,7 +1088,52 @@ mod tests {
         assert_eq!(parts.update_id, 42);
         assert_eq!(parts.from_user_id, "123");
         assert_eq!(parts.reply_chat_id, "999");
-        assert_eq!(parts.text, "/status");
+        assert_eq!(parts.text.as_deref(), Some("/status"));
+        assert!(parts.callback_query_id.is_none());
+        assert!(parts.callback_data.is_none());
+    }
+
+    #[test]
+    fn telegram_update_parts_parse_callback_query_for_auth_reply_and_answer() {
+        let update = serde_json::json!({
+            "update_id": 43,
+            "callback_query": {
+                "id": "callback-1",
+                "from": { "id": 123 },
+                "data": "tgux:status",
+                "message": {
+                    "chat": { "id": 456 },
+                    "message_id": 99
+                }
+            }
+        });
+
+        let parts = telegram_update_parts(&update).unwrap();
+
+        assert_eq!(parts.update_id, 43);
+        assert_eq!(parts.from_user_id, "123");
+        assert_eq!(parts.reply_chat_id, "456");
+        assert_eq!(parts.callback_query_id.as_deref(), Some("callback-1"));
+        assert_eq!(parts.callback_data.as_deref(), Some("tgux:status"));
+        assert!(parts.text.is_none());
+    }
+
+    #[test]
+    fn telegram_send_message_form_includes_html_and_reply_markup() {
+        let reply = crate::telegram_query::TelegramReply {
+            text: "<b>Status</b>".to_string(),
+            parse_mode: Some("HTML"),
+            reply_markup: Some(serde_json::json!({"inline_keyboard": []})),
+        };
+
+        let form = telegram_send_message_form("456", &reply);
+
+        assert!(form.contains(&("chat_id".to_string(), "456".to_string())));
+        assert!(form.contains(&("text".to_string(), "<b>Status</b>".to_string())));
+        assert!(form.contains(&("parse_mode".to_string(), "HTML".to_string())));
+        assert!(form
+            .iter()
+            .any(|(k, v)| k == "reply_markup" && v.contains("inline_keyboard")));
     }
 
     #[tokio::test]

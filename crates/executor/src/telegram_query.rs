@@ -96,6 +96,26 @@ pub fn close_all_confirm_keyboard(code: &str) -> serde_json::Value {
     ])
 }
 
+pub fn bot_commands_payload() -> serde_json::Value {
+    serde_json::json!({
+        "commands": [
+            { "command": "help", "description": "Show commands and controls" },
+            { "command": "status", "description": "System status summary" },
+            { "command": "positions", "description": "Current positions" },
+            { "command": "orders", "description": "Working and recent orders" },
+            { "command": "trades", "description": "Recent fills" },
+            { "command": "pnl", "description": "PnL summary" },
+            { "command": "risk", "description": "Risk state" },
+            { "command": "events", "description": "Recent warnings and errors" },
+            { "command": "smoke_status", "description": "Smoke run status" },
+            { "command": "stop", "description": "Stop new opening exposure" },
+            { "command": "resume", "description": "Resume new opening exposure" },
+            { "command": "cancel_all", "description": "Cancel system working orders" },
+            { "command": "close_all", "description": "Confirm and close system positions" }
+        ]
+    })
+}
+
 /// Map a single command line to its read-only reply, or `None` if it isn't a
 /// recognized command (no reply). Remote trading controls are refused.
 pub fn query_response(conn: &Connection, text: &str) -> Result<Option<String>> {
@@ -1070,6 +1090,38 @@ mod tests {
         assert!(text.contains("tgux:status"), "missing Back callback");
         assert!(!text.contains("open"));
         assert!(!text.contains("set_param"));
+        assert!(!text.contains("live"));
+    }
+
+    #[test]
+    fn bot_commands_payload_contains_existing_commands_only() {
+        let payload = bot_commands_payload();
+        let text = serde_json::to_string(&payload).unwrap();
+
+        for command in [
+            "help",
+            "status",
+            "positions",
+            "orders",
+            "trades",
+            "pnl",
+            "risk",
+            "events",
+            "smoke_status",
+            "stop",
+            "resume",
+            "cancel_all",
+            "close_all",
+        ] {
+            assert!(
+                text.contains(&format!("\"command\":\"{command}\"")),
+                "missing {command}"
+            );
+        }
+        assert!(!text.contains("\"open\""));
+        assert!(!text.contains("set_param"));
+        assert!(!text.contains("model_debug"));
+        assert!(!text.contains("shell"));
         assert!(!text.contains("live"));
     }
 
