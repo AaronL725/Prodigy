@@ -90,6 +90,22 @@ class FakeGappyExchange:
         ]
 
 
+class FakeBoundaryGapExchange:
+    def load_markets(self):
+        return {}
+
+    def fetch_ohlcv(self, symbol, timeframe, since=None, limit=None, params=None):
+        return [
+            [1782864900000, 100.5, 102.0, 100.0, 101.0, 11.0],
+            [1782865800000, 101.0, 103.0, 100.5, 102.0, 12.0],
+        ]
+
+
+class FakeFailingFundingClient:
+    def fetch_funding_rate_page(self, symbol, product_type, page_no, page_size):
+        raise RuntimeError("funding api down")
+
+
 def test_run_backfill_default_end_uses_latest_closed_bar_boundary(tmp_path):
     db_path = tmp_path / "prodigy.sqlite"
     with connect(db_path) as conn:
@@ -135,7 +151,9 @@ def test_run_backfill_records_quality_warning_event_when_quality_problem_exists(
             """
             select severity, message, payload_json
             from events
-            where component = 'data.backfill' and severity = 'warning'
+            where component = 'data.backfill'
+              and severity = 'warning'
+              and message = 'data quality warning'
             """
         ).fetchall()
 
@@ -146,6 +164,102 @@ def test_run_backfill_records_quality_warning_event_when_quality_problem_exists(
     assert "ohlcv.missing_timestamps" in payload["issues"]
 
 
+def test_run_backfill_checks_quality_against_requested_window(tmp_path):
+    db_path = tmp_path / "prodigy.sqlite"
+    with connect(db_path) as conn:
+        init_db(conn)
+
+    result = run_backfill(
+        symbol="ETH/USDT:USDT",
+        start="2026-07-01T00:00:00Z",
+        end="2026-07-01T01:00:00Z",
+        timeframe="15m",
+        data_root=tmp_path,
+        db_path=db_path,
+        exchange=FakeBoundaryGapExchange(),
+        funding_client=FakeEmptyFundingClient(),
+    )
+
+    assert result.ohlcv_quality["expected_15m_bars"] == 4
+    assert result.ohlcv_quality["missing_timestamps"] == 2
+
+
+def test_run_backfill_does_not_advance_checkpoint_when_gaps_remain(tmp_path):
+    db_path = tmp_path / "prodigy.sqlite"
+    with connect(db_path) as conn:
+        init_db(conn)
+        conn.execute(
+            """
+            insert into task_checkpoints (task_name, updated_at, checkpoint_value)
+            values (?, datetime('now'), ?)
+            """,
+            ("backfill:bitget:ETH/USDT:USDT:15m", "2026-06-30"),
+        )
+        conn.commit()
+
+    run_backfill(
+        symbol="ETH/USDT:USDT",
+        start="2026-07-01",
+        end="2026-07-01 00:45:00",
+        timeframe="15m",
+        data_root=tmp_path,
+        db_path=db_path,
+        exchange=FakeGappyExchange(),
+        funding_client=FakeEmptyFundingClient(),
+    )
+
+    with connect(db_path) as conn:
+        checkpoint = conn.execute(
+            "select checkpoint_value from task_checkpoints where task_name = ?",
+            ("backfill:bitget:ETH/USDT:USDT:15m",),
+        ).fetchone()
+        event = conn.execute(
+            """
+            select message, payload_json
+            from events
+            where component = 'data.backfill'
+              and severity = 'warning'
+              and message = 'checkpoint not advanced'
+            """
+        ).fetchone()
+
+    assert checkpoint["checkpoint_value"] == "2026-06-30"
+    assert json.loads(event["payload_json"])["issues"] == ["ohlcv.missing_timestamps"]
+
+
+def test_run_backfill_records_error_event_and_reraises_on_failure(tmp_path):
+    db_path = tmp_path / "prodigy.sqlite"
+
+    try:
+        run_backfill(
+            symbol="ETH/USDT:USDT",
+            start="2026-07-01",
+            end="2026-07-01 00:30:00",
+            timeframe="15m",
+            data_root=tmp_path,
+            db_path=db_path,
+            exchange=FakeExchange(),
+            funding_client=FakeFailingFundingClient(),
+        )
+    except RuntimeError as exc:
+        assert str(exc) == "funding api down"
+    else:
+        raise AssertionError("run_backfill should re-raise fetch failures")
+
+    with connect(db_path) as conn:
+        row = conn.execute(
+            """
+            select severity, message, payload_json
+            from events
+            where component = 'data.backfill'
+            """
+        ).fetchone()
+
+    assert row["severity"] == "error"
+    assert row["message"] == "backfill failed"
+    assert json.loads(row["payload_json"])["error"] == "funding api down"
+
+
 def test_run_backfill_windows_funding_to_range(tmp_path):
     db_path = tmp_path / "prodigy.sqlite"
     with connect(db_path) as conn:
@@ -154,7 +268,7 @@ def test_run_backfill_windows_funding_to_range(tmp_path):
     result = run_backfill(
         symbol="ETH/USDT:USDT",
         start="2026-07-01",
-        end="2026-07-02",
+        end="2026-07-01 00:30:00",
         timeframe="15m",
         data_root=tmp_path,
         db_path=db_path,
@@ -176,7 +290,7 @@ def test_run_backfill_writes_partitions_and_checkpoint(tmp_path):
     result = run_backfill(
         symbol="ETH/USDT:USDT",
         start="2026-07-01",
-        end="2026-07-02",
+        end="2026-07-01 00:30:00",
         timeframe="15m",
         data_root=tmp_path,
         db_path=db_path,
@@ -198,4 +312,4 @@ def test_run_backfill_writes_partitions_and_checkpoint(tmp_path):
             "select checkpoint_value from task_checkpoints where task_name = ?",
             ("backfill:bitget:ETH/USDT:USDT:15m",),
         ).fetchone()
-        assert row["checkpoint_value"] == "2026-07-02"
+        assert row["checkpoint_value"] == "2026-07-01 00:30:00"

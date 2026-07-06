@@ -3,19 +3,46 @@ from __future__ import annotations
 import pandas as pd
 
 
+def _utc_timestamp(value: object) -> pd.Timestamp:
+    ts = pd.Timestamp(value)
+    return ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
+
+
 def quality_summary(
     frame: pd.DataFrame,
     dataset: str,
     timeframe: str | None = None,
+    start: object | None = None,
+    end: object | None = None,
 ) -> dict[str, object]:
+    expected = None
+    if dataset == "ohlcv" and timeframe is not None and start is not None and end is not None:
+        freq = pd.Timedelta(timeframe)
+        expected = pd.date_range(
+            _utc_timestamp(start),
+            _utc_timestamp(end),
+            freq=freq,
+            inclusive="left",
+        )
+
     if frame.empty:
-        return {
+        missing_per_day = {}
+        expected_per_day = {}
+        expected_count = 0
+        if expected is not None:
+            expected_count = int(len(expected))
+            expected_per_day = {
+                str(day): int(count)
+                for day, count in pd.Series(expected.strftime("%Y-%m-%d")).value_counts(sort=False).items()
+            }
+            missing_per_day = expected_per_day
+        summary = {
             "dataset": dataset,
             "rows": 0,
             "duplicate_timestamp_symbol": 0,
             "non_monotonic_timestamps": 0,
-            "missing_timestamps": 0,
-            "missing_timestamps_per_day": {},
+            "missing_timestamps": expected_count,
+            "missing_timestamps_per_day": missing_per_day,
             "null_values": 0,
             "negative_volume": 0,
             "rows_per_day": {},
@@ -23,6 +50,10 @@ def quality_summary(
             "start": None,
             "end": None,
         }
+        if expected is not None:
+            summary[f"expected_{timeframe}_bars"] = expected_count
+            summary[f"expected_{timeframe}_bars_per_day"] = expected_per_day
+        return summary
 
     clean = frame.copy()
     clean["timestamp"] = pd.to_datetime(clean["timestamp"], utc=True)
@@ -41,11 +72,12 @@ def quality_summary(
     expected_per_day = {}
     if dataset == "ohlcv" and timeframe is not None:
         freq = pd.Timedelta(timeframe)
-        expected = pd.date_range(
-            clean["timestamp"].min(),
-            clean["timestamp"].max(),
-            freq=freq,
-        )
+        if expected is None:
+            expected = pd.date_range(
+                clean["timestamp"].min(),
+                clean["timestamp"].max(),
+                freq=freq,
+            )
         actual = pd.DatetimeIndex(clean["timestamp"].drop_duplicates().sort_values())
         missing_index = expected.difference(actual)
         expected_count = int(len(expected))

@@ -10,7 +10,7 @@ from pathlib import Path
 import lightgbm as lgb
 import pandas as pd
 
-from prodigy.db import connect
+from prodigy.db import connect, init_db
 from prodigy.ml.labels import add_forward_return_labels, horizon_to_bars
 from prodigy.ml.splits import purged_walk_forward_splits
 
@@ -230,6 +230,7 @@ def _store_model_row(
     validation_end = str(splits.folds[-1].valid_end) if splits.folds else created_at
 
     with connect(db_path) as conn:
+        init_db(conn)
         conn.execute(
             """
             insert or replace into models (

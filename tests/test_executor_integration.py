@@ -189,10 +189,12 @@ def test_rust_demo_daemon_processes_pending_intent_once(tmp_path):
         ).fetchone()
         order_count = conn.execute("select count(*) from orders").fetchone()[0]
         event_count = conn.execute("select count(*) from events").fetchone()[0]
-        deferred_open_events = conn.execute(
-            "select count(*) from events where component = 'intent_loop' "
-            "and message like 'deferred open daemon-intent-1:%market data stale%'"
-        ).fetchone()[0]
+        daemon_events = {
+            row["message"]
+            for row in conn.execute(
+                "select message from events where component = 'daemon'"
+            ).fetchall()
+        }
         # No zero-fill order may be marked filled — the M4 anti-false-fill
         # invariant, mirrored from the --once test.
         false_fills = conn.execute(
@@ -200,20 +202,18 @@ def test_rust_demo_daemon_processes_pending_intent_once(tmp_path):
         ).fetchone()[0]
 
     # Honest terminal state: executed when the demo book is tradable, failed
-    # with a diagnostic when it is phantom-liquid (see _demo_depth_diagnostic). If
-    # the public WS never delivers a fresh book during the bounded run, the open
-    # must stay pending with an explicit stale-market defer event and no order.
-    assert intent["status"] in ("executed", "failed", "pending"), (
-        f"expected executed|failed|pending-with-defer, got {intent['status']}"
+    # with a diagnostic when it is phantom-liquid (see _demo_depth_diagnostic).
+    # The bounded daemon runtime must actually start, run until the bound, and
+    # exit after writing its daemon events; it must not leave the intent accepted
+    # or pending as a weakened "runtime only" smoke.
+    assert intent["status"] in ("executed", "failed"), (
+        f"expected executed|failed, got {intent['status']}"
     )
     if intent["status"] == "failed":
         assert intent["error"], "a failed intent must record a diagnostic error"
-    if intent["status"] == "pending":
-        assert deferred_open_events >= 1, "pending open must explain stale market data"
-        assert order_count == 0, "stale-market deferred open must not place orders"
-    else:
-        assert order_count >= 1, "expected at least one demo order to be attempted"
+    assert order_count >= 1, "expected at least one demo order to be attempted"
     assert event_count >= 1, "daemon must record startup + reconcile + intent events"
+    assert {"daemon started", "bounded daemon runtime elapsed", "daemon stopped"} <= daemon_events
     assert false_fills == 0, "an order must not be marked filled with no fill"
     assert "daemon" in result.stdout or result.stderr == ""
 

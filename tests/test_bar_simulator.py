@@ -212,6 +212,45 @@ def test_holding_review_extends_by_one_hour_with_confirming_score():
     assert ts.get_loc(pd.Timestamp(lot1_no["exit_ts"])) == 96
 
 
+def test_holding_review_uses_raw_score_when_cooldown_suppresses_open_event():
+    n = 104
+    ts = pd.date_range("2026-07-01", periods=n, freq="15min", tz="UTC")
+    closes = [100.0 + i * 0.01 for i in range(n)]
+    prices_df = pd.DataFrame(
+        {
+            "timestamp": ts,
+            "symbol": ["ETH/USDT:USDT"] * n,
+            "open": closes,
+            "high": [c + 0.001 for c in closes],
+            "low": [c - 0.001 for c in closes],
+            "close": closes,
+            "volume": [10] * n,
+        }
+    )
+    scores = pd.DataFrame(
+        {
+            "timestamp": ts,
+            "symbol": ["ETH/USDT:USDT"] * n,
+            "score": [0.8 if i in (0, 96) else 0.0 for i in range(n)],
+        }
+    )
+    signal_params = SignalParams(total_notional_cap=10_000, add_cooldown_bars=999)
+    signals = score_to_lot_signals(scores, signal_params)
+    params = BacktestParams(
+        initial_equity=1000,
+        stop_loss_position_notional_fraction=1.0,
+        trailing_start_position_notional_fraction=1.0,
+    )
+
+    assert signals[signals["timestamp"] == ts[96]].empty
+
+    result = simulate_lots(prices_df, pd.DataFrame(), signals, params)
+    lot = result.trades[result.trades["lot_id"] == "lot-000001"].iloc[0]
+
+    assert lot["exit_reason"] == "holding"
+    assert ts.get_loc(pd.Timestamp(lot["exit_ts"])) == 100
+
+
 def test_open_lot_at_end_of_data_is_marked_to_market():
     # A lot still open at the last bar must be force-closed (reason "end_of_data")
     # so its unrealized PnL is reflected in final_equity, not silently dropped.

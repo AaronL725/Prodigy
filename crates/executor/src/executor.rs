@@ -30,6 +30,11 @@ impl MarketCache {
         self.local_received_at_ms = Some(local_received_at_ms);
     }
 
+    pub fn invalidate(&mut self) {
+        self.latest = None;
+        self.local_received_at_ms = None;
+    }
+
     pub fn latest_fresh(&self, now_ms: i64, stale_after_secs: u64) -> Option<MarketUpdate> {
         let update = self.latest.clone()?;
         let received_at = self.local_received_at_ms?;
@@ -209,6 +214,7 @@ pub async fn process_pending_intents_once(
                 continue;
             }
         };
+        let raw_unrealized_pnl = account.unrealized_pnl_24h;
         // ponytail: isolate the per-intent audit-row write too — a sqlite
         // failure here (disk full / DB locked) must not strand the rest of the
         // batch. Skip this intent and retry next tick; the snapshot was fetched
@@ -217,7 +223,7 @@ pub async fn process_pending_intents_once(
             conn,
             account.equity,
             account.available_margin,
-            account.unrealized_pnl_24h,
+            raw_unrealized_pnl,
             0.0,
         ) {
             let _ = db::write_event(
@@ -231,6 +237,18 @@ pub async fn process_pending_intents_once(
                 "{}",
             );
             continue;
+        }
+        let account = apply_24h_equity_loss(conn, account, "now")?;
+        if account.margin_danger {
+            if let Err(err) = handle_margin_danger(conn, cfg, rest).await {
+                let _ = db::write_event(
+                    conn,
+                    "error",
+                    "executor",
+                    &format!("margin danger handling failed: {err}"),
+                    "{}",
+                );
+            }
         }
 
         // Resolve the market snapshot: a fresh-WS open reuses the cached level;
@@ -443,6 +461,175 @@ pub(crate) fn account_margin_danger(data: &serde_json::Value) -> bool {
     };
     parse("crossedRiskRate").is_some_and(|v| v >= 1.0)
         || parse("available").is_some_and(|v| v < 0.0)
+}
+
+fn apply_24h_equity_loss(
+    conn: &Connection,
+    mut account: AccountRiskSnapshot,
+    now: &str,
+) -> Result<AccountRiskSnapshot> {
+    let loss = db::equity_loss_24h_from(conn, account.equity, now)?;
+    account.unrealized_pnl_24h = -loss;
+    Ok(account)
+}
+
+async fn handle_margin_danger(
+    conn: &Connection,
+    cfg: &ExecutorConfig,
+    rest: &BitgetRestClient,
+) -> Result<()> {
+    db::write_event(
+        conn,
+        "critical",
+        "executor",
+        "margin_danger",
+        &serde_json::json!({"symbol": &cfg.bitget_symbol}).to_string(),
+    )?;
+    crate::notify::send_telegram(
+        cfg.telegram_bot_token.as_deref(),
+        cfg.telegram_chat_id.as_deref(),
+        "margin_danger",
+        &format!("margin danger for {}", cfg.bitget_symbol),
+    )
+    .await
+    .ok();
+
+    for (client_oid, _order_id, _size) in db::local_working_system_orders(conn, &cfg.bitget_symbol)?
+    {
+        let cancel = CancelOrderRequest {
+            symbol: cfg.bitget_symbol.clone(),
+            product_type: cfg.product_type.clone(),
+            margin_coin: cfg.margin_coin.clone(),
+            client_oid: client_oid.clone(),
+        };
+        if rest.cancel_order(&cancel).await.is_ok() {
+            db::mark_system_order_cancelled_by_command(conn, &client_oid)?;
+        }
+    }
+
+    for position in db::system_positions(conn)?
+        .into_iter()
+        .filter(|p| p.symbol == cfg.bitget_symbol)
+    {
+        if position.entry_price <= 0.0 {
+            continue;
+        }
+        let base_size = position.notional / position.entry_price;
+        if base_size <= DUST_BASE {
+            continue;
+        }
+        let side = if position.side == "long" {
+            "sell"
+        } else {
+            "buy"
+        };
+        let order = PlaceOrderRequest {
+            symbol: cfg.bitget_symbol.clone(),
+            product_type: cfg.product_type.clone(),
+            margin_mode: cfg.margin_mode.clone(),
+            margin_coin: cfg.margin_coin.clone(),
+            size: format_size(base_size),
+            price: None,
+            side: side.to_string(),
+            order_type: "market".to_string(),
+            force: None,
+            client_oid: format!("pdgy-margin-danger-{}-{}", cfg.bitget_symbol, position.side),
+            reduce_only: Some("YES".to_string()),
+        };
+        db::upsert_order(
+            conn,
+            &OrderRecord {
+                order_id: order.client_oid.clone(),
+                exchange_order_id: None,
+                client_oid: order.client_oid.clone(),
+                intent_id: None,
+                symbol: cfg.bitget_symbol.clone(),
+                side: order.side.clone(),
+                action: "close".to_string(),
+                order_type: order.order_type.clone(),
+                status: "submitting".to_string(),
+                price: None,
+                size: order.size.parse().unwrap_or(0.0),
+                filled_size: 0.0,
+                attempt: 1,
+                raw_json: "{}".to_string(),
+                last_error: None,
+            },
+        )?;
+        match rest
+            .post_json("/api/v2/mix/order/place-order", &order)
+            .await
+        {
+            Ok(response) => {
+                let exchange_order_id = response
+                    .pointer("/data/orderId")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(&order.client_oid)
+                    .to_string();
+                db::upsert_order(
+                    conn,
+                    &OrderRecord {
+                        order_id: exchange_order_id.clone(),
+                        exchange_order_id: Some(exchange_order_id),
+                        status: "submitted".to_string(),
+                        raw_json: response.to_string(),
+                        ..OrderRecord {
+                            order_id: order.client_oid.clone(),
+                            exchange_order_id: None,
+                            client_oid: order.client_oid.clone(),
+                            intent_id: None,
+                            symbol: cfg.bitget_symbol.clone(),
+                            side: order.side.clone(),
+                            action: "close".to_string(),
+                            order_type: order.order_type.clone(),
+                            status: "submitting".to_string(),
+                            price: None,
+                            size: order.size.parse().unwrap_or(0.0),
+                            filled_size: 0.0,
+                            attempt: 1,
+                            raw_json: "{}".to_string(),
+                            last_error: None,
+                        }
+                    },
+                )?;
+            }
+            Err(err) => {
+                let reason = format!("margin danger close rejected: {err}");
+                db::upsert_order(
+                    conn,
+                    &OrderRecord {
+                        order_id: order.client_oid.clone(),
+                        exchange_order_id: None,
+                        client_oid: order.client_oid.clone(),
+                        intent_id: None,
+                        symbol: cfg.bitget_symbol.clone(),
+                        side: order.side.clone(),
+                        action: "close".to_string(),
+                        order_type: order.order_type.clone(),
+                        status: "rejected".to_string(),
+                        price: None,
+                        size: order.size.parse().unwrap_or(0.0),
+                        filled_size: 0.0,
+                        attempt: 1,
+                        raw_json: "{}".to_string(),
+                        last_error: Some(reason.clone()),
+                    },
+                )?;
+                db::write_event(
+                    conn,
+                    "error",
+                    "executor",
+                    "rest_order_failed",
+                    &serde_json::json!({
+                        "client_oid": &order.client_oid,
+                        "error": &reason,
+                    })
+                    .to_string(),
+                )?;
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(crate) async fn fetch_market_snapshot(
@@ -821,14 +1008,7 @@ pub fn build_order_request_for_base(
         OrderMode::Taker => None,
     };
     let size = format_size(base_size);
-    // ponytail: append now_ms so re-running the same intent doesn't collide on
-    // Bitget's client_oid uniqueness window (code 40786); matches the demo test
-    // convention. attempt still sequences retries within one placement.
-    let client_oid = format!(
-        "pdgy-{}-{attempt}-{}",
-        intent.intent_id,
-        crate::bitget::now_ms()
-    );
+    let client_oid = stable_client_oid(&intent.intent_id, mode, attempt);
 
     PlaceOrderRequest {
         symbol: cfg.bitget_symbol.clone(),
@@ -856,6 +1036,14 @@ pub fn build_order_request_for_base(
             None
         },
     }
+}
+
+fn stable_client_oid(intent_id: &str, mode: OrderMode, attempt: u32) -> String {
+    let mode = match mode {
+        OrderMode::Maker => "maker",
+        OrderMode::Taker => "taker",
+    };
+    format!("pdgy-{intent_id}-{attempt}-{mode}")
 }
 
 pub fn build_order_request(
@@ -988,6 +1176,37 @@ fn upsert_order_row(
         },
     )?;
     Ok(exchange_order_id)
+}
+
+fn record_order_attempt(
+    conn: &Connection,
+    cfg: &ExecutorConfig,
+    intent: &TradeIntent,
+    order: &PlaceOrderRequest,
+    status: &str,
+    attempt: i64,
+    last_error: Option<&str>,
+) -> Result<()> {
+    db::upsert_order(
+        conn,
+        &OrderRecord {
+            order_id: order.client_oid.clone(),
+            exchange_order_id: None,
+            client_oid: order.client_oid.clone(),
+            intent_id: Some(intent.intent_id.clone()),
+            symbol: cfg.bitget_symbol.clone(),
+            side: order.side.clone(),
+            action: intent.action.clone(),
+            order_type: order.order_type.clone(),
+            status: status.to_string(),
+            price: order.price.as_ref().and_then(|v| v.parse().ok()),
+            size: order.size.parse().unwrap_or(0.0),
+            filled_size: 0.0,
+            attempt,
+            raw_json: "{}".to_string(),
+            last_error: last_error.map(str::to_string),
+        },
+    )
 }
 
 fn normalize_intent_symbol(mut intent: TradeIntent, cfg: &ExecutorConfig) -> TradeIntent {
@@ -1134,6 +1353,17 @@ pub async fn process_one_intent(
             db::get_executor_state(conn, &format!("manual_override:{}", intent.symbol))?.as_deref(),
         )
     {
+        db::write_event(
+            conn,
+            "warning",
+            "executor",
+            "manual_override_blocked_open",
+            &serde_json::json!({
+                "intent_id": &intent.intent_id,
+                "symbol": &intent.symbol,
+            })
+            .to_string(),
+        )?;
         db::fail_intent(conn, &intent.intent_id, "manual override active for symbol")?;
         return Ok(());
     }
@@ -1321,6 +1551,15 @@ pub async fn process_one_intent(
                         attempt,
                     )
                 };
+                record_order_attempt(
+                    conn,
+                    cfg,
+                    &intent,
+                    &order,
+                    "submitting",
+                    attempt as i64,
+                    None,
+                )?;
                 let response = match rest
                     .post_json("/api/v2/mix/order/place-order", &order)
                     .await
@@ -1330,21 +1569,29 @@ pub async fn process_one_intent(
                         // ponytail: a rejected placement (e.g. size below exchange min,
                         // price-band) must fail the intent durably, not crash the executor.
                         // Record the order row with the error so reconcile/audit see it.
-                        let _ = upsert_order_row(
+                        let reason = format!("place-order rejected: {e}");
+                        let _ = record_order_attempt(
                             conn,
                             cfg,
                             &intent,
                             &order,
-                            &serde_json::Value::Null,
                             "rejected",
                             attempt as i64,
-                            0.0,
+                            Some(&reason),
                         );
-                        db::fail_intent(
+                        let _ = db::write_event(
                             conn,
-                            &intent.intent_id,
-                            &format!("place-order rejected: {e}"),
-                        )?;
+                            "error",
+                            "executor",
+                            "rest_order_failed",
+                            &serde_json::json!({
+                                "intent_id": &intent.intent_id,
+                                "client_oid": &order.client_oid,
+                                "error": &reason,
+                            })
+                            .to_string(),
+                        );
+                        db::fail_intent(conn, &intent.intent_id, &reason)?;
                         return Ok(());
                     }
                 };
@@ -1561,27 +1808,36 @@ pub async fn process_one_intent(
                         1,
                     )
                 };
+                record_order_attempt(conn, cfg, &intent, &order, "submitting", 1, None)?;
                 let response = match rest
                     .post_json("/api/v2/mix/order/place-order", &order)
                     .await
                 {
                     Ok(r) => r,
                     Err(e) => {
-                        let _ = upsert_order_row(
+                        let reason = format!("taker place-order rejected: {e}");
+                        let _ = record_order_attempt(
                             conn,
                             cfg,
                             &intent,
                             &order,
-                            &serde_json::Value::Null,
                             "rejected",
                             1,
-                            0.0,
+                            Some(&reason),
                         );
-                        db::fail_intent(
+                        let _ = db::write_event(
                             conn,
-                            &intent.intent_id,
-                            &format!("taker place-order rejected: {e}"),
-                        )?;
+                            "error",
+                            "executor",
+                            "rest_order_failed",
+                            &serde_json::json!({
+                                "intent_id": &intent.intent_id,
+                                "client_oid": &order.client_oid,
+                                "error": &reason,
+                            })
+                            .to_string(),
+                        );
+                        db::fail_intent(conn, &intent.intent_id, &reason)?;
                         return Ok(());
                     }
                 };
@@ -1704,6 +1960,32 @@ mod tests {
         .unwrap()
     }
 
+    fn one_response_server(body: &'static str) -> String {
+        response_server(vec![body])
+    }
+
+    fn response_server(bodies: Vec<&'static str>) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for body in bodies {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(1)));
+                    let mut buf = [0u8; 4096];
+                    let _ = stream.read(&mut buf);
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                }
+            }
+        });
+        format!("http://{addr}")
+    }
+
     #[test]
     fn infra_error_marks_accepted_intent_failed_not_stuck() {
         // Regression: process_one_intent accepts the intent (pending→accepted)
@@ -1773,6 +2055,70 @@ mod tests {
         assert_eq!(order.order_type, "limit");
         assert_eq!(order.price.as_deref(), Some("3000"));
         assert_eq!(order.size, "0.1");
+    }
+
+    #[test]
+    fn client_oid_is_stable_per_intent_attempt_and_mode() {
+        let cfg = ExecutorConfig::demo_for_tests();
+        let intent = TradeIntent {
+            intent_id: "intent-1".to_string(),
+            symbol: "ETH/USDT:USDT".to_string(),
+            side: "long".to_string(),
+            action: "open".to_string(),
+            target_notional: 300.0,
+            max_order_notional: 300.0,
+        };
+        let market = MarketUpdate {
+            symbol: "ETHUSDT".to_string(),
+            best_bid: 3000.0,
+            best_ask: 3000.5,
+            exchange_ts_ms: 1,
+        };
+
+        let maker = build_order_request(&cfg, &intent, &market, 300.0, OrderMode::Maker, 1);
+        let maker_again = build_order_request(&cfg, &intent, &market, 300.0, OrderMode::Maker, 1);
+        let taker = build_order_request(&cfg, &intent, &market, 300.0, OrderMode::Taker, 1);
+
+        assert_eq!(maker.client_oid, "pdgy-intent-1-1-maker");
+        assert_eq!(maker_again.client_oid, maker.client_oid);
+        assert_eq!(taker.client_oid, "pdgy-intent-1-1-taker");
+    }
+
+    #[test]
+    fn order_attempt_is_durable_before_rest_success() {
+        let conn = memory_db();
+        insert_pending_intent(&conn, "intent-1");
+        let cfg = ExecutorConfig::demo_for_tests();
+        let intent = TradeIntent {
+            intent_id: "intent-1".to_string(),
+            symbol: "ETH/USDT:USDT".to_string(),
+            side: "long".to_string(),
+            action: "open".to_string(),
+            target_notional: 300.0,
+            max_order_notional: 300.0,
+        };
+        let market = MarketUpdate {
+            symbol: "ETHUSDT".to_string(),
+            best_bid: 3000.0,
+            best_ask: 3000.5,
+            exchange_ts_ms: 1,
+        };
+        let order = build_order_request(&cfg, &intent, &market, 300.0, OrderMode::Maker, 1);
+
+        record_order_attempt(&conn, &cfg, &intent, &order, "submitting", 1, None).unwrap();
+
+        let row: (String, Option<String>, String, Option<String>) = conn
+            .query_row(
+                "select order_id, exchange_order_id, status, last_error
+                 from orders where client_oid = ?1",
+                rusqlite::params![order.client_oid],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(row.0, "pdgy-intent-1-1-maker");
+        assert_eq!(row.1, None);
+        assert_eq!(row.2, "submitting");
+        assert_eq!(row.3, None);
     }
 
     #[test]
@@ -1871,6 +2217,204 @@ mod tests {
             .query_row("select count(*) from orders", [], |row| row.get(0))
             .unwrap();
         assert_eq!(orders, 0);
+        let events: i64 = conn
+            .query_row(
+                "select count(*) from events
+                 where component = 'executor'
+                   and message = 'manual_override_blocked_open'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(events, 1);
+    }
+
+    #[tokio::test]
+    async fn rest_place_order_failure_records_event_and_last_error() {
+        let conn = memory_db();
+        insert_pending_intent(&conn, "i-rest-fail");
+        let cfg = ExecutorConfig {
+            rest_base_url: one_response_server(r#"{"code":"40010","msg":"price band"}"#),
+            open_maker_timeout_secs: 0,
+            ..ExecutorConfig::demo_for_tests()
+        };
+        let rest = BitgetRestClient::new(cfg.clone()).unwrap();
+        let mut cache = MarketCache::default();
+
+        process_one_intent(
+            &conn,
+            &cfg,
+            &rest,
+            TradeIntent {
+                intent_id: "i-rest-fail".to_string(),
+                symbol: "ETH/USDT:USDT".to_string(),
+                side: "long".to_string(),
+                action: "open".to_string(),
+                target_notional: 100.0,
+                max_order_notional: 100.0,
+            },
+            MarketUpdate {
+                symbol: "ETHUSDT".to_string(),
+                best_bid: 3000.0,
+                best_ask: 3001.0,
+                exchange_ts_ms: 1,
+            },
+            AccountRiskSnapshot {
+                equity: 10_000.0,
+                available_margin: 10_000.0,
+                unrealized_pnl_24h: 0.0,
+                gross_notional: 0.0,
+                market_is_fresh: true,
+                private_state_is_ready: true,
+                margin_danger: false,
+            },
+            &mut cache,
+        )
+        .await
+        .unwrap();
+
+        let (status, error): (String, Option<String>) = conn
+            .query_row(
+                "select status, error from trade_intents where intent_id='i-rest-fail'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "failed");
+        assert!(error.as_deref().unwrap_or("").contains("price band"));
+
+        let (order_status, last_error): (String, Option<String>) = conn
+            .query_row(
+                "select status, last_error from orders where intent_id='i-rest-fail'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(order_status, "rejected");
+        assert!(last_error.as_deref().unwrap_or("").contains("price band"));
+
+        let events: i64 = conn
+            .query_row(
+                "select count(*) from events where message = 'rest_order_failed'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(events, 1);
+    }
+
+    #[tokio::test]
+    async fn margin_danger_cancels_and_closes_system_exposure_with_event() {
+        let conn = memory_db();
+        insert_pending_intent(&conn, "i-open");
+        conn.execute(
+            "update trade_intents set status='executed' where intent_id='i-open'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "insert into orders (order_id, client_oid, intent_id, symbol, side, action,
+               order_type, status, price, size, filled_size, created_at, updated_at)
+             values ('o-live','c-live','i-open','ETHUSDT','buy','open','limit','submitted',
+               3000, 0.05, 0.0, '2026-07-01T00:00:00Z', '2026-07-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        db::upsert_position(
+            &conn,
+            &crate::types::PositionRecord {
+                symbol: "ETHUSDT".to_string(),
+                side: "long".to_string(),
+                notional: 150.0,
+                entry_price: 3000.0,
+                unrealized_pnl: -20.0,
+                ownership: "system".to_string(),
+                opened_at: Some("2026-07-01T00:00:00Z".to_string()),
+                adopted_at: None,
+                source_intent_id: Some("i-open".to_string()),
+                raw_json: "{}".to_string(),
+            },
+        )
+        .unwrap();
+        let cfg = ExecutorConfig {
+            rest_base_url: response_server(vec![
+                r#"{"code":"00000","data":{"orderId":"cancelled"}}"#,
+                r#"{"code":"00000","data":{"orderId":"close-1"}}"#,
+            ]),
+            ..ExecutorConfig::demo_for_tests()
+        };
+        let rest = BitgetRestClient::new(cfg.clone()).unwrap();
+
+        handle_margin_danger(&conn, &cfg, &rest).await.unwrap();
+
+        let events: i64 = conn
+            .query_row(
+                "select count(*) from events where message = 'margin_danger'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(events, 1);
+        let cancelled: String = conn
+            .query_row(
+                "select status from orders where client_oid = 'c-live'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cancelled, "cancelled");
+        let close_orders: i64 = conn
+            .query_row(
+                "select count(*) from orders
+                 where action = 'close' and side = 'sell' and intent_id is null",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(close_orders, 1);
+    }
+
+    #[test]
+    fn account_snapshot_uses_24h_equity_drawdown_for_suspension() {
+        let conn = memory_db();
+        conn.execute(
+            "insert into equity_snapshots (
+              snapshot_id, created_at, equity, available_margin, unrealized_pnl, realized_pnl_24h
+            ) values ('base', '2026-07-05 12:00:00', 1000, 1000, 0, 0)",
+            [],
+        )
+        .unwrap();
+
+        let account = apply_24h_equity_loss(
+            &conn,
+            AccountRiskSnapshot {
+                equity: 900.0,
+                available_margin: 900.0,
+                unrealized_pnl_24h: 0.0,
+                gross_notional: 0.0,
+                market_is_fresh: true,
+                private_state_is_ready: true,
+                margin_danger: false,
+            },
+            "2026-07-06 12:00:00",
+        )
+        .unwrap();
+
+        assert_eq!(account.unrealized_pnl_24h, -100.0);
+        let err = check_intent(
+            &TradeIntent {
+                intent_id: "i-drawdown".to_string(),
+                symbol: "ETHUSDT".to_string(),
+                side: "long".to_string(),
+                action: "open".to_string(),
+                target_notional: 100.0,
+                max_order_notional: 100.0,
+            },
+            &account,
+            &RiskParams::default(),
+        )
+        .unwrap_err();
+        assert!(err.contains("trading suspended"));
     }
 
     #[test]
@@ -2201,6 +2745,25 @@ mod tests {
         let cache = MarketCache::default();
 
         assert!(cache.latest_fresh(1_000, 3).is_none());
+    }
+
+    #[test]
+    fn market_cache_invalidate_makes_snapshot_stale_immediately() {
+        let mut cache = MarketCache::default();
+        cache.update_at(
+            MarketUpdate {
+                symbol: "ETHUSDT".to_string(),
+                best_bid: 100.0,
+                best_ask: 101.0,
+                exchange_ts_ms: 10,
+            },
+            1_000,
+        );
+        assert!(cache.latest_fresh(1_001, 3).is_some());
+
+        cache.invalidate();
+
+        assert!(cache.latest_fresh(1_001, 3).is_none());
     }
 
     #[test]

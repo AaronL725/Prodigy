@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import subprocess
+import urllib.error
+import urllib.request
 from datetime import UTC, datetime
 
 import pytest
@@ -136,8 +138,8 @@ def _seed_m6_detail_db(db_path):
         )
         set_executor_state(conn, "smoke:component:prodigy-executor", "started pid=101", "2026-07-06T00:00:01Z")
         set_executor_state(conn, "smoke:component:prodigy-signal", "early_exit code=1", "2026-07-06T00:00:02Z")
-        set_executor_state(conn, "smoke:telegram:queries", "skipped not configured", "2026-07-06T00:00:03Z")
-        set_executor_state(conn, "smoke:telegram:controls", "skipped not configured", "2026-07-06T00:00:04Z")
+        set_executor_state(conn, "smoke:telegram:queries", "skipped missing telegram credentials", "2026-07-06T00:00:03Z")
+        set_executor_state(conn, "smoke:telegram:controls", "skipped missing telegram credentials", "2026-07-06T00:00:04Z")
         conn.commit()
 
 
@@ -195,16 +197,17 @@ def test_build_smoke_report_includes_required_m6_sections_and_details(tmp_path):
 
     assert "- prodigy-executor: started pid=101" in report
     assert "- prodigy-signal: early_exit code=1" in report
-    assert "- queries: skipped not configured" in report
-    assert "- controls: skipped not configured" in report
+    assert "- queries: skipped missing telegram credentials" in report
+    assert "- controls: skipped missing telegram credentials" in report
     assert "- pending: 1" in report
     assert "- executed: 1" in report
     assert "- close_all cmd-failed: failed requested_by=123 error=demo reject" in report
     assert "- ETHUSDT buy open submitted size=0.1 filled=0.04 price=2000.0" in report
     assert "- ETHUSDT buy size=0.04 price=2010.0 fee=0.02" in report
     assert "- ETHUSDT long notional=100.0 entry=2000.0 unrealized_pnl=1.5 ownership=system" in report
-    assert "- realized_pnl_24h: 0.5" in report
+    assert "- realized_pnl_24h: n/a" in report
     assert "- unrealized_pnl: 1.5" in report
+    assert "- total_pnl: n/a" in report
     assert "- sqlite busy" in report
     assert "- ws: websocket reconnect" in report
     assert "- rest: rest timeout" in report
@@ -235,6 +238,34 @@ def test_write_smoke_report_writes_markdown_and_executor_state(tmp_path):
         init_db(conn)
         assert get_executor_state(conn, "smoke:last_report") == str(path)
         assert get_executor_state(conn, "smoke:status") == "completed"
+
+
+def test_build_smoke_report_does_not_invent_total_pnl_from_zero_snapshot(tmp_path):
+    db_path = tmp_path / "prodigy.sqlite"
+    with connect(db_path) as conn:
+        init_db(conn)
+        conn.execute(
+            """
+            insert into equity_snapshots (
+              snapshot_id, created_at, equity, available_margin, unrealized_pnl,
+              realized_pnl_24h
+            ) values ('eq-zero', '2026-07-06T00:28:00Z', 1000, 900, 0, 0)
+            """
+        )
+        conn.commit()
+
+    report = build_smoke_report(
+        db_path,
+        started_at="2026-07-06T00:00:00Z",
+        ended_at="2026-07-06T00:45:00Z",
+        duration_minutes=45,
+        issues=[],
+    )
+
+    assert "- realized_pnl_24h: n/a" in report
+    assert "- total_pnl: n/a" in report
+    assert "- realized_pnl_24h: 0.0" not in report
+    assert "- total_pnl: 0.0" not in report
 
 
 def test_write_smoke_report_uses_yyyymmdd_hhmm_filename(tmp_path):
@@ -273,8 +304,14 @@ def test_write_smoke_report_initializes_empty_database(tmp_path):
         assert get_executor_state(conn, "smoke:last_report") == str(path)
 
 
-def test_smoke_cli_validates_duration_and_can_write_skip_start_report(tmp_path, capsys):
+def test_smoke_cli_validates_duration_and_can_write_skip_start_report(
+    tmp_path, capsys, monkeypatch
+):
     from prodigy.cli import smoke
+
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("TELEGRAM_ALLOWED_USER_IDS", raising=False)
+    monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
 
     db_path = tmp_path / "prodigy.sqlite"
     report_dir = tmp_path / "reports"
@@ -312,8 +349,12 @@ def test_smoke_cli_validates_duration_and_can_write_skip_start_report(tmp_path, 
         assert get_executor_state(conn, "smoke:status") == "completed"
 
 
-def test_smoke_cli_records_process_kill_after_terminate_timeout(tmp_path):
+def test_smoke_cli_records_process_kill_after_terminate_timeout(tmp_path, monkeypatch):
     from prodigy.cli import smoke
+
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("TELEGRAM_ALLOWED_USER_IDS", raising=False)
+    monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
 
     class HangingProcess:
         pid = 999999
@@ -373,6 +414,7 @@ def test_smoke_cli_records_component_startup_status_and_telegram_checks(
 
     monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
     monkeypatch.delenv("TELEGRAM_ALLOWED_USER_IDS", raising=False)
+    monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
 
     class EarlyExitProcess:
         pid = 101
@@ -414,8 +456,8 @@ def test_smoke_cli_records_component_startup_status_and_telegram_checks(
     report = path.read_text()
     assert "- prodigy-executor: early_exit code=2" in report
     assert "- prodigy-signal: failed_to_start missing signal" in report
-    assert "- queries: skipped not configured" in report
-    assert "- controls: skipped not configured" in report
+    assert "- queries: skipped missing telegram credentials" in report
+    assert "- controls: skipped missing telegram credentials" in report
     with connect(tmp_path / "prodigy.sqlite") as conn:
         assert (
             get_executor_state(conn, "smoke:component:prodigy-executor")
@@ -425,6 +467,106 @@ def test_smoke_cli_records_component_startup_status_and_telegram_checks(
             get_executor_state(conn, "smoke:component:prodigy-signal")
             == "failed_to_start missing signal"
         )
+
+
+def test_smoke_cli_records_successful_telegram_bot_api_checks(tmp_path, monkeypatch):
+    from prodigy.cli import smoke
+
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123:secret-token")
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USER_IDS", "123")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "999")
+
+    calls = []
+
+    class FakeResponse:
+        def __init__(self, body):
+            self.body = body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return self.body
+
+    def fake_urlopen(request, timeout):
+        calls.append((request.full_url, request.data, timeout))
+        if request.full_url.endswith("/getMe"):
+            return FakeResponse(b'{"ok": true, "result": {"username": "smoke_bot"}}')
+        if request.full_url.endswith("/sendMessage"):
+            return FakeResponse(b'{"ok": true, "result": {"message_id": 42}}')
+        raise AssertionError(request.full_url)
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+    ticks = [
+        datetime(2026, 7, 6, 0, 0, tzinfo=UTC),
+        datetime(2026, 7, 6, 0, 30, tzinfo=UTC),
+    ]
+    path = smoke.run_smoke(
+        smoke.build_parser().parse_args(
+            [
+                "--db",
+                str(tmp_path / "prodigy.sqlite"),
+                "--duration-minutes",
+                "30",
+                "--report-dir",
+                str(tmp_path / "reports"),
+                "--skip-start",
+            ]
+        ),
+        sleep=lambda _seconds: None,
+        clock=lambda: ticks.pop(0),
+    )
+
+    report = path.read_text()
+    assert len(calls) == 2
+    assert "- queries: pass getMe username=smoke_bot" in report
+    assert "- controls: pass sendMessage message_id=42" in report
+    assert "secret-token" not in report
+
+
+def test_smoke_cli_records_failed_telegram_bot_api_checks_without_token(
+    tmp_path, monkeypatch
+):
+    from prodigy.cli import smoke
+
+    token = "123:secret-token"
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", token)
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USER_IDS", "123")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "999")
+
+    def fake_urlopen(request, timeout):
+        raise urllib.error.URLError(f"network failed for {request.full_url}")
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+    ticks = [
+        datetime(2026, 7, 6, 0, 0, tzinfo=UTC),
+        datetime(2026, 7, 6, 0, 30, tzinfo=UTC),
+    ]
+    path = smoke.run_smoke(
+        smoke.build_parser().parse_args(
+            [
+                "--db",
+                str(tmp_path / "prodigy.sqlite"),
+                "--duration-minutes",
+                "30",
+                "--report-dir",
+                str(tmp_path / "reports"),
+                "--skip-start",
+            ]
+        ),
+        sleep=lambda _seconds: None,
+        clock=lambda: ticks.pop(0),
+    )
+
+    report = path.read_text()
+    assert "- queries: fail getMe error=" in report
+    assert "- controls: fail sendMessage error=" in report
+    assert token not in report
 
 
 def test_smoke_start_process_uses_process_group_on_posix():

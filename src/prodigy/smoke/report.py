@@ -295,13 +295,13 @@ def _position_lines(rows: list[sqlite3.Row]) -> list[str]:
 def _pnl_lines(row: sqlite3.Row | None) -> list[str]:
     if row is None:
         return ["- realized_pnl_24h: n/a", "- unrealized_pnl: n/a", "- total_pnl: n/a"]
-    total = float(row["realized_pnl_24h"]) + float(row["unrealized_pnl"])
+    # ponytail: no realized-PnL ledger exists yet; total stays unknown until one does.
     return [
         f"- equity: {_num(row['equity'])}",
         f"- available_margin: {_num(row['available_margin'])}",
-        f"- realized_pnl_24h: {_num(row['realized_pnl_24h'])}",
+        "- realized_pnl_24h: n/a",
         f"- unrealized_pnl: {_num(row['unrealized_pnl'])}",
-        f"- total_pnl: {_num(total)}",
+        "- total_pnl: n/a",
     ]
 
 

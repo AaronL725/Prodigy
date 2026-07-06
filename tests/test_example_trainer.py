@@ -22,8 +22,6 @@ def features():
 
 def test_train_example_model_saves_artifact_and_metadata(tmp_path):
     db_path = tmp_path / "prodigy.sqlite"
-    with connect(db_path) as conn:
-        init_db(conn)
 
     result = train_example_model(
         frame=features(),

@@ -27,6 +27,14 @@ def _notional(score: float, params: SignalParams) -> float:
     return params.total_notional_cap * fraction
 
 
+def score_confirms_side(score: float, side: str, threshold: float = 0.6) -> bool:
+    if side == "long":
+        return score >= threshold
+    if side == "short":
+        return score <= -threshold
+    return False
+
+
 # ponytail: single-symbol milestone; plain row loop, dict tracking open lots.
 def score_to_lot_signals(scores: pd.DataFrame, params: SignalParams) -> pd.DataFrame:
     rows: list[dict] = []
@@ -91,7 +99,7 @@ def score_to_lot_signals(scores: pd.DataFrame, params: SignalParams) -> pd.DataF
                     }
                 )
 
-    return pd.DataFrame(
+    result = pd.DataFrame(
         rows,
         columns=[
             "timestamp",
@@ -104,3 +112,8 @@ def score_to_lot_signals(scores: pd.DataFrame, params: SignalParams) -> pd.DataF
             "reason",
         ],
     )
+    result.attrs["raw_scores"] = (
+        scores[["timestamp", "symbol", "score"]].reset_index(drop=True).copy()
+    )
+    result.attrs["open_threshold"] = params.open_threshold
+    return result

@@ -1,5 +1,5 @@
 use anyhow::Result;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::types::{ControlCommand, FillRecord, OrderRecord, PositionRecord, TradeIntent};
 
@@ -7,7 +7,7 @@ pub fn pending_intents(conn: &Connection) -> Result<Vec<TradeIntent>> {
     let mut stmt = conn.prepare(
         "select intent_id, symbol, side, action, target_notional, max_order_notional
          from trade_intents
-         where status = 'pending'
+         where status in ('pending', 'accepted')
          order by created_at asc",
     )?;
     let rows = stmt.query_map([], |row| {
@@ -32,7 +32,7 @@ pub fn accept_intent(conn: &Connection, intent_id: &str) -> Result<bool> {
     let rows = conn.execute(
         "update trade_intents
          set status = 'accepted', processed_at = datetime('now'), error = null
-         where intent_id = ? and status = 'pending'",
+         where intent_id = ? and status in ('pending', 'accepted')",
         params![intent_id],
     )?;
     Ok(rows == 1)
@@ -119,7 +119,12 @@ pub fn upsert_order(conn: &Connection, order: &OrderRecord) -> Result<()> {
         ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'),
           datetime('now'), ?, ?, ?)
         on conflict(client_oid) do update set
-          exchange_order_id = excluded.exchange_order_id,
+          order_id = case
+            when excluded.exchange_order_id is not null then excluded.order_id
+            else orders.order_id
+          end,
+          exchange_order_id = coalesce(excluded.exchange_order_id, orders.exchange_order_id),
+          intent_id = excluded.intent_id,
           status = excluded.status,
           price = excluded.price,
           size = excluded.size,
@@ -216,12 +221,24 @@ pub fn upsert_position(conn: &Connection, position: &PositionRecord) -> Result<(
            notional = excluded.notional,
            entry_price = excluded.entry_price,
            unrealized_pnl = excluded.unrealized_pnl,
-           updated_at = datetime('now'),
-           ownership = excluded.ownership,
-           opened_at = excluded.opened_at,
-           adopted_at = excluded.adopted_at,
-           source_intent_id = excluded.source_intent_id,
-           raw_json = excluded.raw_json",
+          updated_at = datetime('now'),
+          ownership = excluded.ownership,
+          opened_at = case
+            when positions.ownership = 'imported'
+             and excluded.ownership = 'imported'
+             and positions.opened_at is not null
+            then positions.opened_at
+            else excluded.opened_at
+          end,
+          adopted_at = case
+            when positions.ownership = 'imported'
+             and excluded.ownership = 'imported'
+             and positions.adopted_at is not null
+            then positions.adopted_at
+            else excluded.adopted_at
+          end,
+          source_intent_id = excluded.source_intent_id,
+          raw_json = excluded.raw_json",
         params![
             position.symbol,
             position.side,
@@ -236,6 +253,22 @@ pub fn upsert_position(conn: &Connection, position: &PositionRecord) -> Result<(
         ],
     )?;
     Ok(())
+}
+
+pub fn equity_loss_24h_from(conn: &Connection, current_equity: f64, now: &str) -> Result<f64> {
+    let baseline: Option<f64> = conn
+        .query_row(
+            "select equity from equity_snapshots
+             where julianday(created_at) >= julianday(?1, '-24 hours')
+               and julianday(created_at) <= julianday(?1)
+             order by julianday(created_at) asc, created_at asc limit 1",
+            params![now],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(baseline
+        .map(|equity| (equity - current_equity).max(0.0))
+        .unwrap_or(0.0))
 }
 
 /// Refresh a position's live market fields from a private-WS update WITHOUT
@@ -643,7 +676,7 @@ mod tests {
     }
 
     #[test]
-    fn accept_intent_is_idempotent() {
+    fn accept_intent_claims_pending_but_not_terminal() {
         let conn = memory_db();
         conn.execute(
             "insert into trade_intents (
@@ -656,7 +689,52 @@ mod tests {
         .unwrap();
 
         assert!(accept_intent(&conn, "i1").unwrap());
+        mark_intent_executed(&conn, "i1").unwrap();
         assert!(!accept_intent(&conn, "i1").unwrap());
+    }
+
+    #[test]
+    fn pending_intents_include_accepted_for_restart_recovery() {
+        let conn = memory_db();
+        for (intent_id, status) in [("i-pending", "pending"), ("i-accepted", "accepted")] {
+            conn.execute(
+                "insert into trade_intents (
+                  intent_id, created_at, symbol, side, action, target_notional,
+                  max_order_notional, status, source
+                ) values (?1, '2026-07-01T00:00:00Z', 'ETH/USDT:USDT',
+                  'long', 'open', 100, 100, ?2, 'test')",
+                params![intent_id, status],
+            )
+            .unwrap();
+        }
+
+        let mut ids: Vec<String> = pending_intents(&conn)
+            .unwrap()
+            .into_iter()
+            .map(|i| i.intent_id)
+            .collect();
+        ids.sort();
+
+        assert_eq!(ids, vec!["i-accepted", "i-pending"]);
+    }
+
+    #[test]
+    fn accept_intent_reclaims_accepted_intent_after_restart() {
+        let conn = memory_db();
+        conn.execute(
+            "insert into trade_intents (
+              intent_id, created_at, symbol, side, action, target_notional,
+              max_order_notional, status, source
+            ) values ('i-accepted', '2026-07-01T00:00:00Z', 'ETH/USDT:USDT',
+              'long', 'open', 100, 100, 'accepted', 'test')",
+            [],
+        )
+        .unwrap();
+
+        assert!(
+            accept_intent(&conn, "i-accepted").unwrap(),
+            "accepted intents must be claimable after a restart"
+        );
     }
 
     #[test]
@@ -796,6 +874,66 @@ mod tests {
             .unwrap();
         assert_eq!(row.0, 50.0);
         assert_eq!(row.1, "imported");
+    }
+
+    #[test]
+    fn upsert_position_preserves_first_imported_adoption_time() {
+        use crate::types::PositionRecord;
+        let conn = memory_db();
+        let first = PositionRecord {
+            symbol: "ETHUSDT".to_string(),
+            side: "long".to_string(),
+            notional: 1000.0,
+            entry_price: 3000.0,
+            unrealized_pnl: 0.0,
+            ownership: "imported".to_string(),
+            opened_at: Some("2026-07-01T00:00:00Z".to_string()),
+            adopted_at: Some("2026-07-01T00:00:00Z".to_string()),
+            source_intent_id: None,
+            raw_json: "{}".to_string(),
+        };
+        upsert_position(&conn, &first).unwrap();
+
+        upsert_position(
+            &conn,
+            &PositionRecord {
+                unrealized_pnl: 25.0,
+                opened_at: Some("2026-07-02T00:00:00Z".to_string()),
+                adopted_at: Some("2026-07-02T00:00:00Z".to_string()),
+                ..first
+            },
+        )
+        .unwrap();
+
+        let row: (Option<String>, Option<String>, f64) = conn
+            .query_row(
+                "select adopted_at, opened_at, unrealized_pnl from positions where symbol='ETHUSDT'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(row.0.as_deref(), Some("2026-07-01T00:00:00Z"));
+        assert_eq!(row.1.as_deref(), Some("2026-07-01T00:00:00Z"));
+        assert_eq!(row.2, 25.0);
+    }
+
+    #[test]
+    fn equity_loss_24h_uses_window_baseline_not_current_unrealized() {
+        let conn = memory_db();
+        conn.execute(
+            "insert into equity_snapshots (
+              snapshot_id, created_at, equity, available_margin, unrealized_pnl, realized_pnl_24h
+            ) values
+              ('old', '2026-07-04 00:00:00', 2000, 2000, 0, 0),
+              ('base', '2026-07-05 12:00:00', 1000, 1000, 0, 0),
+              ('later', '2026-07-06 11:00:00', 970, 970, 0, 0)",
+            [],
+        )
+        .unwrap();
+
+        let loss = equity_loss_24h_from(&conn, 900.0, "2026-07-06 12:00:00").unwrap();
+
+        assert_eq!(loss, 100.0);
     }
 
     #[test]

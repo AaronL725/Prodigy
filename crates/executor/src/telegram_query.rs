@@ -65,7 +65,10 @@ pub fn operator_response(
         "/events" => Ok(Some(events_response(conn)?)),
         "/smoke_status" => Ok(Some(smoke_status_response(conn)?)),
         "/stop" | "/resume" | "/cancel_all" | "/close_all" | "/confirm" => {
-            control_response(conn, text, from_user_id, now_ms)
+            match control_response(conn, text, from_user_id, now_ms) {
+                Ok(reply) => Ok(reply),
+                Err(err) => Ok(Some(control_failure_response(err))),
+            }
         }
         _ => Ok(None),
     }
@@ -225,8 +228,25 @@ fn positions_response(conn: &Connection) -> Result<String> {
 
 fn orders_response(conn: &Connection) -> Result<String> {
     let mut stmt = conn.prepare(
-        "select client_oid, symbol, side, action, status, size, filled_size
-         from orders order by updated_at desc limit 10",
+        "with working as (
+           select client_oid, symbol, side, action, status, size, filled_size, updated_at, 0 as bucket
+           from orders
+           where intent_id is not null and status in ('submitted', 'live')
+         ),
+         recent as (
+           select client_oid, symbol, side, action, status, size, filled_size, updated_at, 1 as bucket
+           from orders
+           where client_oid not in (select client_oid from working)
+           order by updated_at desc
+           limit 10
+         )
+         select client_oid, symbol, side, action, status, size, filled_size
+         from (
+           select * from working
+           union all
+           select * from recent
+         )
+         order by bucket asc, updated_at desc",
     )?;
     let rows = stmt.query_map([], |row| {
         Ok(format!(
@@ -448,17 +468,23 @@ fn start_close_all_confirmation(
         "expires_ms": now_ms + 60_000,
     })
     .to_string();
-    crate::db::set_executor_state(conn, &format!("close_all_confirm:{requested_by}"), &value)?;
-    audit(
-        conn,
-        "telegram close_all confirmation generated",
-        &serde_json::json!({
-            "requested_by": requested_by,
-            "expires_ms": now_ms + 60_000,
-        })
-        .to_string(),
-    )?;
+    with_savepoint(conn, "telegram_close_all_confirm", |conn| {
+        crate::db::set_executor_state(conn, &format!("close_all_confirm:{requested_by}"), &value)?;
+        audit(
+            conn,
+            "telegram close_all confirmation generated",
+            &serde_json::json!({
+                "requested_by": requested_by,
+                "expires_ms": now_ms + 60_000,
+            })
+            .to_string(),
+        )
+    })?;
     Ok(format!("confirm close_all with /confirm {code}"))
+}
+
+fn control_failure_response(err: anyhow::Error) -> String {
+    format!("telegram command failed: {err}")
 }
 
 fn confirm_close_all(
@@ -716,6 +742,51 @@ mod tests {
     }
 
     #[test]
+    fn orders_query_prioritizes_old_working_system_orders_before_recent_orders() {
+        let conn = test_conn();
+        conn.execute(
+            "insert into trade_intents (
+              intent_id, created_at, symbol, side, action, target_notional,
+              max_order_notional, status, source
+            ) values ('intent-working', '2026-07-06T00:00:00Z', 'ETHUSDT', 'long', 'open', 100, 100, 'executed', 'test')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "insert into orders (
+               order_id, client_oid, intent_id, symbol, side, action, order_type,
+               status, price, size, filled_size, created_at, updated_at
+             ) values (
+               'old-working', 'old-working', 'intent-working', 'ETHUSDT', 'buy', 'open',
+               'limit', 'submitted', 2000.0, 0.5, 0.0, '2026-07-06T00:00:00Z', '2026-07-06T00:00:00Z'
+             )",
+            [],
+        )
+        .unwrap();
+        for n in 0..11 {
+            conn.execute(
+                "insert into orders (
+                   order_id, client_oid, intent_id, symbol, side, action, order_type,
+                   status, price, size, filled_size, created_at, updated_at
+                 ) values (?, ?, null, 'ETHUSDT', 'buy', 'open',
+                   'market', 'filled', 2000.0, 0.1, 0.1, ?, ?)",
+                rusqlite::params![
+                    format!("recent-{n}"),
+                    format!("recent-{n}"),
+                    format!("2026-07-06T00:{:02}:00Z", n + 1),
+                    format!("2026-07-06T00:{:02}:00Z", n + 1),
+                ],
+            )
+            .unwrap();
+        }
+
+        let response = query_response(&conn, "/orders").unwrap().unwrap();
+
+        assert!(response.lines().next().unwrap().contains("old-working"));
+        assert_eq!(response.matches("old-working").count(), 1);
+    }
+
+    #[test]
     fn unauthorized_user_gets_no_sqlite_state_and_no_control() {
         let conn = test_conn();
         let response = operator_response(&conn, "/bad\"cmd", "999", &["123".to_string()], 1_000)
@@ -813,6 +884,44 @@ mod tests {
     }
 
     #[test]
+    fn control_command_write_failure_returns_failure_reply_without_queued_semantics() {
+        let conn = test_conn();
+        conn.execute("drop table control_commands", []).unwrap();
+
+        let response = operator_response(&conn, "/stop", "123", &["123".to_string()], 1_000)
+            .unwrap()
+            .unwrap();
+        let event_count: i64 = conn
+            .query_row(
+                "select count(*) from events where component = 'telegram'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        assert!(response.contains("failed"));
+        assert!(!response.contains("queued"));
+        assert_eq!(event_count, 0);
+    }
+
+    #[test]
+    fn audit_write_failure_returns_failure_reply_and_rolls_back_control_command() {
+        let conn = test_conn();
+        conn.execute("drop table events", []).unwrap();
+
+        let response = operator_response(&conn, "/stop", "123", &["123".to_string()], 1_000)
+            .unwrap()
+            .unwrap();
+        let command_count: i64 = conn
+            .query_row("select count(*) from control_commands", [], |r| r.get(0))
+            .unwrap();
+
+        assert!(response.contains("failed"));
+        assert!(!response.contains("queued"));
+        assert_eq!(command_count, 0);
+    }
+
+    #[test]
     fn close_all_requires_same_user_confirmation_before_queueing() {
         let conn = test_conn();
         let first = operator_response(&conn, "/close_all", "123", &["123".to_string()], 10_000)
@@ -862,6 +971,56 @@ mod tests {
         assert!(second.contains("queued"));
         assert_eq!(command, "close_all");
         assert_eq!(accepted_events, 1);
+    }
+
+    #[test]
+    fn close_all_pending_confirmation_write_failure_returns_failure_without_pending_state() {
+        let conn = test_conn();
+        conn.execute("drop table events", []).unwrap();
+
+        let response = operator_response(&conn, "/close_all", "123", &["123".to_string()], 1_000)
+            .unwrap()
+            .unwrap();
+        let state = crate::db::get_executor_state(&conn, "close_all_confirm:123").unwrap();
+
+        assert!(response.contains("failed"));
+        assert!(!response.contains("/confirm"));
+        assert!(state.is_none());
+    }
+
+    #[test]
+    fn confirm_write_failure_returns_failure_reply_without_queueing_close_all() {
+        let conn = test_conn();
+        crate::db::set_executor_state(
+            &conn,
+            "close_all_confirm:123",
+            &serde_json::json!({
+                "status": "pending",
+                "requested_by": "123",
+                "code_hash": sha256_hex("abc123"),
+                "expires_ms": 70_000,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        conn.execute("drop table events", []).unwrap();
+
+        let response = operator_response(
+            &conn,
+            "/confirm abc123",
+            "123",
+            &["123".to_string()],
+            20_000,
+        )
+        .unwrap()
+        .unwrap();
+        let command_count: i64 = conn
+            .query_row("select count(*) from control_commands", [], |r| r.get(0))
+            .unwrap();
+
+        assert!(response.contains("failed"));
+        assert!(!response.contains("queued"));
+        assert_eq!(command_count, 0);
     }
 
     #[test]

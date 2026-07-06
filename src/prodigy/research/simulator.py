@@ -16,6 +16,8 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
+from prodigy.research.signals import score_confirms_side
+
 BARS_PER_HOUR = 4  # 15m bars
 
 
@@ -88,6 +90,18 @@ def _signal_lookup(signals: pd.DataFrame) -> dict[tuple, pd.DataFrame]:
     return lookup
 
 
+def _raw_score_lookup(signals: pd.DataFrame) -> dict[tuple, float]:
+    scores = signals.attrs.get("raw_scores")
+    if not isinstance(scores, pd.DataFrame) or scores.empty:
+        return {}
+    if not {"timestamp", "symbol", "score"}.issubset(scores.columns):
+        return {}
+    return {
+        (row["timestamp"], row["symbol"]): float(row["score"])
+        for _, row in scores.iterrows()
+    }
+
+
 def _net_fee(params: BacktestParams) -> float:
     # ponytail: taker-only fills; net fee = raw * (1 - rebate_fraction).
     return params.taker_rate * (1.0 - params.rebate_fraction)
@@ -112,6 +126,8 @@ def simulate_lots(
 
     atr_series = _atr(prices, params.atr_window)
     sig_by_bar = _signal_lookup(signals)
+    raw_score_by_bar = _raw_score_lookup(signals)
+    review_threshold = float(signals.attrs.get("open_threshold", 0.6))
     has_funding = (
         funding is not None and not funding.empty and "funding_rate" in funding.columns
     )
@@ -166,6 +182,8 @@ def simulate_lots(
                 funding_df,
                 net_fee,
                 sig_by_bar,
+                raw_score_by_bar,
+                review_threshold,
                 key,
                 max_holding_bars,
             )
@@ -332,6 +350,8 @@ def _evaluate_exits(
     funding_df: pd.DataFrame,
     net_fee: float,
     sig_by_bar: dict,
+    raw_score_by_bar: dict[tuple, float],
+    review_threshold: float,
     key: tuple,
     max_holding_bars: int,
 ) -> dict | None:
@@ -375,17 +395,21 @@ def _evaluate_exits(
     # same-direction score is present at this bar; otherwise close.
     held_bars = i - lot["open_bar"]
     if held_bars >= max_holding_bars:
-        frame = sig_by_bar.get(key)
-        confirming = False
-        if frame is not None and not frame.empty:
-            for _, signal in frame.iterrows():
-                if signal["action"] == "open":
-                    score = float(signal["score"])
-                    if (lot["side"] == "long" and score >= 0.6) or (
-                        lot["side"] == "short" and score <= -0.6
-                    ):
-                        confirming = True
-                        break
+        raw_score = raw_score_by_bar.get(key)
+        confirming = (
+            score_confirms_side(raw_score, lot["side"], review_threshold)
+            if raw_score is not None
+            else False
+        )
+        if raw_score is None:
+            frame = sig_by_bar.get(key)
+            if frame is not None and not frame.empty:
+                for _, signal in frame.iterrows():
+                    if signal["action"] == "open":
+                        score = float(signal["score"])
+                        if score_confirms_side(score, lot["side"], review_threshold):
+                            confirming = True
+                            break
         if confirming:
             lot["extended"] = True
             # ponytail: extend the review deadline by extension_hours (1h = 4 bars

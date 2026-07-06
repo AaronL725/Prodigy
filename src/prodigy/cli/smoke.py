@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import signal
 import subprocess
 import sys
 import time
+import urllib.parse
+import urllib.request
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Callable
@@ -16,6 +19,7 @@ from prodigy.smoke.report import write_smoke_report
 
 
 POLL_SECONDS = 30
+TELEGRAM_TIMEOUT_SECONDS = 5
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -225,9 +229,72 @@ def _started_status(proc: subprocess.Popen) -> str:
 
 
 def _telegram_checks() -> dict[str, str]:
-    configured = bool(os.getenv("TELEGRAM_BOT_TOKEN") and os.getenv("TELEGRAM_ALLOWED_USER_IDS"))
-    status = "configured" if configured else "skipped not configured"
-    return {"queries": status, "controls": status}
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    allowed = os.getenv("TELEGRAM_ALLOWED_USER_IDS", "")
+    if not token or not allowed:
+        status = "skipped missing telegram credentials"
+        return {"queries": status, "controls": status}
+
+    chat_id = os.getenv("TELEGRAM_SMOKE_CHAT_ID") or os.getenv("TELEGRAM_CHAT_ID")
+    return {
+        "queries": _telegram_get_me(token),
+        "controls": (
+            _telegram_send_message(token, chat_id)
+            if chat_id
+            else "skipped missing telegram chat"
+        ),
+    }
+
+
+def _telegram_get_me(token: str) -> str:
+    try:
+        payload = _telegram_api(token, "getMe")
+        if not payload.get("ok"):
+            return f"fail getMe error={_telegram_payload_error(payload, token)}"
+        username = payload.get("result", {}).get("username", "unknown")
+        return f"pass getMe username={_summary(username, token)}"
+    except Exception as exc:
+        return f"fail getMe error={_summary(exc, token)}"
+
+
+def _telegram_send_message(token: str, chat_id: str) -> str:
+    try:
+        payload = _telegram_api(
+            token,
+            "sendMessage",
+            {"chat_id": chat_id, "text": "M6 smoke check"},
+        )
+        if not payload.get("ok"):
+            return f"fail sendMessage error={_telegram_payload_error(payload, token)}"
+        message_id = payload.get("result", {}).get("message_id", "unknown")
+        return f"pass sendMessage message_id={_summary(message_id, token)}"
+    except Exception as exc:
+        return f"fail sendMessage error={_summary(exc, token)}"
+
+
+def _telegram_api(
+    token: str,
+    method: str,
+    data: dict[str, str] | None = None,
+) -> dict[str, object]:
+    body = urllib.parse.urlencode(data).encode() if data else None
+    request = urllib.request.Request(
+        f"https://api.telegram.org/bot{token}/{method}",
+        data=body,
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=TELEGRAM_TIMEOUT_SECONDS) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def _telegram_payload_error(payload: dict[str, object], token: str) -> str:
+    error = payload.get("description") or payload.get("error_code") or "telegram api error"
+    return _summary(error, token)
+
+
+def _summary(value: object, token: str) -> str:
+    text = str(value).replace(token, "<redacted>").replace("\n", " ")
+    return text[:160]
 
 
 def _record_observations(

@@ -79,6 +79,51 @@ def _upsert_checkpoint(conn, task_name: str, value: str) -> None:
     )
 
 
+def _insert_event(conn, severity: str, message: str, payload: dict) -> None:
+    conn.execute(
+        """
+        insert into events (event_id, created_at, severity, component, message, payload_json)
+        values (?, datetime('now'), ?, ?, ?, ?)
+        """,
+        (
+            str(uuid.uuid4()),
+            severity,
+            "data.backfill",
+            message,
+            json.dumps(payload, sort_keys=True),
+        ),
+    )
+
+
+def _record_failure_event(
+    db_path: str | Path,
+    symbol: str,
+    start: str,
+    end: str,
+    timeframe: str,
+    exc: Exception,
+) -> None:
+    try:
+        with connect(db_path) as conn:
+            init_db(conn)
+            _insert_event(
+                conn,
+                "error",
+                "backfill failed",
+                {
+                    "symbol": symbol,
+                    "start": start,
+                    "end": end,
+                    "timeframe": timeframe,
+                    "error": str(exc),
+                    "error_type": type(exc).__name__,
+                },
+            )
+            conn.commit()
+    except Exception as event_exc:
+        exc.add_note(f"failed to record backfill failure event: {event_exc}")
+
+
 def _quality_issues(quality: dict, prefix: str) -> list[str]:
     return [
         f"{prefix}.{field}"
@@ -105,29 +150,38 @@ def run_backfill(
     funding_client: object | None = None,
     now: object | None = None,
 ) -> BackfillResult:
-    # ponytail: build real Bitget/CCXT clients only when not injected so tests
-    # never touch the network or import ccxt. No factory, just a branch.
-    if exchange is None:
-        exchange = _build_ccxt_bitget(proxy_url)
-    if funding_client is None:
-        funding_client = BitgetRestClient(proxy_url=proxy_url)
-
     effective_end_ts = _utc_timestamp(end) if end is not None else _latest_closed_bar_end(timeframe, now)
     effective_end = end if end is not None else effective_end_ts.isoformat()
 
-    # ponytail: forward-paginate OHLCV by since_ms from start to end. Bitget
-    # returns only the most recent page per call, so a single fetch would miss
-    # historical data — page until we reach end_ms.
     start_ts = _utc_timestamp(start)
     start_ms = int(start_ts.value // 1_000_000)
     end_ms = int(effective_end_ts.value // 1_000_000)
     bar_ms = _timeframe_ms(timeframe)
+
+    # ponytail: build real Bitget/CCXT clients only when not injected so tests
+    # never touch the network or import ccxt. No factory, just a branch.
+    if exchange is None:
+        try:
+            exchange = _build_ccxt_bitget(proxy_url)
+        except Exception as exc:
+            _record_failure_event(db_path, symbol, start, effective_end, timeframe, exc)
+            raise
+    if funding_client is None:
+        funding_client = BitgetRestClient(proxy_url=proxy_url)
+
+    # ponytail: forward-paginate OHLCV by since_ms from start to end. Bitget
+    # returns only the most recent page per call, so a single fetch would miss
+    # historical data — page until we reach end_ms.
     pages = []
     cursor = start_ms
     while cursor < end_ms:
-        page = fetch_ohlcv_frame(
-            exchange, symbol, timeframe, since_ms=cursor, limit=PAGE_LIMIT
-        )
+        try:
+            page = fetch_ohlcv_frame(
+                exchange, symbol, timeframe, since_ms=cursor, limit=PAGE_LIMIT
+            )
+        except Exception as exc:
+            _record_failure_event(db_path, symbol, start, effective_end, timeframe, exc)
+            raise
         if page.empty:
             break
         pages.append(page)
@@ -152,24 +206,32 @@ def run_backfill(
         ohlcv = ohlcv.drop_duplicates(subset=["timestamp", "symbol"]).reset_index(drop=True)
     if not ohlcv.empty:
         for day, day_frame in ohlcv.groupby(ohlcv["timestamp"].dt.floor("D")):
-            write_daily_partition(
-                day_frame,
-                data_root=data_root,
-                exchange=EXCHANGE_NAME,
-                symbol=symbol,
-                dataset="ohlcv",
-                date=day,
-                timeframe=timeframe,
-            )
+            try:
+                write_daily_partition(
+                    day_frame,
+                    data_root=data_root,
+                    exchange=EXCHANGE_NAME,
+                    symbol=symbol,
+                    dataset="ohlcv",
+                    date=day,
+                    timeframe=timeframe,
+                )
+            except Exception as exc:
+                _record_failure_event(db_path, symbol, start, effective_end, timeframe, exc)
+                raise
 
     funding_pages = []
     for page_no in range(1, MAX_FUNDING_PAGES + 1):
-        page = funding_client.fetch_funding_rate_page(
-            symbol=symbol,
-            product_type=PRODUCT_TYPE,
-            page_no=page_no,
-            page_size=FUNDING_PAGE_SIZE,
-        )
+        try:
+            page = funding_client.fetch_funding_rate_page(
+                symbol=symbol,
+                product_type=PRODUCT_TYPE,
+                page_no=page_no,
+                page_size=FUNDING_PAGE_SIZE,
+            )
+        except Exception as exc:
+            _record_failure_event(db_path, symbol, start, effective_end, timeframe, exc)
+            raise
         if page.empty:
             break
         funding_pages.append(page)
@@ -184,16 +246,26 @@ def run_backfill(
         ].reset_index(drop=True)
     if not funding.empty:
         for day, day_frame in funding.groupby(funding["timestamp"].dt.floor("D")):
-            write_daily_partition(
-                day_frame,
-                data_root=data_root,
-                exchange=EXCHANGE_NAME,
-                symbol=symbol,
-                dataset="funding_rates",
-                date=day,
-            )
+            try:
+                write_daily_partition(
+                    day_frame,
+                    data_root=data_root,
+                    exchange=EXCHANGE_NAME,
+                    symbol=symbol,
+                    dataset="funding_rates",
+                    date=day,
+                )
+            except Exception as exc:
+                _record_failure_event(db_path, symbol, start, effective_end, timeframe, exc)
+                raise
 
-    ohlcv_quality = quality_summary(ohlcv_quality_frame, "ohlcv", timeframe)
+    ohlcv_quality = quality_summary(
+        ohlcv_quality_frame,
+        "ohlcv",
+        timeframe,
+        start=start_ts,
+        end=effective_end_ts,
+    )
     funding_quality = quality_summary(funding, "funding_rates")
     issues = _quality_issues(ohlcv_quality, "ohlcv") + _quality_issues(
         funding_quality, "funding"
@@ -213,44 +285,30 @@ def run_backfill(
 
     with connect(db_path) as conn:
         init_db(conn)
-        _upsert_checkpoint(conn, task_name, effective_end)
-        conn.execute(
-            """
-            insert into events (event_id, created_at, severity, component, message, payload_json)
-            values (?, datetime('now'), ?, ?, ?, ?)
-            """,
-            (
-                str(uuid.uuid4()),
-                "info",
-                "data.backfill",
-                f"backfill {symbol} {start} to {effective_end}",
-                json.dumps(summary, sort_keys=True),
-            ),
+        if not issues:
+            _upsert_checkpoint(conn, task_name, effective_end)
+        _insert_event(
+            conn,
+            "info",
+            f"backfill {symbol} {start} to {effective_end}",
+            summary,
         )
         if issues:
-            conn.execute(
-                """
-                insert into events (event_id, created_at, severity, component, message, payload_json)
-                values (?, datetime('now'), ?, ?, ?, ?)
-                """,
-                (
-                    str(uuid.uuid4()),
-                    "warning",
-                    "data.backfill",
-                    "data quality warning",
-                    json.dumps(
-                        {
-                            "symbol": symbol,
-                            "start": start,
-                            "end": effective_end,
-                            "timeframe": timeframe,
-                            "issues": issues,
-                            "ohlcv_quality": ohlcv_quality,
-                            "funding_quality": funding_quality,
-                        },
-                        sort_keys=True,
-                    ),
-                ),
+            quality_payload = {
+                "symbol": symbol,
+                "start": start,
+                "end": effective_end,
+                "timeframe": timeframe,
+                "issues": issues,
+                "ohlcv_quality": ohlcv_quality,
+                "funding_quality": funding_quality,
+            }
+            _insert_event(conn, "warning", "data quality warning", quality_payload)
+            _insert_event(
+                conn,
+                "warning",
+                "checkpoint not advanced",
+                quality_payload | {"task_name": task_name},
             )
         conn.commit()
 

@@ -696,6 +696,44 @@ pub fn public_books5_subscribe_message(cfg: &ExecutorConfig) -> serde_json::Valu
     })
 }
 
+pub fn public_ws_message_confirms_subscription(text: &str, cfg: &ExecutorConfig) -> Result<bool> {
+    if text == "pong" {
+        return Ok(false);
+    }
+    let value: Value = serde_json::from_str(text)?;
+    if let Some(event) = value.get("event").and_then(Value::as_str) {
+        if event == "error" {
+            bail!(
+                "public websocket subscription failed: code {}: {}",
+                ws_code(&value),
+                value.get("msg").and_then(Value::as_str).unwrap_or("")
+            );
+        }
+        if event == "subscribe" {
+            let code = ws_code(&value);
+            if !code.is_empty() && code != "0" {
+                bail!(
+                    "public websocket subscription failed: code {}: {}",
+                    code,
+                    value.get("msg").and_then(Value::as_str).unwrap_or("")
+                );
+            }
+            let channel = value
+                .pointer("/arg/channel")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let inst_id = value
+                .pointer("/arg/instId")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            return Ok(matches!(channel, "books5" | "books1") && inst_id == cfg.bitget_symbol);
+        }
+        return Ok(false);
+    }
+    Ok(parse_public_ws_message(text)?
+        .is_some_and(|m| m.symbol == cfg.bitget_symbol && m.best_bid > 0.0 && m.best_ask > 0.0))
+}
+
 pub async fn verify_public_ws_connects(cfg: &ExecutorConfig) -> Result<()> {
     cfg.validate_demo_only()?;
     let (mut socket, _) = tokio_tungstenite::connect_async(&cfg.public_ws_url).await?;
@@ -706,14 +744,20 @@ pub async fn verify_public_ws_connects(cfg: &ExecutorConfig) -> Result<()> {
             msg.to_string(),
         ))
         .await?;
-    let msg = tokio::time::timeout(std::time::Duration::from_secs(10), socket.next())
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("public websocket closed"))??;
-    let text = msg.into_text()?;
-    if text.contains("\"event\":\"error\"") {
-        bail!("public websocket subscription failed: {text}");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let msg = tokio::time::timeout(remaining, socket.next())
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("public websocket closed before subscribe ack"))??;
+        let Ok(text) = msg.into_text() else {
+            continue;
+        };
+        if public_ws_message_confirms_subscription(&text, cfg)? {
+            return Ok(());
+        }
     }
-    Ok(())
+    bail!("public websocket subscribe ack timed out")
 }
 
 pub async fn verify_private_ws_connects(cfg: &ExecutorConfig) -> Result<()> {
@@ -812,6 +856,33 @@ mod tests {
         assert_eq!(update.symbol, "ETHUSDT");
         assert_eq!(update.best_bid, 3000.1);
         assert_eq!(update.best_ask, 3000.2);
+    }
+
+    #[test]
+    fn public_ws_verify_requires_subscribe_ack_or_valid_market() {
+        let cfg = ExecutorConfig::demo_for_tests();
+        assert!(!public_ws_message_confirms_subscription("pong", &cfg).unwrap());
+        assert!(public_ws_message_confirms_subscription(
+            r#"{"event":"subscribe","arg":{"channel":"books5","instId":"ETHUSDT"}}"#,
+            &cfg,
+        )
+        .unwrap());
+        assert!(public_ws_message_confirms_subscription(
+            r#"{
+              "action":"snapshot",
+              "arg":{"instType":"USDT-FUTURES","channel":"books5","instId":"ETHUSDT"},
+              "data":[{"bids":[["3000.1","2"]],"asks":[["3000.2","3"]]}],
+              "ts":1760461517285
+            }"#,
+            &cfg,
+        )
+        .unwrap());
+        let err = public_ws_message_confirms_subscription(
+            r#"{"event":"error","code":"30001","msg":"bad subscribe"}"#,
+            &cfg,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("bad subscribe"));
     }
 
     #[test]

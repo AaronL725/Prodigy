@@ -419,6 +419,10 @@ pub async fn run_public_ws_loop(
         if *shutdown.borrow() {
             return Ok(());
         }
+        {
+            let mut cache = market_cache.lock().await;
+            cache.invalidate();
+        }
         match tokio_tungstenite::connect_async(&cfg.public_ws_url).await {
             Ok((mut socket, _)) => {
                 // ponytail: a failed subscribe send is recoverable — log and
@@ -436,9 +440,52 @@ pub async fn run_public_ws_loop(
                     tokio::time::sleep(Duration::from_secs(1)).await;
                     continue;
                 }
-                // (Re)connect succeeded and we're subscribed: request a REST
-                // reconcile on the next main-loop tick (spec: reconcile after
-                // WS reconnect) so any books5 / cache gap is repaired promptly.
+                let subscribe_deadline = std::time::Instant::now() + Duration::from_secs(10);
+                let mut confirmed = false;
+                while std::time::Instant::now() < subscribe_deadline {
+                    let msg = tokio::select! {
+                        _ = shutdown.changed() => {
+                            if *shutdown.borrow() {
+                                return Ok(());
+                            }
+                            continue;
+                        }
+                        msg = socket.next() => match msg {
+                            Some(Ok(m)) => m,
+                            Some(Err(_)) | None => break,
+                        },
+                    };
+                    let Ok(text) = msg.into_text() else {
+                        continue;
+                    };
+                    match crate::bitget::public_ws_message_confirms_subscription(&text, &cfg) {
+                        Ok(true) => {
+                            if let Ok(Some(update)) = crate::bitget::parse_public_ws_message(&text)
+                            {
+                                let now_ms = crate::bitget::now_ms().parse::<i64>().unwrap_or(0);
+                                let mut cache = market_cache.lock().await;
+                                apply_public_market_update(&mut cache, update, now_ms);
+                            }
+                            confirmed = true;
+                            break;
+                        }
+                        Ok(false) => {}
+                        Err(err) => {
+                            eprintln!("public ws subscribe failed: {err}; reconnecting");
+                            break;
+                        }
+                    }
+                }
+                if !confirmed {
+                    let mut cache = market_cache.lock().await;
+                    cache.invalidate();
+                    eprintln!("public ws subscribe ack timed out; reconnecting");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    continue;
+                }
+                // (Re)connect succeeded and subscription was ACKED (or first
+                // valid books update arrived): request a REST reconcile on the
+                // next main-loop tick (spec: reconcile after WS reconnect).
                 reconcile_signal.request();
                 'inner: loop {
                     tokio::select! {
@@ -465,9 +512,15 @@ pub async fn run_public_ws_loop(
                         }
                     }
                 }
+                {
+                    let mut cache = market_cache.lock().await;
+                    cache.invalidate();
+                }
                 eprintln!("public ws socket closed; reconnecting");
             }
             Err(err) => {
+                let mut cache = market_cache.lock().await;
+                cache.invalidate();
                 eprintln!("public ws disconnected: {err}");
             }
         }
