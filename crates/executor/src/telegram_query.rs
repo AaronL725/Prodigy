@@ -111,7 +111,8 @@ pub fn bot_commands_payload() -> serde_json::Value {
             { "command": "stop", "description": "Stop new opening exposure" },
             { "command": "resume", "description": "Resume new opening exposure" },
             { "command": "cancel_all", "description": "Cancel system working orders" },
-            { "command": "close_all", "description": "Confirm and close system positions" }
+            { "command": "close_all", "description": "Confirm and close system positions" },
+            { "command": "confirm", "description": "Confirm pending close-all fallback" }
         ]
     })
 }
@@ -1112,6 +1113,7 @@ mod tests {
             "resume",
             "cancel_all",
             "close_all",
+            "confirm",
         ] {
             assert!(
                 text.contains(&format!("\"command\":\"{command}\"")),
