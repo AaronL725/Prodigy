@@ -288,7 +288,7 @@ fn paginated_card(
     html_card_with_keyboard(
         title,
         vec![lines.join("\n\n")],
-        Some(format!("Page {}", clamp_page(page))),
+        None,
         Some(paginated_keyboard(section, page, has_next)),
     )
 }
@@ -2017,7 +2017,9 @@ mod tests {
             assert_eq!(reply.text.matches(marker).count(), 8, "{callback}");
             assert!(reply.text.contains(visible), "{callback}");
             assert!(!reply.text.contains(hidden), "{callback}");
+            assert!(!reply.text.contains("— Page 5"), "{callback}");
             assert!(markup.contains(&callback.replace(":5", ":4")), "{callback}");
+            assert!(markup.contains("Page 5"), "{callback}");
             assert!(
                 !markup.contains(&callback.replace(":5", ":6")),
                 "{callback}"
