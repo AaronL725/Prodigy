@@ -5,8 +5,8 @@
 M7 is **Live-Ready Safety Gates + Final Pre-Live Readiness**.
 
 M7 prepares the system for a future live integration milestone. It does not
-enable live trading, does not connect to live Bitget APIs, and does not add any
-new production trading capability.
+enable live trading, does not use live credentials or live-mode runtime paths,
+and does not add any new production trading capability.
 
 M8 is the first milestone that may perform live integration or a small-capital
 production launch. If that scope is too large, M9 can hold the final live
@@ -44,7 +44,10 @@ M7 keeps the existing hard boundary:
 
 - `prodigy-executor --mode live` fails before execution.
 - The executor does not read live credentials.
-- The executor does not connect to live Bitget REST or WebSocket endpoints.
+- The executor does not start live-mode REST or WebSocket clients.
+- WebSocket configuration remains demo-only in production paths. REST checks
+  must not treat Bitget's shared REST host as live by itself; live-readiness
+  tests should focus on mode, credentials, and execution-path enablement.
 - Telegram commands cannot enable live mode.
 - Python signal code cannot request live execution.
 
@@ -68,8 +71,9 @@ Test coverage should include:
   regress;
 - `/close_all` remains confirmed and system-position-only;
 - `/cancel_all` remains system-working-order-only;
-- no remote open, remote parameter edit, remote model debug, remote shell, or
-  live enablement strings appear in production code paths;
+- no dangerous live-enablement pattern appears in production code paths. The
+  scope scan must not ban every `live` string, because safe rejection code such
+  as `TradingMode::Live` and `live_mode_is_rejected` is expected;
 - M6 smoke/operator tests continue to pass.
 
 ## Readiness Checklist
