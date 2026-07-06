@@ -555,14 +555,8 @@ mod tests {
         let help = operator_response(&conn, "/help", "123", &["123".to_string()], 1_000)
             .unwrap()
             .unwrap();
-        let response = operator_response(
-            &conn,
-            "/smoke_report",
-            "123",
-            &["123".to_string()],
-            1_000,
-        )
-        .unwrap();
+        let response =
+            operator_response(&conn, "/smoke_report", "123", &["123".to_string()], 1_000).unwrap();
 
         assert!(!help.contains("/smoke_report"));
         assert!(response.is_none());
