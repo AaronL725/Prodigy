@@ -150,6 +150,16 @@ pub fn operator_response(
     allowed_user_ids: &[String],
     now_ms: i64,
 ) -> Result<Option<String>> {
+    Ok(operator_reply(conn, text, from_user_id, allowed_user_ids, now_ms)?.map(|reply| reply.text))
+}
+
+pub fn operator_reply(
+    conn: &Connection,
+    text: &str,
+    from_user_id: &str,
+    allowed_user_ids: &[String],
+    now_ms: i64,
+) -> Result<Option<TelegramReply>> {
     let command = text.split_whitespace().next().unwrap_or("");
     if command.is_empty() {
         return Ok(None);
@@ -167,26 +177,66 @@ pub fn operator_response(
             .to_string(),
         )
         .ok();
-        return Ok(Some("unauthorized".to_string()));
+        return Ok(Some(TelegramReply::plain("unauthorized".to_string())));
     }
     match command {
-        "/help" => Ok(Some(help_reply().text)),
-        "/status" => Ok(Some(status_reply(conn)?.text)),
-        "/positions" => Ok(Some(positions_reply(conn)?.text)),
-        "/orders" => Ok(Some(orders_reply(conn)?.text)),
-        "/trades" => Ok(Some(trades_reply(conn)?.text)),
-        "/pnl" => Ok(Some(pnl_reply(conn)?.text)),
-        "/risk" => Ok(Some(risk_reply(conn)?.text)),
-        "/events" => Ok(Some(events_reply(conn)?.text)),
-        "/smoke_status" => Ok(Some(smoke_status_reply(conn)?.text)),
+        "/help" => Ok(Some(help_reply())),
+        "/status" | "/positions" | "/orders" | "/trades" | "/pnl" | "/risk" | "/events"
+        | "/smoke_status" => query_reply(conn, command),
         "/stop" | "/resume" | "/cancel_all" | "/close_all" | "/confirm" => {
-            match control_response(conn, text, from_user_id, now_ms) {
-                Ok(reply) => Ok(reply),
-                Err(err) => Ok(Some(control_failure_response(err))),
-            }
+            control_reply_or_failure(conn, text, from_user_id, now_ms)
         }
         _ => Ok(None),
     }
+}
+
+pub fn operator_callback_reply(
+    conn: &Connection,
+    callback_data: &str,
+    from_user_id: &str,
+    allowed_user_ids: &[String],
+    now_ms: i64,
+) -> Result<Option<TelegramReply>> {
+    if !allowed_user_ids.iter().any(|id| id == from_user_id) {
+        crate::db::write_event(
+            conn,
+            "warning",
+            "telegram",
+            "unauthorized telegram callback",
+            &serde_json::json!({
+                "from_user_id": from_user_id,
+                "callback_data": callback_data,
+            })
+            .to_string(),
+        )
+        .ok();
+        return Ok(Some(TelegramReply::plain("unauthorized".to_string())));
+    }
+
+    match callback_data {
+        "tgux:status" => query_reply(conn, "/status"),
+        "tgux:pnl" => query_reply(conn, "/pnl"),
+        "tgux:risk" => query_reply(conn, "/risk"),
+        "tgux:positions" => query_reply(conn, "/positions"),
+        "tgux:orders" => query_reply(conn, "/orders"),
+        "tgux:trades" => query_reply(conn, "/trades"),
+        "tgux:events" => query_reply(conn, "/events"),
+        "tgux:smoke" => query_reply(conn, "/smoke_status"),
+        "tgux:help" => Ok(Some(help_reply())),
+        "tgux:control" => Ok(Some(control_panel_reply())),
+        "tgux:stop" => control_reply_or_failure(conn, "/stop", from_user_id, now_ms),
+        "tgux:resume" => control_reply_or_failure(conn, "/resume", from_user_id, now_ms),
+        "tgux:cancel_all" => control_reply_or_failure(conn, "/cancel_all", from_user_id, now_ms),
+        "tgux:close_all" => control_reply_or_failure(conn, "/close_all", from_user_id, now_ms),
+        _ => Ok(Some(TelegramReply::plain("unsupported button".to_string()))),
+    }
+}
+
+fn control_panel_reply() -> TelegramReply {
+    TelegramReply::html(
+        "◆ <b>CONTROL</b>\n\n<b>STOP</b> — block new opening exposure\n<b>RESUME</b> — clear operator stop\n<b>CANCEL ALL</b> — system working orders only\n<b>CLOSE ALL</b> — system positions only".to_string(),
+        Some(control_keyboard()),
+    )
 }
 
 fn help_reply() -> TelegramReply {
@@ -651,6 +701,18 @@ fn control_failure_response(err: anyhow::Error) -> String {
     format!("telegram command failed: {err}")
 }
 
+fn control_reply_or_failure(
+    conn: &Connection,
+    text: &str,
+    from_user_id: &str,
+    now_ms: i64,
+) -> Result<Option<TelegramReply>> {
+    match control_reply(conn, text, from_user_id, now_ms) {
+        Ok(reply) => Ok(reply),
+        Err(err) => Ok(Some(TelegramReply::plain(control_failure_response(err)))),
+    }
+}
+
 fn confirm_close_all(
     conn: &Connection,
     text: &str,
@@ -757,32 +819,43 @@ fn confirm_close_all(
     Ok(format!("close_all queued command_id={command_id}"))
 }
 
-fn control_response(
+fn control_reply(
     conn: &Connection,
     text: &str,
     from_user_id: &str,
     now_ms: i64,
-) -> Result<Option<String>> {
+) -> Result<Option<TelegramReply>> {
     let command = text.split_whitespace().next().unwrap_or("");
     match command {
-        "/stop" => Ok(Some(format!(
-            "stop queued command_id={}",
-            queue_control_command(conn, "stop", from_user_id)?
+        "/stop" => Ok(Some(TelegramReply::html(
+            format!(
+                "stop queued command_id={}",
+                queue_control_command(conn, "stop", from_user_id)?
+            ),
+            Some(control_keyboard()),
         ))),
-        "/resume" => Ok(Some(format!(
-            "resume queued command_id={}",
-            queue_control_command(conn, "resume", from_user_id)?
+        "/resume" => Ok(Some(TelegramReply::html(
+            format!(
+                "resume queued command_id={}",
+                queue_control_command(conn, "resume", from_user_id)?
+            ),
+            Some(control_keyboard()),
         ))),
-        "/cancel_all" => Ok(Some(format!(
-            "cancel_all queued command_id={}",
-            queue_control_command(conn, "cancel_all", from_user_id)?
+        "/cancel_all" => Ok(Some(TelegramReply::html(
+            format!(
+                "cancel_all queued command_id={}",
+                queue_control_command(conn, "cancel_all", from_user_id)?
+            ),
+            Some(control_keyboard()),
         ))),
-        "/close_all" => Ok(Some(start_close_all_confirmation(
-            conn,
-            from_user_id,
-            now_ms,
-        )?)),
-        "/confirm" => Ok(Some(confirm_close_all(conn, text, from_user_id, now_ms)?)),
+        "/close_all" => Ok(Some(TelegramReply::html(
+            start_close_all_confirmation(conn, from_user_id, now_ms)?,
+            Some(close_all_confirm_keyboard()),
+        ))),
+        "/confirm" => Ok(Some(TelegramReply::html(
+            confirm_close_all(conn, text, from_user_id, now_ms)?,
+            Some(control_keyboard()),
+        ))),
         _ => Ok(None),
     }
 }
@@ -858,6 +931,149 @@ mod tests {
         assert!(reply.text.contains("<b>DEMO</b>"));
         assert!(reply.text.contains("<b>DAEMON</b>"));
         assert!(reply.reply_markup.is_some());
+    }
+
+    #[test]
+    fn read_only_callbacks_return_same_dashboard_replies() {
+        let conn = test_conn();
+        crate::db::write_event(&conn, "info", "daemon", "daemon started", "{}").unwrap();
+
+        let callback =
+            operator_callback_reply(&conn, "tgux:status", "123", &["123".to_string()], 1_000)
+                .unwrap()
+                .unwrap();
+        let slash = operator_reply(&conn, "/status", "123", &["123".to_string()], 1_000)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(callback.text, slash.text);
+        assert_eq!(callback.parse_mode, Some("HTML"));
+        assert!(callback.reply_markup.is_some());
+    }
+
+    #[test]
+    fn unauthorized_callback_gets_no_sqlite_state_and_no_control() {
+        let conn = test_conn();
+        let response =
+            operator_callback_reply(&conn, "tgux:status", "999", &["123".to_string()], 1_000)
+                .unwrap()
+                .unwrap();
+
+        let command_count: i64 = conn
+            .query_row("select count(*) from control_commands", [], |r| r.get(0))
+            .unwrap();
+
+        assert!(response.text.contains("unauthorized"));
+        assert_eq!(command_count, 0);
+    }
+
+    #[test]
+    fn unknown_callback_does_not_queue_any_command() {
+        let conn = test_conn();
+        let response =
+            operator_callback_reply(&conn, "tgux:open", "123", &["123".to_string()], 1_000)
+                .unwrap()
+                .unwrap();
+
+        let command_count: i64 = conn
+            .query_row("select count(*) from control_commands", [], |r| r.get(0))
+            .unwrap();
+
+        assert!(response.text.contains("unsupported"));
+        assert_eq!(command_count, 0);
+    }
+
+    #[test]
+    fn callback_control_write_failure_reuses_slash_failure_semantics() {
+        let conn = test_conn();
+        conn.execute("drop table control_commands", []).unwrap();
+
+        let response =
+            operator_callback_reply(&conn, "tgux:stop", "123", &["123".to_string()], 1_000)
+                .unwrap()
+                .unwrap();
+
+        assert!(response.text.contains("failed"));
+        assert!(!response.text.contains("queued"));
+    }
+
+    #[test]
+    fn callback_mutating_controls_queue_same_direct_commands() {
+        for (callback_data, command) in [
+            ("tgux:stop", "stop"),
+            ("tgux:resume", "resume"),
+            ("tgux:cancel_all", "cancel_all"),
+        ] {
+            let conn = test_conn();
+
+            let response =
+                operator_callback_reply(&conn, callback_data, "123", &["123".to_string()], 1_000)
+                    .unwrap()
+                    .unwrap();
+            let row = conn
+                .query_row(
+                    "select command, status, requested_by from control_commands",
+                    [],
+                    |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                        ))
+                    },
+                )
+                .unwrap();
+
+            assert!(response.text.contains("queued"));
+            assert_eq!(
+                row,
+                (
+                    command.to_string(),
+                    "pending".to_string(),
+                    "123".to_string()
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn callback_close_all_creates_pending_confirmation_without_queueing_command() {
+        let conn = test_conn();
+
+        let response =
+            operator_callback_reply(&conn, "tgux:close_all", "123", &["123".to_string()], 10_000)
+                .unwrap()
+                .unwrap();
+        let command_count: i64 = conn
+            .query_row("select count(*) from control_commands", [], |r| r.get(0))
+            .unwrap();
+        let raw_state = crate::db::get_executor_state(&conn, "close_all_confirm:123")
+            .unwrap()
+            .unwrap();
+        let state: serde_json::Value = serde_json::from_str(&raw_state).unwrap();
+
+        assert!(response.text.contains("/confirm"));
+        assert_eq!(command_count, 0);
+        assert_eq!(state["requested_by"], "123");
+        assert_eq!(state["expires_ms"], 70_000);
+    }
+
+    #[test]
+    fn task3_confirm_and_cancel_close_all_callbacks_are_unsupported_without_queueing() {
+        for callback_data in ["tgux:confirm_close_all", "tgux:cancel_close_all"] {
+            let conn = test_conn();
+
+            let response =
+                operator_callback_reply(&conn, callback_data, "123", &["123".to_string()], 1_000)
+                    .unwrap()
+                    .unwrap();
+            let command_count: i64 = conn
+                .query_row("select count(*) from control_commands", [], |r| r.get(0))
+                .unwrap();
+
+            assert!(response.text.contains("unsupported"));
+            assert_eq!(command_count, 0);
+        }
     }
 
     #[test]
