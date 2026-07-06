@@ -7,43 +7,7 @@ from prodigy.db import connect, init_db
 from prodigy.signals.daemon import RunOnceConfig, run_once
 from prodigy.signals.intents import TradeIntent, write_trade_intent
 
-
-def _demo_depth_diagnostic():
-    """Fetch the DEMO merge-depth (paptrading:1) and print best bid/ask + spread.
-
-    The demo ETHUSDT book is frequently phantom-liquid (best ask/bid far apart,
-    beyond the exchange price-limit band); a wide spread explains why a market
-    buy is accepted then cancelled with no fill. Printed only as a diagnostic so
-    a non-fill run isn't a mystery. Best-effort: never fails the test on its own.
-    """
-    try:
-        out = subprocess.run(
-            [
-                "curl",
-                "-s",
-                "-H",
-                "paptrading: 1",
-                "https://api.bitget.com/api/v2/mix/market/merge-depth"
-                "?productType=usdt-futures&symbol=ETHUSDT&limit=5&precision=scale0",
-            ],
-            check=False,
-            text=True,
-            capture_output=True,
-            timeout=10,
-        ).stdout
-        import json
-
-        data = json.loads(out).get("data", {})
-        asks = data.get("asks") or [[]]
-        bids = data.get("bids") or [[]]
-        ba, sa = (asks[0][0] if asks[0] else "?"), (bids[0][0] if bids[0] else "?")
-        print(f"demo merge-depth: best_ask={ba} best_bid={sa}")
-    except Exception as exc:  # noqa: BLE001 - diagnostic only
-        print(f"demo merge-depth diagnostic skipped: {exc}")
-
-
 def test_rust_demo_executor_processes_pending_intent(tmp_path):
-    _demo_depth_diagnostic()
     db_path = tmp_path / "prodigy.sqlite"
 
     with connect(db_path) as conn:
@@ -106,12 +70,11 @@ def test_rust_demo_executor_processes_pending_intent(tmp_path):
         event_count = conn.execute("select count(*) from events").fetchone()[0]
 
     assert "processed intent-1" in result.stdout
-    # The intent must reach a terminal state. When the DEMO book is phantom-
-    # liquid (see the demo merge-depth diagnostic above — best ask/bid far apart,
-    # beyond the exchange price-limit band) a buy cannot genuinely fill and the
-    # executor must FAIL the intent with a clear diagnostic rather than falsely
-    # mark it executed. When the book is tradable, status is 'executed'. Either
-    # terminal state is honest; 'pending'/'accepted' (stuck) is not.
+    # The intent must reach a terminal state. When the DEMO book is phantom-liquid,
+    # a buy cannot genuinely fill and the executor must FAIL the intent with a
+    # clear diagnostic rather than falsely mark it executed. When the book is
+    # tradable, status is 'executed'. Either terminal state is honest;
+    # 'pending'/'accepted' (stuck) is not.
     assert intent["status"] in ("executed", "failed"), (
         f"expected a terminal state (executed|failed), got {intent['status']}"
     )
@@ -132,7 +95,6 @@ def test_rust_demo_executor_processes_pending_intent(tmp_path):
 
 
 def test_rust_demo_daemon_processes_pending_intent_once(tmp_path):
-    _demo_depth_diagnostic()
     db_path = tmp_path / "prodigy.sqlite"
 
     with connect(db_path) as conn:
@@ -202,7 +164,7 @@ def test_rust_demo_daemon_processes_pending_intent_once(tmp_path):
         ).fetchone()[0]
 
     # Honest terminal state: executed when the demo book is tradable, failed
-    # with a diagnostic when it is phantom-liquid (see _demo_depth_diagnostic).
+    # with a diagnostic when it is phantom-liquid.
     # The bounded daemon runtime must actually start, run until the bound, and
     # exit after writing its daemon events; it must not leave the intent accepted
     # or pending as a weakened "runtime only" smoke.

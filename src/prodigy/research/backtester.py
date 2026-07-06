@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
 
 import numpy as np
 import pandas as pd
@@ -12,9 +11,6 @@ from prodigy.research.evaluator import (
     rank_ic_by_timestamp,
 )
 from prodigy.research.simulator import BacktestParams, simulate_lots
-
-if TYPE_CHECKING:
-    from matplotlib.figure import Figure
 
 
 @dataclass

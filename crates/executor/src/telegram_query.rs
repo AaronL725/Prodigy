@@ -164,18 +164,6 @@ fn row(label: &str, value: impl ToString) -> String {
     )
 }
 
-fn muted(label: &str, value: impl ToString) -> String {
-    row(label, value)
-}
-
-fn item_header(label: &str, value: impl ToString) -> String {
-    format!(
-        "<b>{}</b> — {}",
-        html_escape(&title_label(label)),
-        html_escape(&value.to_string())
-    )
-}
-
 fn metric_row(label: &str, value: impl ToString) -> String {
     format!(
         "{} — <b>{}</b>",
@@ -422,11 +410,11 @@ fn help_reply() -> TelegramReply {
     html_card(
         "HELP",
         vec![
-            muted(
+            row(
                 "READ",
                 "/help /status /positions /orders /trades /pnl /risk /events /smoke_status",
             ),
-            muted("CONTROL", "/stop /resume /cancel_all /close_all"),
+            row("CONTROL", "/stop /resume /cancel_all /close_all"),
         ],
         None,
     )
@@ -577,7 +565,7 @@ fn positions_reply(conn: &Connection) -> Result<TelegramReply> {
         let ownership = r.get::<_, String>(5)?;
         Ok(format!(
             "{}\n{}\n{}\n{}\n{}",
-            item_header("POSITION", format!("{symbol} {side}")),
+            row("POSITION", format!("{symbol} {side}")),
             metric_row("NOTIONAL", notional),
             metric_row("ENTRY", entry),
             pnl_metric_row("UPNL", upnl),
@@ -618,7 +606,7 @@ fn orders_reply(conn: &Connection, page: usize) -> Result<TelegramReply> {
         |r| {
             Ok(format!(
                 "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
-                item_header("ORDER", r.get::<_, String>(0)?),
+                row("ORDER", r.get::<_, String>(0)?),
                 plain_row("SYMBOL", r.get::<_, String>(1)?),
                 plain_row("SIDE", r.get::<_, String>(2)?),
                 plain_row("ACTION", r.get::<_, String>(3)?),
@@ -646,7 +634,7 @@ fn trades_reply(conn: &Connection, page: usize) -> Result<TelegramReply> {
             let side = r.get::<_, String>(1)?;
             Ok(format!(
                 "{}\n{}\n{}\n{}\n{}",
-                item_header("TRADE", format!("{symbol} {side}")),
+                row("TRADE", format!("{symbol} {side}")),
                 metric_row("PRICE", r.get::<_, f64>(2)?),
                 metric_row("POSITION", r.get::<_, f64>(3)?),
                 metric_row("FEE", r.get::<_, f64>(4)?),

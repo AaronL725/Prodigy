@@ -164,7 +164,7 @@ def test_trade_intents_are_unique_by_id(tmp_path):
             ),
         )
 
-        try:
+        with pytest.raises(sqlite3.IntegrityError):
             conn.execute(
                 """
                 insert into trade_intents (
@@ -184,12 +184,6 @@ def test_trade_intents_are_unique_by_id(tmp_path):
                     "test",
                 ),
             )
-        except sqlite3.IntegrityError:
-            duplicate_rejected = True
-        else:
-            duplicate_rejected = False
-
-    assert duplicate_rejected is True
 
 
 def test_execution_schema_adds_order_and_position_context(tmp_path):

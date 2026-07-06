@@ -165,8 +165,8 @@ def simulate_lots(
 
         # 2. Evaluate open lots for exits (stop-loss / trailing / 24h holding).
         still_open: list[dict] = []
+        atr = float(atr_series.iloc[i])
         for lot in open_lots:
-            atr = float(atr_series.iloc[i])
             exited = _evaluate_exits(
                 lot,
                 prices,
@@ -208,7 +208,6 @@ def simulate_lots(
             realized_pnl += lot["pnl"]
             unrealized_at_end += lot["pnl"]
             trades.append(_trade_row(lot))
-        open_lots = []
         # Rewrite the final equity row with the marked-to-market equity.
         equity_rows[-1]["equity"] = params.initial_equity + realized_pnl
 
@@ -322,10 +321,7 @@ def _funding_pnl(
         & (funding["timestamp"] >= entry_ts)
         & (funding["timestamp"] <= exit_ts)
     )
-    subset = funding.loc[mask]
-    if subset.empty:
-        return 0.0
-    return float(subset["funding_rate"].sum())
+    return float(funding.loc[mask, "funding_rate"].sum())
 
 
 def _swing(prices: pd.DataFrame, i: int, lookback: int) -> tuple[float, float]:

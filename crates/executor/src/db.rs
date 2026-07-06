@@ -150,12 +150,12 @@ pub fn upsert_order(conn: &Connection, order: &OrderRecord) -> Result<()> {
 /// loop uses this to refresh ONLY orders we placed locally — it never inserts a
 /// row the executor didn't write (REST reconcile owns order discovery).
 pub fn order_exists(conn: &Connection, client_oid: &str) -> Result<bool> {
-    let n: i64 = conn.query_row(
-        "select count(*) from orders where client_oid = ?",
+    conn.query_row(
+        "select exists(select 1 from orders where client_oid = ?)",
         params![client_oid],
         |r| r.get(0),
-    )?;
-    Ok(n > 0)
+    )
+    .map_err(Into::into)
 }
 
 /// Refresh an ALREADY-LOCAL order's live fields from a private-WS update WITHOUT
@@ -350,21 +350,14 @@ pub fn local_order_client_oids(conn: &Connection) -> Result<std::collections::Ha
 /// historical fills for a position the client already closed outside the executor,
 /// so they no longer contribute to current system exposure.
 pub fn system_net_base_for_symbol(conn: &Connection, symbol: &str) -> Result<(f64, &'static str)> {
-    let mut stmt = conn.prepare(
-        "select side, filled_size from orders
+    let net: f64 = conn.query_row(
+        "select coalesce(sum(case when side = 'sell' then -filled_size else filled_size end), 0.0)
+         from orders
          where symbol = ? and filled_size > 0 and intent_id is not null
            and status != 'externally_closed'",
+        params![symbol],
+        |r| r.get(0),
     )?;
-    let rows = stmt.query_map(params![symbol], |row| {
-        let side: String = row.get(0)?;
-        let filled: f64 = row.get(1)?;
-        Ok((side, filled))
-    })?;
-    let mut net = 0.0;
-    for row in rows {
-        let (side, filled) = row?;
-        net += if side == "sell" { -filled } else { filled };
-    }
     let side = if net > 0.0 {
         "long"
     } else if net < 0.0 {
@@ -624,12 +617,13 @@ pub fn set_executor_state(conn: &Connection, key: &str, value: &str) -> Result<(
 }
 
 pub fn get_executor_state(conn: &Connection, key: &str) -> Result<Option<String>> {
-    let mut stmt = conn.prepare("select value from executor_state where key = ?")?;
-    let mut rows = stmt.query(params![key])?;
-    Ok(match rows.next()? {
-        Some(row) => Some(row.get(0)?),
-        None => None,
-    })
+    conn.query_row(
+        "select value from executor_state where key = ?",
+        params![key],
+        |r| r.get(0),
+    )
+    .optional()
+    .map_err(Into::into)
 }
 
 #[cfg(test)]

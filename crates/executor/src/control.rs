@@ -474,14 +474,14 @@ fn ensure_close_all_finished(
         ));
     }
 
-    let positions: Vec<_> = crate::db::system_positions(conn)?
+    let positions = crate::db::system_positions(conn)?
         .into_iter()
         .filter(|position| position.symbol == cfg.bitget_symbol)
-        .collect();
-    if !positions.is_empty() {
+        .count();
+    if positions > 0 {
         return Err(anyhow::anyhow!(
             "close_all left {} system positions",
-            positions.len()
+            positions
         ));
     }
     Ok(())

@@ -79,7 +79,8 @@ class SignalDecision:
 def latest_closed_bar(frame: pd.DataFrame, now: pd.Timestamp, timeframe: str) -> pd.Series:
     if frame.empty:
         raise ValueError("no OHLCV rows available")
-    now = pd.Timestamp(now).tz_convert("UTC") if pd.Timestamp(now).tzinfo else pd.Timestamp(now, tz="UTC")
+    now = pd.Timestamp(now)
+    now = now.tz_localize("UTC") if now.tzinfo is None else now.tz_convert("UTC")
     alias = _floor_alias(timeframe)
     cutoff = now.floor(alias) - pd.Timedelta(timeframe)
     closed = frame[pd.to_datetime(frame["timestamp"], utc=True) <= cutoff]
@@ -453,7 +454,8 @@ def load_example_score(
     the expected closed bar for `now`, so a stale parquet can't drive an intent
     for a fresher bar.
     """
-    now = pd.Timestamp(now).tz_convert("UTC") if pd.Timestamp(now).tzinfo else pd.Timestamp(now, tz="UTC")
+    now = pd.Timestamp(now)
+    now = now.tz_localize("UTC") if now.tzinfo is None else now.tz_convert("UTC")
     start = now - pd.Timedelta(days=7)
     end = now + pd.Timedelta(days=1)
     ohlcv = load_ohlcv(data_root, research_symbol, start, end, timeframe)

@@ -1,5 +1,5 @@
 from prodigy.db import connect, init_db
-from prodigy.signals.intents import TradeIntent, write_trade_intent
+from prodigy.signals.intents import TradeIntent, insert_trade_intent, write_trade_intent
 
 
 def test_write_trade_intent_persists_pending_row(tmp_path):
@@ -29,9 +29,6 @@ def test_write_trade_intent_persists_pending_row(tmp_path):
         "status": "pending",
         "symbol": "ETH/USDT:USDT",
     }
-
-
-from prodigy.signals.intents import insert_trade_intent
 
 
 def test_insert_trade_intent_does_not_commit(tmp_path):

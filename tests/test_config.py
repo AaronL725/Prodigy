@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from prodigy.config import load_config
 
 
@@ -17,11 +19,5 @@ def test_config_rejects_missing_top_level_section(tmp_path):
     path = tmp_path / "bad.toml"
     path.write_text("[trading]\nleverage = 5\n")
 
-    try:
+    with pytest.raises(ValueError, match="missing config section: risk"):
         load_config(path)
-    except ValueError as exc:
-        message = str(exc)
-    else:
-        message = ""
-
-    assert "missing config section: risk" in message
