@@ -284,19 +284,18 @@ def test_signal_run_once_writes_intent_for_executor(tmp_path):
     }
 
 
-def test_m6_scope_scan_has_no_remote_open_or_live_enablement():
+def test_m7_live_readiness_scope_scan_targets_dangerous_patterns_only():
     repo_root = Path(__file__).resolve().parents[1]
+    dangerous_patterns = (
+        "remote_open|open_from_telegram|"
+        "TELEGRAM_LIVE|BITGET_LIVE|ENABLE_LIVE_TRADING|LIVE_TRADING_ENABLED|"
+        "allow_live_trading|live_trading_enabled|live_order_execution_enabled|"
+        "TELEGRAM_PARAM|remote_param|set_param_from_telegram|"
+        "remote_shell|shell_from_telegram|"
+        "model_debug_from_telegram|remote_model_debug"
+    )
     dangerous = subprocess.run(
-        [
-            "rg",
-            "-n",
-            (
-                "remote_open|open_from_telegram|TELEGRAM_LIVE|BITGET_LIVE|"
-                "TELEGRAM_PARAM|remote_shell|shell_from_telegram|model_debug_from_telegram"
-            ),
-            "src",
-            "crates",
-        ],
+        ["rg", "-n", dangerous_patterns, "src", "crates"],
         check=False,
         text=True,
         capture_output=True,
@@ -306,6 +305,10 @@ def test_m6_scope_scan_has_no_remote_open_or_live_enablement():
 
     config_rs = (repo_root / "crates/executor/src/config.rs").read_text()
     production_config, test_config = config_rs.split("#[cfg(test)]", 1)
+
+    # M7 deliberately allows safe live-rejection code; do not ban every "live"
+    # string. The dangerous scan above is targeted at enablement patterns.
+    assert "TradingMode::Live" in config_rs
     assert "ws.bitget.com" not in production_config
     assert "wss://ws.bitget.com/v2/ws/public" in test_config
     assert "wss://ws.bitget.com/v2/ws/private" in test_config
