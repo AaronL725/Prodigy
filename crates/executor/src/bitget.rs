@@ -7,7 +7,7 @@ use serde::Serialize;
 use serde_json::Value;
 use sha2::Sha256;
 use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::config::ExecutorConfig;
 use crate::types::{
@@ -89,7 +89,9 @@ impl BitgetRestClient {
         cfg.validate_demo_only()?;
         Ok(Self {
             cfg,
-            client: reqwest::Client::builder().build()?,
+            client: reqwest::Client::builder()
+                .timeout(bitget_rest_timeout())
+                .build()?,
         })
     }
 
@@ -299,6 +301,10 @@ impl BitgetRestClient {
     }
 }
 
+fn bitget_rest_timeout() -> Duration {
+    Duration::from_secs(15)
+}
+
 /// Read a depth level field that Bitget serializes as either a JSON number
 /// (merge-depth: `1977.31`) or a string (ticker/order-detail: `"1977.31"`).
 fn num_or_str_f64(v: &Value) -> Option<f64> {
@@ -446,6 +452,22 @@ pub fn parse_private_ws_message(text: &str, cfg: &ExecutorConfig) -> Result<Priv
                 update.auth_error = Some(format!(
                     "login code {}: {}",
                     ws_code(&value),
+                    value.get("msg").and_then(Value::as_str).unwrap_or("")
+                ));
+            }
+            return Ok(update);
+        }
+        if event == "subscribe" {
+            let code = ws_code(&value);
+            if code.is_empty() || code == "0" {
+                update.subscribe_ack_channel = value
+                    .pointer("/arg/channel")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+            } else {
+                update.auth_error = Some(format!(
+                    "subscribe code {}: {}",
+                    code,
                     value.get("msg").and_then(Value::as_str).unwrap_or("")
                 ));
             }
@@ -639,6 +661,28 @@ pub fn private_subscribe_message(cfg: &ExecutorConfig) -> serde_json::Value {
     })
 }
 
+#[derive(Debug, Default)]
+pub struct PrivateSubscribeAcks {
+    orders: bool,
+    positions: bool,
+    account: bool,
+}
+
+impl PrivateSubscribeAcks {
+    pub fn record(&mut self, update: &PrivateWsUpdate) {
+        match update.subscribe_ack_channel.as_deref() {
+            Some("orders") => self.orders = true,
+            Some("positions") => self.positions = true,
+            Some("account") => self.account = true,
+            _ => {}
+        }
+    }
+
+    pub fn ready(&self) -> bool {
+        self.orders && self.positions && self.account
+    }
+}
+
 /// Public books5 subscribe payload for the configured symbol. Pure so the one-shot
 /// verify and the long-running WS loop build the identical subscription.
 pub fn public_books5_subscribe_message(cfg: &ExecutorConfig) -> serde_json::Value {
@@ -676,13 +720,10 @@ pub async fn verify_private_ws_connects(cfg: &ExecutorConfig) -> Result<()> {
     cfg.validate_demo_only()?;
     let (mut socket, _) = tokio_tungstenite::connect_async(&cfg.private_ws_url).await?;
     use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
     let timestamp = now_seconds();
     let login = private_login_message(cfg, &timestamp);
-    socket
-        .send(tokio_tungstenite::tungstenite::Message::Text(
-            login.to_string(),
-        ))
-        .await?;
+    socket.send(Message::Text(login.to_string())).await?;
     let msg = tokio::time::timeout(std::time::Duration::from_secs(10), socket.next())
         .await?
         .ok_or_else(|| anyhow::anyhow!("private websocket closed"))??;
@@ -699,7 +740,29 @@ pub async fn verify_private_ws_connects(cfg: &ExecutorConfig) -> Result<()> {
     if !update.login_ack {
         bail!("private websocket login not acked: {text}");
     }
-    Ok(())
+    socket
+        .send(Message::Text(private_subscribe_message(cfg).to_string()))
+        .await?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut acks = PrivateSubscribeAcks::default();
+    while std::time::Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let msg = tokio::time::timeout(remaining, socket.next())
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("private websocket closed before subscribe ack"))??;
+        let Ok(text) = msg.into_text() else {
+            continue;
+        };
+        let update = parse_private_ws_message(&text, cfg)?;
+        if let Some(detail) = update.auth_error {
+            bail!("private websocket subscribe failed: {detail}");
+        }
+        acks.record(&update);
+        if acks.ready() {
+            return Ok(());
+        }
+    }
+    bail!("private websocket subscribe ack timed out")
 }
 
 #[cfg(test)]
@@ -791,6 +854,77 @@ mod tests {
         assert!(text.contains("\"channel\":\"positions\""));
         assert!(text.contains("\"channel\":\"account\""));
         assert!(text.contains("\"instType\":\"USDT-FUTURES\""));
+    }
+
+    #[test]
+    fn parses_private_subscribe_ack_channel() {
+        let cfg = ExecutorConfig::demo_for_tests();
+        let update = parse_private_ws_message(
+            r#"{"event":"subscribe","code":0,"arg":{"channel":"orders"}}"#,
+            &cfg,
+        )
+        .unwrap();
+
+        assert_eq!(update.subscribe_ack_channel.as_deref(), Some("orders"));
+        assert!(update.auth_error.is_none());
+    }
+
+    #[test]
+    fn parses_private_subscribe_ack_without_code_as_success() {
+        let cfg = ExecutorConfig::demo_for_tests();
+        let update = parse_private_ws_message(
+            r#"{"event":"subscribe","arg":{"channel":"positions"}}"#,
+            &cfg,
+        )
+        .unwrap();
+
+        assert_eq!(update.subscribe_ack_channel.as_deref(), Some("positions"));
+        assert!(update.auth_error.is_none());
+    }
+
+    #[test]
+    fn private_subscribe_ack_tracker_requires_all_channels() {
+        let mut acks = PrivateSubscribeAcks::default();
+        for channel in ["orders", "positions"] {
+            let update = PrivateWsUpdate {
+                subscribe_ack_channel: Some(channel.to_string()),
+                ..PrivateWsUpdate::default()
+            };
+            acks.record(&update);
+        }
+        assert!(!acks.ready(), "two private channel acks are not enough");
+
+        let update = PrivateWsUpdate {
+            subscribe_ack_channel: Some("account".to_string()),
+            ..PrivateWsUpdate::default()
+        };
+        acks.record(&update);
+
+        assert!(acks.ready());
+    }
+
+    #[test]
+    fn private_verify_sends_subscribe_and_requires_ack() {
+        let source = include_str!("bitget.rs");
+        let start = source
+            .find("pub async fn verify_private_ws_connects")
+            .expect("verify_private_ws_connects exists");
+        let tail = &source[start..];
+        let end = tail
+            .find("#[cfg(test)]")
+            .expect("test module follows verify");
+        let body = &tail[..end];
+
+        assert!(body.contains("private_subscribe_message"));
+        assert!(body.contains("PrivateSubscribeAcks"));
+        assert!(body.contains(".ready()"));
+    }
+
+    #[test]
+    fn bitget_rest_client_has_timeout() {
+        let source = include_str!("bitget.rs");
+
+        assert!(source.contains(".timeout(bitget_rest_timeout())"));
     }
 
     #[test]

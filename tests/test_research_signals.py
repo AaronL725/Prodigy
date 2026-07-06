@@ -14,7 +14,7 @@ def score_frame(values):
 
 
 def test_open_size_maps_from_five_to_ten_percent():
-    params = SignalParams(total_notional_cap=10_000.0)
+    params = SignalParams(total_notional_cap=10_000.0, add_cooldown_bars=1)
     signals = score_to_lot_signals(score_frame([0.6, 1.0]), params)
 
     opens = signals[signals["action"] == "open"]
@@ -25,6 +25,7 @@ def test_open_size_fractions_are_configurable():
     # The 5%..10% mapping is configurable on SignalParams, not hardcoded.
     params = SignalParams(
         total_notional_cap=10_000.0,
+        add_cooldown_bars=1,
         min_size_fraction=0.02,
         max_size_fraction=0.20,
     )
@@ -41,6 +42,14 @@ def test_add_cooldown_blocks_dense_same_direction_opens():
 
     opens = signals[signals["action"] == "open"]
     assert opens["timestamp"].dt.strftime("%H:%M").tolist() == ["00:00", "01:00"]
+
+
+def test_add_cooldown_blocks_stronger_same_direction_open_inside_window():
+    params = SignalParams(total_notional_cap=10_000.0, add_cooldown_bars=4)
+    signals = score_to_lot_signals(score_frame([0.8, 0.9]), params)
+
+    opens = signals[signals["action"] == "open"]
+    assert opens["timestamp"].dt.strftime("%H:%M").tolist() == ["00:00"]
 
 
 def test_opposite_score_closes_lots():

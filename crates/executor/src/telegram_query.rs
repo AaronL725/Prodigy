@@ -8,7 +8,7 @@
 //! command, so the polling loop simply doesn't reply to noise.
 
 use anyhow::Result;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 
 /// Map a single command line to its read-only reply, or `None` if it isn't a
@@ -76,15 +76,127 @@ fn help_response() -> String {
 }
 
 fn status_response(conn: &Connection) -> Result<String> {
-    let events: i64 = conn.query_row("select count(*) from events", [], |r| r.get(0))?;
     let pending: i64 = conn.query_row(
         "select count(*) from trade_intents where status = 'pending'",
         [],
         |r| r.get(0),
     )?;
+    let pending_controls: i64 = conn.query_row(
+        "select count(*) from control_commands where status = 'pending'",
+        [],
+        |r| r.get(0),
+    )?;
+    let manual_overrides = active_manual_override_count(conn)?;
     Ok(format!(
-        "status: daemon\npending_intents: {pending}\nevents: {events}"
+        "status:\ndaemon={}\nsignal={}\nreconcile={}\noperator_stop={}\nmanual_overrides={manual_overrides}\npending_intents={pending}\npending_controls={pending_controls}\nlatest_error={}",
+        latest_daemon_status(conn)?,
+        latest_signal_status(conn)?,
+        latest_reconcile_status(conn)?,
+        operator_stop_state(conn)?,
+        latest_critical_error(conn)?,
     ))
+}
+
+fn operator_stop_state(conn: &Connection) -> Result<String> {
+    Ok(
+        match crate::db::get_executor_state(conn, crate::control::OPERATOR_STOP_KEY)?.as_deref() {
+            Some("active") => "active",
+            _ => "cleared",
+        }
+        .to_string(),
+    )
+}
+
+fn active_manual_override_count(conn: &Connection) -> Result<i64> {
+    conn.query_row(
+        "select count(*) from executor_state
+         where key like 'manual_override:%' and value = 'active'",
+        [],
+        |r| r.get(0),
+    )
+    .map_err(Into::into)
+}
+
+fn latest_daemon_status(conn: &Connection) -> Result<String> {
+    let row: Option<(String, String)> = conn
+        .query_row(
+            "select message, created_at
+             from events
+             where component = 'daemon'
+             order by created_at desc, event_id desc
+             limit 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    Ok(row
+        .map(|(message, created_at)| format!("{message} at {created_at}"))
+        .unwrap_or_else(|| "n/a".to_string()))
+}
+
+fn latest_signal_status(conn: &Connection) -> Result<String> {
+    let row: Option<(String, String)> = conn
+        .query_row(
+            "select value, updated_at
+             from executor_state
+             where key like 'signal_processed:%'
+                or key in ('signal:status', 'signal:last_run', 'smoke:status')
+             order by updated_at desc, key desc
+             limit 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    if let Some((value, updated_at)) = row {
+        return Ok(format!("{value} at {updated_at}"));
+    }
+    let row: Option<(String, String)> = conn
+        .query_row(
+            "select message, created_at
+             from events
+             where component = 'signal'
+             order by created_at desc, event_id desc
+             limit 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    Ok(row
+        .map(|(message, created_at)| format!("{message} at {created_at}"))
+        .unwrap_or_else(|| "n/a".to_string()))
+}
+
+fn latest_reconcile_status(conn: &Connection) -> Result<String> {
+    conn.query_row(
+        "select created_at
+         from events
+         where message = 'reconciliation completed'
+         order by created_at desc, event_id desc
+         limit 1",
+        [],
+        |r| r.get(0),
+    )
+    .optional()?
+    .map_or_else(|| Ok("n/a".to_string()), Ok)
+}
+
+fn latest_critical_error(conn: &Connection) -> Result<String> {
+    let row: Option<(String, String, String, String)> = conn
+        .query_row(
+            "select severity, component, message, created_at
+             from events
+             where severity in ('critical', 'error')
+             order by created_at desc, event_id desc
+             limit 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()?;
+    Ok(row
+        .map(|(severity, component, message, created_at)| {
+            format!("{severity} {component}: {message} at {created_at}")
+        })
+        .unwrap_or_else(|| "n/a".to_string()))
 }
 
 fn positions_response(conn: &Connection) -> Result<String> {
@@ -181,22 +293,62 @@ fn pnl_response(conn: &Connection) -> Result<String> {
 }
 
 fn risk_response(conn: &Connection) -> Result<String> {
-    let manual_overrides: i64 = conn.query_row(
-        "select count(*) from executor_state
-         where key like 'manual_override:%' and value = 'active'",
-        [],
-        |r| r.get(0),
-    )?;
-    let available_margin: Option<f64> = conn
+    let manual_overrides = active_manual_override_count(conn)?;
+    let operator_stop = operator_stop_state(conn)?;
+    let equity: Option<(f64, f64, f64)> = conn
         .query_row(
-            "select available_margin from equity_snapshots order by created_at desc limit 1",
+            "select equity, available_margin, unrealized_pnl
+             from equity_snapshots
+             order by created_at desc
+             limit 1",
             [],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
-        .ok();
+        .optional()?;
+    let (equity_text, available_text, margin_state, trading_suspension) = match equity {
+        Some((equity, available_margin, unrealized_pnl)) => {
+            let params = crate::risk::RiskParams::default();
+            let margin_state = if equity <= 0.0
+                || available_margin < equity * params.min_available_margin_fraction
+            {
+                "low"
+            } else {
+                "ok"
+            };
+            let trading_suspension = if equity > 0.0
+                && unrealized_pnl <= -equity * params.trading_suspension_unrealized_loss_x_equity
+            {
+                "active"
+            } else {
+                "inactive"
+            };
+            (
+                equity.to_string(),
+                available_margin.to_string(),
+                margin_state.to_string(),
+                trading_suspension.to_string(),
+            )
+        }
+        None => (
+            "n/a".to_string(),
+            "n/a".to_string(),
+            "n/a".to_string(),
+            "n/a".to_string(),
+        ),
+    };
+    let risk_state = if operator_stop == "active"
+        || manual_overrides > 0
+        || margin_state == "low"
+        || trading_suspension == "active"
+    {
+        "blocked"
+    } else if margin_state == "n/a" {
+        "unknown"
+    } else {
+        "ok"
+    };
     Ok(format!(
-        "risk:\nmanual_overrides={manual_overrides}\navailable_margin={}",
-        available_margin.unwrap_or(0.0)
+        "risk:\nrisk_state={risk_state}\nequity={equity_text}\navailable_margin={available_text}\nmargin_state={margin_state}\nmanual_overrides={manual_overrides}\noperator_stop={operator_stop}\ntrading_suspension={trading_suspension}"
     ))
 }
 
@@ -467,6 +619,59 @@ mod tests {
 
         assert!(response.contains("status"));
         assert!(response.contains("daemon"));
+    }
+
+    #[test]
+    fn status_query_reports_operator_stop_pending_controls_latest_error_and_freshness() {
+        let conn = test_conn();
+        conn.execute(
+            "insert into events (
+              event_id, created_at, severity, component, message, payload_json
+            ) values
+            ('e-daemon', '2026-07-06T00:00:00Z', 'info', 'daemon', 'daemon started', '{}'),
+            ('e-reconcile', '2026-07-06T00:01:00Z', 'info', 'executor', 'reconciliation completed', '{}'),
+            ('e-error', '2026-07-06T00:03:00Z', 'critical', 'executor', 'risk gate failed', '{}')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "insert into executor_state (key, value, updated_at)
+             values
+             ('operator_stop:global', 'active', '2026-07-06T00:00:30Z'),
+             ('manual_override:ETHUSDT', 'active', '2026-07-06T00:00:40Z'),
+             ('signal_processed:example-factors:ETHUSDT:15m:2026-07-06T00:00:00Z', 'no_signal', '2026-07-06T00:02:00Z')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "insert into trade_intents (
+              intent_id, created_at, symbol, side, action, target_notional,
+              max_order_notional, status, source
+            ) values ('i-pending', '2026-07-06T00:02:30Z', 'ETHUSDT', 'long', 'open', 100, 100, 'pending', 'test')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "insert into control_commands (
+              command_id, created_at, command, status, requested_by
+            ) values
+            ('cmd-stop', '2026-07-06T00:02:31Z', 'stop', 'pending', '123'),
+            ('cmd-cancel', '2026-07-06T00:02:32Z', 'cancel_all', 'pending', '123')",
+            [],
+        )
+        .unwrap();
+
+        let response = query_response(&conn, "/status").unwrap().unwrap();
+
+        assert!(response.contains("daemon=daemon started at 2026-07-06T00:00:00Z"));
+        assert!(response.contains("signal=no_signal at 2026-07-06T00:02:00Z"));
+        assert!(response.contains("reconcile=2026-07-06T00:01:00Z"));
+        assert!(response.contains("operator_stop=active"));
+        assert!(response.contains("manual_overrides=1"));
+        assert!(response.contains("pending_intents=1"));
+        assert!(response.contains("pending_controls=2"));
+        assert!(response
+            .contains("latest_error=critical executor: risk gate failed at 2026-07-06T00:03:00Z"));
     }
 
     #[test]
@@ -840,5 +1045,37 @@ mod tests {
 
         assert!(response.contains("manual_overrides=1"));
         assert!(response.contains("available_margin=500"));
+    }
+
+    #[test]
+    fn risk_query_reports_margin_manual_override_and_suspension() {
+        let conn = test_conn();
+        conn.execute(
+            "insert into equity_snapshots (
+              snapshot_id, created_at, equity, available_margin, unrealized_pnl,
+              realized_pnl_24h
+            ) values ('snap-1', '2026-07-06T00:00:00Z', 1000, 25, -125, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "insert into executor_state (key, value, updated_at)
+             values
+             ('operator_stop:global', 'active', '2026-07-06T00:00:01Z'),
+             ('manual_override:ETHUSDT', 'active', '2026-07-06T00:00:02Z'),
+             ('manual_override:BTCUSDT', 'active', '2026-07-06T00:00:03Z')",
+            [],
+        )
+        .unwrap();
+
+        let response = query_response(&conn, "/risk").unwrap().unwrap();
+
+        assert!(response.contains("risk_state=blocked"));
+        assert!(response.contains("equity=1000"));
+        assert!(response.contains("available_margin=25"));
+        assert!(response.contains("margin_state=low"));
+        assert!(response.contains("manual_overrides=2"));
+        assert!(response.contains("operator_stop=active"));
+        assert!(response.contains("trading_suspension=active"));
     }
 }

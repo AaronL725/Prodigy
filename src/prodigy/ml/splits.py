@@ -4,9 +4,6 @@ from dataclasses import dataclass
 
 import pandas as pd
 
-# ponytail: 15-min bars for this milestone; 1 day = 96 bars.
-_BARS_PER_DAY = 96
-
 
 @dataclass(frozen=True)
 class WalkForwardFold:
@@ -31,22 +28,29 @@ def purged_walk_forward_splits(
     final_holdout_days: int = 30,
     purge_gap_bars: int = 4,
 ) -> WalkForwardSplits:
-    ts = pd.DatetimeIndex(pd.Series(frame["timestamp"]).reset_index(drop=True))
+    ts = pd.DatetimeIndex(
+        pd.Series(frame["timestamp"]).sort_values().reset_index(drop=True)
+    )
     n = len(ts)
-    bars_per_day = _BARS_PER_DAY
 
     start_time = ts[0]
     end_time = ts[n - 1]
-    final_holdout_start = end_time - pd.Timedelta(days=final_holdout_days) + pd.Timedelta(minutes=15)
+    final_holdout_start = end_time - pd.Timedelta(days=final_holdout_days)
 
     folds: list[WalkForwardFold] = []
 
     # First validation window starts right after the minimum expanding-train span.
-    valid_offset_days = min_train_days
+    valid_start_boundary = start_time + pd.Timedelta(days=min_train_days)
     while True:
-        valid_start_idx = valid_offset_days * bars_per_day
-        valid_end_idx = valid_offset_days * bars_per_day + valid_days * bars_per_day - 1
-        if valid_end_idx >= n:
+        valid_start_idx = ts.searchsorted(valid_start_boundary, side="left")
+        valid_end_idx = ts.searchsorted(
+            valid_start_boundary + pd.Timedelta(days=valid_days), side="left"
+        ) - 1
+        if (
+            valid_start_idx >= n
+            or valid_end_idx >= n
+            or valid_end_idx < valid_start_idx
+        ):
             break
         valid_start_time = ts[valid_start_idx]
         valid_end_time = ts[valid_end_idx]
@@ -73,7 +77,7 @@ def purged_walk_forward_splits(
                 valid_end=valid_end_time,
             )
         )
-        valid_offset_days += step_days
+        valid_start_boundary += pd.Timedelta(days=step_days)
 
     return WalkForwardSplits(
         folds=folds,

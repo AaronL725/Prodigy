@@ -383,6 +383,7 @@ pub(crate) async fn fetch_account_snapshot(
         .and_then(serde_json::Value::as_str)
         .and_then(|v| v.parse::<f64>().ok())
         .unwrap_or(0.0);
+    let margin_danger = account_margin_danger(data);
 
     // Sum position notionals from all-position for gross_notional.
     let positions = rest
@@ -430,7 +431,18 @@ pub(crate) async fn fetch_account_snapshot(
         // when the ticker refresh itself fails, so this never hides a stale price.
         market_is_fresh: true,
         private_state_is_ready: private_state_ready,
+        margin_danger,
     })
+}
+
+pub(crate) fn account_margin_danger(data: &serde_json::Value) -> bool {
+    let parse = |key: &str| {
+        data.get(key)
+            .and_then(serde_json::Value::as_str)
+            .and_then(|v| v.parse::<f64>().ok())
+    };
+    parse("crossedRiskRate").is_some_and(|v| v >= 1.0)
+        || parse("available").is_some_and(|v| v < 0.0)
 }
 
 pub(crate) async fn fetch_market_snapshot(
@@ -942,6 +954,7 @@ async fn poll_order(
 #[allow(clippy::too_many_arguments)]
 fn upsert_order_row(
     conn: &Connection,
+    cfg: &ExecutorConfig,
     intent: &TradeIntent,
     order: &PlaceOrderRequest,
     response: &serde_json::Value,
@@ -961,7 +974,7 @@ fn upsert_order_row(
             exchange_order_id: Some(exchange_order_id.clone()),
             client_oid: order.client_oid.clone(),
             intent_id: Some(intent.intent_id.clone()),
-            symbol: intent.symbol.clone(),
+            symbol: cfg.bitget_symbol.clone(),
             side: order.side.clone(),
             action: intent.action.clone(),
             order_type: order.order_type.clone(),
@@ -975,6 +988,13 @@ fn upsert_order_row(
         },
     )?;
     Ok(exchange_order_id)
+}
+
+fn normalize_intent_symbol(mut intent: TradeIntent, cfg: &ExecutorConfig) -> TradeIntent {
+    if intent.symbol == cfg.symbol || intent.symbol == cfg.bitget_symbol {
+        intent.symbol = cfg.bitget_symbol.clone();
+    }
+    intent
 }
 
 /// Update just the status of the local orders row for a client_oid.
@@ -1062,6 +1082,7 @@ pub async fn process_one_intent(
     account: AccountRiskSnapshot,
     market_cache: &mut MarketCache,
 ) -> Result<()> {
+    let intent = normalize_intent_symbol(intent, cfg);
     if !db::accept_intent(conn, &intent.intent_id)? {
         return Ok(());
     }
@@ -1311,6 +1332,7 @@ pub async fn process_one_intent(
                         // Record the order row with the error so reconcile/audit see it.
                         let _ = upsert_order_row(
                             conn,
+                            cfg,
                             &intent,
                             &order,
                             &serde_json::Value::Null,
@@ -1328,6 +1350,7 @@ pub async fn process_one_intent(
                 };
                 upsert_order_row(
                     conn,
+                    cfg,
                     &intent,
                     &order,
                     &response,
@@ -1356,6 +1379,7 @@ pub async fn process_one_intent(
                             // the order's filled_size/status below.
                             upsert_order_row(
                                 conn,
+                                cfg,
                                 &intent,
                                 &order,
                                 &response,
@@ -1545,6 +1569,7 @@ pub async fn process_one_intent(
                     Err(e) => {
                         let _ = upsert_order_row(
                             conn,
+                            cfg,
                             &intent,
                             &order,
                             &serde_json::Value::Null,
@@ -1560,7 +1585,7 @@ pub async fn process_one_intent(
                         return Ok(());
                     }
                 };
-                upsert_order_row(conn, &intent, &order, &response, "submitted", 1, 0.0)?;
+                upsert_order_row(conn, cfg, &intent, &order, &response, "submitted", 1, 0.0)?;
                 let taker_size: f64 = order.size.parse().unwrap_or(0.0);
                 state.on_taker_sent();
 
@@ -1574,7 +1599,7 @@ pub async fn process_one_intent(
                             // fills come per-trade from fillList via reconcile; here
                             // we only persist the order's filled_size/status.
                             upsert_order_row(
-                                conn, &intent, &order, &response, "filled", 1, filled,
+                                conn, cfg, &intent, &order, &response, "filled", 1, filled,
                             )?;
                             state.on_order_filled();
                             break;
@@ -1751,6 +1776,104 @@ mod tests {
     }
 
     #[test]
+    fn order_rows_use_bitget_symbol_even_when_intent_uses_research_symbol() {
+        let conn = memory_db();
+        insert_pending_intent(&conn, "intent-1");
+        let cfg = ExecutorConfig::demo_for_tests();
+        let intent = TradeIntent {
+            intent_id: "intent-1".to_string(),
+            symbol: "ETH/USDT:USDT".to_string(),
+            side: "long".to_string(),
+            action: "open".to_string(),
+            target_notional: 300.0,
+            max_order_notional: 300.0,
+        };
+        let order = PlaceOrderRequest {
+            symbol: cfg.bitget_symbol.clone(),
+            product_type: cfg.product_type.clone(),
+            margin_mode: cfg.margin_mode.clone(),
+            margin_coin: cfg.margin_coin.clone(),
+            size: "0.1".to_string(),
+            price: Some("3000".to_string()),
+            side: "buy".to_string(),
+            order_type: "limit".to_string(),
+            force: Some("post_only".to_string()),
+            client_oid: "client-1".to_string(),
+            reduce_only: None,
+        };
+        let response = serde_json::json!({"data":{"orderId":"exchange-1"}});
+
+        upsert_order_row(&conn, &cfg, &intent, &order, &response, "submitted", 1, 0.0).unwrap();
+
+        let symbol: String = conn
+            .query_row(
+                "select symbol from orders where client_oid='client-1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(symbol, "ETHUSDT");
+    }
+
+    #[tokio::test]
+    async fn manual_override_gate_uses_bitget_symbol_for_research_symbol_intent() {
+        let conn = memory_db();
+        insert_pending_intent(&conn, "i-override");
+        db::set_executor_state(&conn, "manual_override:ETHUSDT", "active").unwrap();
+        let cfg = ExecutorConfig {
+            rest_base_url: "http://127.0.0.1:9".to_string(),
+            ..ExecutorConfig::demo_for_tests()
+        };
+        let rest = BitgetRestClient::new(cfg.clone()).unwrap();
+        let mut cache = MarketCache::default();
+
+        process_one_intent(
+            &conn,
+            &cfg,
+            &rest,
+            TradeIntent {
+                intent_id: "i-override".to_string(),
+                symbol: "ETH/USDT:USDT".to_string(),
+                side: "long".to_string(),
+                action: "open".to_string(),
+                target_notional: 100.0,
+                max_order_notional: 100.0,
+            },
+            MarketUpdate {
+                symbol: "ETHUSDT".to_string(),
+                best_bid: 3000.0,
+                best_ask: 3001.0,
+                exchange_ts_ms: 1,
+            },
+            AccountRiskSnapshot {
+                equity: 10_000.0,
+                available_margin: 10_000.0,
+                unrealized_pnl_24h: 0.0,
+                gross_notional: 0.0,
+                market_is_fresh: true,
+                private_state_is_ready: true,
+                margin_danger: false,
+            },
+            &mut cache,
+        )
+        .await
+        .unwrap();
+
+        let error: String = conn
+            .query_row(
+                "select error from trade_intents where intent_id='i-override'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(error, "manual override active for symbol");
+        let orders: i64 = conn
+            .query_row("select count(*) from orders", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(orders, 0);
+    }
+
+    #[test]
     fn remaining_base_deducts_cumulative_and_clamps() {
         // Nothing filled yet: remaining is the full target.
         assert!((remaining_base(0.10, 0.0) - 0.10).abs() < 1e-12);
@@ -1820,6 +1943,25 @@ mod tests {
         // FP-noisy); formatting it for a reduce-only close must yield "0.01", not
         // the raw repr the exchange rejects as below the minimum order quantity.
         assert_eq!(format_size(0.009999999999999995), "0.01");
+    }
+
+    #[test]
+    fn account_margin_danger_parses_crossed_risk_rate_and_negative_available() {
+        assert!(account_margin_danger(&serde_json::json!({
+            "crossedRiskRate": "1.0",
+            "available": "10",
+            "accountEquity": "100"
+        })));
+        assert!(account_margin_danger(&serde_json::json!({
+            "crossedRiskRate": "0.1",
+            "available": "-0.01",
+            "accountEquity": "100"
+        })));
+        assert!(!account_margin_danger(&serde_json::json!({
+            "crossedRiskRate": "0.1",
+            "available": "10",
+            "accountEquity": "100"
+        })));
     }
 
     #[test]
@@ -1920,6 +2062,7 @@ mod tests {
                 gross_notional: 0.0,
                 market_is_fresh: true,
                 private_state_is_ready: true,
+                margin_danger: false,
             },
             &mut cache,
         )

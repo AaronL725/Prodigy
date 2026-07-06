@@ -1,4 +1,7 @@
+import threading
+
 import pandas as pd
+import pytest
 import sqlite3
 
 from prodigy.signals.daemon import (
@@ -900,6 +903,128 @@ def test_run_once_sees_reconcile_written_manual_override_under_ethusdt(tmp_path)
     )
 
     assert result == "skipped_manual_override"
+    with connect(db_path) as conn:
+        assert conn.execute("select count(*) from trade_intents").fetchone()[0] == 0
+        key = signal_processed_key("dummy-cycle", "ETHUSDT", "15m", "2026-07-04T10:00:00Z")
+        assert get_executor_state(conn, key) is None
+
+
+def test_run_once_concurrent_same_bar_writes_one_intent(tmp_path, monkeypatch):
+    import prodigy.signals.daemon as daemon_mod
+
+    db_path = tmp_path / "prodigy.sqlite"
+    _seed_fresh_equity(db_path)
+    refresh_barrier = threading.Barrier(2, timeout=2)
+    write_barrier = threading.Barrier(2)
+    real_process_decision = daemon_mod.process_decision
+
+    def refresh_data() -> None:
+        refresh_barrier.wait()
+
+    def synchronized_process_decision(*args, **kwargs) -> None:
+        try:
+            write_barrier.wait(timeout=0.25)
+        except threading.BrokenBarrierError:
+            pass
+        real_process_decision(*args, **kwargs)
+
+    monkeypatch.setattr(daemon_mod, "process_decision", synchronized_process_decision)
+    cfg = RunOnceConfig(
+        db_path=db_path,
+        data_root=tmp_path / "data",
+        research_symbol="ETH/USDT:USDT",
+        exchange_symbol="ETHUSDT",
+        source="dummy-cycle",
+        clock=_clock(),
+        now=pd.Timestamp("2026-07-04T10:16:00Z"),
+        refresh_data=refresh_data,
+        score_loader=lambda: (1.0, "2026-07-04T10:00:00Z"),
+    )
+    results = []
+    errors = []
+
+    def worker() -> None:
+        try:
+            results.append(run_once(cfg))
+        except Exception as exc:  # noqa: BLE001 - test should surface thread failures
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert errors == []
+    assert results.count("open_intent_written") == 1
+    assert any(result in {"already_processed", "skipped_pending_intent"} for result in results)
+    with connect(db_path) as conn:
+        assert conn.execute("select count(*) from trade_intents").fetchone()[0] == 1
+
+
+def test_run_once_skips_malformed_position_side_without_processed_marker(tmp_path):
+    db_path = tmp_path / "prodigy.sqlite"
+    _seed_fresh_equity(db_path)
+    with connect(db_path) as conn:
+        conn.execute(
+            """
+            insert into positions (symbol, side, notional, entry_price, unrealized_pnl, opened_at, updated_at)
+            values ('ETHUSDT', 'flat', 100.0, 100.0, 1.0, '2026-07-04T10:00:00Z', '2026-07-04T10:15:30Z')
+            """
+        )
+        conn.commit()
+
+    result = run_once(
+        RunOnceConfig(
+            db_path=db_path,
+            data_root=tmp_path / "data",
+            research_symbol="ETH/USDT:USDT",
+            exchange_symbol="ETHUSDT",
+            source="dummy-cycle",
+            clock=_clock(),
+            now=pd.Timestamp("2026-07-04T10:16:00Z"),
+            refresh_data=lambda: None,
+            score_loader=lambda: (0.1, "2026-07-04T10:00:00Z"),
+        )
+    )
+
+    assert result == "skipped_ambiguous_position"
+    with connect(db_path) as conn:
+        assert conn.execute("select count(*) from trade_intents").fetchone()[0] == 0
+        key = signal_processed_key("dummy-cycle", "ETHUSDT", "15m", "2026-07-04T10:00:00Z")
+        assert get_executor_state(conn, key) is None
+
+
+@pytest.mark.parametrize("unrealized_pnl", ["not-a-number", float("inf")])
+def test_run_once_skips_unparseable_position_pnl_without_processed_marker(tmp_path, unrealized_pnl):
+    db_path = tmp_path / "prodigy.sqlite"
+    _seed_fresh_equity(db_path)
+    with connect(db_path) as conn:
+        conn.execute(
+            """
+            insert into positions (symbol, side, notional, entry_price, unrealized_pnl, opened_at, updated_at)
+            values ('ETHUSDT', 'long', 100.0, 100.0, ?, '2026-07-04T10:00:00Z', '2026-07-04T10:15:30Z')
+            """,
+            (unrealized_pnl,),
+        )
+        conn.commit()
+
+    result = run_once(
+        RunOnceConfig(
+            db_path=db_path,
+            data_root=tmp_path / "data",
+            research_symbol="ETH/USDT:USDT",
+            exchange_symbol="ETHUSDT",
+            source="dummy-cycle",
+            clock=_clock(),
+            now=pd.Timestamp("2026-07-04T10:16:00Z"),
+            refresh_data=lambda: None,
+            score_loader=lambda: (0.1, "2026-07-04T10:00:00Z"),
+        )
+    )
+
+    assert result == "skipped_ambiguous_position"
     with connect(db_path) as conn:
         assert conn.execute("select count(*) from trade_intents").fetchone()[0] == 0
         key = signal_processed_key("dummy-cycle", "ETHUSDT", "15m", "2026-07-04T10:00:00Z")

@@ -4,6 +4,7 @@ import re
 import sqlite3
 import uuid
 from dataclasses import dataclass
+import math
 from pathlib import Path
 from typing import Callable
 
@@ -62,6 +63,9 @@ class PositionState:
     side: str
     unrealized_pnl: float
     opened_at: str | None = None
+
+
+AMBIGUOUS_POSITION = object()
 
 
 @dataclass(frozen=True)
@@ -153,13 +157,8 @@ def process_decision(
         reason=decision.reason,
         model_version=model_version,
     )
-    # ponytail: `with conn` commits on success, rolls back on exception — so the
-    # intent insert and the signal_processed marker are atomic; neither persists
-    # alone. Move either statement outside this block and a crash between them
-    # can double-fire orders on the next cycle (idempotency relies on the marker).
-    with conn:
-        insert_trade_intent(conn, intent)
-        set_executor_state(conn, processed_key, outcome, created_at)
+    insert_trade_intent(conn, intent)
+    set_executor_state(conn, processed_key, outcome, created_at)
 
 
 @dataclass(frozen=True)
@@ -258,16 +257,25 @@ def _latest_equity_snapshot_age_secs(conn: sqlite3.Connection, now: pd.Timestamp
     return (now - created).total_seconds()
 
 
-def _position_state(conn: sqlite3.Connection, symbol: str) -> PositionState | None:
+def _position_state(conn: sqlite3.Connection, symbol: str) -> PositionState | None | object:
     row = conn.execute(
         "select side, unrealized_pnl, opened_at from positions where symbol = ?",
         (symbol,),
     ).fetchone()
     if row is None:
         return None
+    side = str(row["side"])
+    if side not in {"long", "short"}:
+        return AMBIGUOUS_POSITION
+    try:
+        unrealized_pnl = float(row["unrealized_pnl"])
+    except (TypeError, ValueError, OverflowError):
+        return AMBIGUOUS_POSITION
+    if not math.isfinite(unrealized_pnl):
+        return AMBIGUOUS_POSITION
     return PositionState(
-        side=str(row["side"]),
-        unrealized_pnl=float(row["unrealized_pnl"]),
+        side=side,
+        unrealized_pnl=unrealized_pnl,
         opened_at=row["opened_at"],
     )
 
@@ -343,15 +351,6 @@ def run_once(cfg: RunOnceConfig) -> str:
     try:
         with connect(cfg.db_path) as conn:
             init_db(conn)
-            # M5 limitation: the processed-key check below and the marker write in
-            # process_decision happen on SEPARATE connections (refresh/score run
-            # with no handle held), so two concurrent prodigy-signal instances could
-            # both pass this check and double-write an intent for one bar. M5 is a
-            # single-instance demo daemon by design; serial calls are idempotent
-            # (test_run_once_is_idempotent_per_closed_bar). A multi-instance
-            # deployment would need BEGIN IMMEDIATE re-check inside the write
-            # transaction — out of M5 scope (and it would contend with the Rust
-            # executor's WAL writes on the same DB).
             pre = _gate_skip(conn, cfg, key, cfg.clock(), check_already_processed=True)
             if pre is not None:
                 return pre
@@ -396,16 +395,19 @@ def run_once(cfg: RunOnceConfig) -> str:
     try:
         with connect(cfg.db_path) as conn:
             init_db(conn)
-            # TOCTOU re-check: refresh + score ran outside this transaction and can
-            # take seconds; a manual_override, pending intent, unfinished order, or
-            # stale state that appeared during that window must still block the
-            # write. already_processed is owned by the caller (it can't change
-            # within a single run_once), so the re-check excludes it. None of these
-            # transient skips writes the processed marker.
-            reskip = _gate_skip(conn, cfg, key, cfg.clock(), check_already_processed=False)
+            # Final write gate owns idempotency: BEGIN IMMEDIATE serializes
+            # competing signal daemons, then the full gate (including
+            # already_processed) is re-run in the same transaction that writes the
+            # intent/marker or no_signal marker.
+            conn.execute("begin immediate")
+            reskip = _gate_skip(conn, cfg, key, cfg.clock(), check_already_processed=True)
             if reskip is not None:
+                conn.rollback()
                 return reskip
             position = _position_state(conn, cfg.exchange_symbol)
+            if position is AMBIGUOUS_POSITION:
+                conn.rollback()
+                return "skipped_ambiguous_position"
             # Spec: if a position exists but its age (opened_at) can't be read
             # reliably, SKIP rather than guessing — a transient skip that writes NO
             # processed marker, so the bar is re-evaluated next run. (No position =>
@@ -413,6 +415,7 @@ def run_once(cfg: RunOnceConfig) -> str:
             if position is not None:
                 holding_bars = _holding_bars(position.opened_at, closed_ts, cfg.timeframe)
                 if holding_bars is None:
+                    conn.rollback()
                     return "skipped_ambiguous_position"
             else:
                 holding_bars = 0
@@ -430,6 +433,7 @@ def run_once(cfg: RunOnceConfig) -> str:
                 source=cfg.source,
                 model_version=cfg.source,
             )
+            conn.commit()
             return "open_intent_written" if decision.action == "open" else "close_intent_written"
     except sqlite3.OperationalError as exc:
         if is_transient_sqlite_error(exc):

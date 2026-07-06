@@ -93,4 +93,7 @@ pub struct PrivateWsUpdate {
     /// parsed (auth/subscribe failure). Carries the exchange message so the loop
     /// can emit a `websocket_auth_failed` event and stay not-ready until reconnect.
     pub auth_error: Option<String>,
+    /// Private-WS `{"event":"subscribe","code":0,...}` ack channel, when present.
+    /// Readiness waits for subscribe acks, not for the first real data push.
+    pub subscribe_ack_channel: Option<String>,
 }

@@ -25,6 +25,7 @@ pub struct AccountRiskSnapshot {
     pub gross_notional: f64,
     pub market_is_fresh: bool,
     pub private_state_is_ready: bool,
+    pub margin_danger: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -56,6 +57,9 @@ pub fn check_intent(
     }
     if is_open && account.available_margin < account.equity * params.min_available_margin_fraction {
         return Err("available margin is too low".to_string());
+    }
+    if is_open && account.margin_danger {
+        return Err("margin danger".to_string());
     }
 
     let suspended = account.unrealized_pnl_24h
@@ -111,6 +115,7 @@ mod tests {
             gross_notional: 1_000.0,
             market_is_fresh: true,
             private_state_is_ready: true,
+            margin_danger: false,
         };
         let params = RiskParams::default();
 
@@ -128,6 +133,7 @@ mod tests {
             gross_notional: 0.0,
             market_is_fresh: true,
             private_state_is_ready: true,
+            margin_danger: false,
         };
 
         let err = check_intent(
@@ -149,6 +155,7 @@ mod tests {
             gross_notional: 500.0,
             market_is_fresh: true,
             private_state_is_ready: true,
+            margin_danger: false,
         };
 
         let decision = check_intent(
@@ -158,6 +165,40 @@ mod tests {
         );
 
         assert!(decision.is_ok());
+    }
+
+    #[test]
+    fn margin_danger_blocks_open_but_allows_close_cancel() {
+        let account = AccountRiskSnapshot {
+            equity: 1_000.0,
+            available_margin: 500.0,
+            unrealized_pnl_24h: 0.0,
+            gross_notional: 500.0,
+            market_is_fresh: true,
+            private_state_is_ready: true,
+            margin_danger: true,
+        };
+
+        let err = check_intent(
+            &intent("open", 100.0, 100.0),
+            &account,
+            &RiskParams::default(),
+        )
+        .unwrap_err();
+        assert!(err.contains("margin danger"));
+
+        assert!(check_intent(
+            &intent("close", 100.0, 100.0),
+            &account,
+            &RiskParams::default(),
+        )
+        .is_ok());
+        assert!(check_intent(
+            &intent("cancel", 0.0, 0.0),
+            &account,
+            &RiskParams::default(),
+        )
+        .is_ok());
     }
 
     #[test]
@@ -171,6 +212,7 @@ mod tests {
             gross_notional: 5_000.0, // == equity 1000 * cap_x 5 → remaining 0
             market_is_fresh: true,
             private_state_is_ready: true,
+            margin_danger: false,
         };
 
         let err = check_intent(
@@ -193,6 +235,7 @@ mod tests {
             gross_notional: 5_000.0, // == cap → remaining 0
             market_is_fresh: true,
             private_state_is_ready: true,
+            margin_danger: false,
         };
 
         let decision = check_intent(
@@ -225,6 +268,7 @@ mod tests {
             gross_notional: 0.0,
             market_is_fresh: true,
             private_state_is_ready: true,
+            margin_danger: false,
         };
 
         let decision = check_intent(
@@ -256,6 +300,7 @@ mod tests {
             gross_notional: 0.0,
             market_is_fresh: false,
             private_state_is_ready: false,
+            margin_danger: false,
         };
 
         let decision = check_intent(
@@ -287,6 +332,7 @@ mod tests {
             gross_notional: 0.0,
             market_is_fresh: true,
             private_state_is_ready: true,
+            margin_danger: false,
         };
 
         let err = check_intent(

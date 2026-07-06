@@ -40,6 +40,8 @@ def run_smoke(
     started_at = _iso(clock())
     issues: list[str] = []
     processes: list[tuple[str, subprocess.Popen]] = []
+    component_statuses: dict[str, str] = {}
+    telegram_checks = _telegram_checks()
 
     with connect(db_path) as conn:
         init_db(conn)
@@ -56,18 +58,25 @@ def run_smoke(
                             _start_process(cmd, popen=popen, process_group=process_group),
                         )
                     )
+                    component_statuses[name] = _started_status(processes[-1][1])
                 except OSError as exc:
                     issues.append(f"{name} failed to start: {exc}")
+                    component_statuses[name] = f"failed_to_start {exc}"
+        else:
+            for name, _cmd in _commands(db_path):
+                component_statuses[name] = "skipped by --skip-start"
         _wait_for_duration(
             args.duration_minutes * 60,
             processes=processes,
             issues=issues,
+            component_statuses=component_statuses,
             sleep=sleep,
         )
     finally:
-        _stop_processes(processes, issues)
+        _stop_processes(processes, issues, component_statuses)
 
     ended_at = _iso(clock())
+    _record_observations(db_path, component_statuses, telegram_checks, ended_at)
     return write_smoke_report(
         db_path,
         args.report_dir,
@@ -125,7 +134,10 @@ def _start_process(
 
 
 def _collect_early_exits(
-    processes: list[tuple[str, subprocess.Popen]], issues: list[str], seen: set[str]
+    processes: list[tuple[str, subprocess.Popen]],
+    issues: list[str],
+    seen: set[str],
+    component_statuses: dict[str, str],
 ) -> None:
     for name, proc in processes:
         if name in seen:
@@ -133,6 +145,7 @@ def _collect_early_exits(
         code = proc.poll()
         if code is not None:
             issues.append(f"{name} exited early with code {code}")
+            component_statuses[name] = f"early_exit code={code}"
             seen.add(name)
 
 
@@ -141,29 +154,38 @@ def _wait_for_duration(
     *,
     processes: list[tuple[str, subprocess.Popen]],
     issues: list[str],
+    component_statuses: dict[str, str],
     sleep: Callable[[float], None],
 ) -> None:
     remaining = seconds
     seen_exits: set[str] = set()
     while remaining > 0:
-        _collect_early_exits(processes, issues, seen_exits)
+        _collect_early_exits(processes, issues, seen_exits, component_statuses)
         step = min(POLL_SECONDS, remaining)
         sleep(step)
         remaining -= step
-    _collect_early_exits(processes, issues, seen_exits)
+    _collect_early_exits(processes, issues, seen_exits, component_statuses)
 
 
 def _stop_processes(
-    processes: list[tuple[str, subprocess.Popen]], issues: list[str]
+    processes: list[tuple[str, subprocess.Popen]],
+    issues: list[str],
+    component_statuses: dict[str, str],
 ) -> None:
     for name, proc in processes:
-        if proc.poll() is not None:
+        code = proc.poll()
+        if code is not None:
+            if name not in component_statuses or component_statuses[name].startswith("started"):
+                component_statuses[name] = f"early_exit code={code}"
             continue
         _terminate_process(proc)
+        started = component_statuses.get(name, _started_status(proc))
         try:
             proc.wait(timeout=10)
+            component_statuses[name] = f"{started}; stopped after duration"
         except subprocess.TimeoutExpired:
             issues.append(f"{name} killed after terminate timeout")
+            component_statuses[name] = f"{started}; killed after terminate timeout"
             _kill_process(proc)
             proc.wait()
 
@@ -196,6 +218,31 @@ def _iso(moment: datetime) -> str:
     if moment.tzinfo is None:
         moment = moment.replace(tzinfo=UTC)
     return moment.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _started_status(proc: subprocess.Popen) -> str:
+    return f"started pid={getattr(proc, 'pid', 'unknown')}"
+
+
+def _telegram_checks() -> dict[str, str]:
+    configured = bool(os.getenv("TELEGRAM_BOT_TOKEN") and os.getenv("TELEGRAM_ALLOWED_USER_IDS"))
+    status = "configured" if configured else "skipped not configured"
+    return {"queries": status, "controls": status}
+
+
+def _record_observations(
+    db_path: Path,
+    component_statuses: dict[str, str],
+    telegram_checks: dict[str, str],
+    updated_at: str,
+) -> None:
+    with connect(db_path) as conn:
+        init_db(conn)
+        for name, status in component_statuses.items():
+            set_executor_state(conn, f"smoke:component:{name}", status, updated_at)
+        for name, status in telegram_checks.items():
+            set_executor_state(conn, f"smoke:telegram:{name}", status, updated_at)
+        conn.commit()
 
 
 if __name__ == "__main__":

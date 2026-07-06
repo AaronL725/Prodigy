@@ -26,6 +26,16 @@ def _timeframe_ms(timeframe: str) -> int:
     return int(pd.Timedelta(timeframe) / pd.Timedelta(1, "ms"))
 
 
+def _utc_timestamp(value: object) -> pd.Timestamp:
+    ts = pd.Timestamp(value)
+    return ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
+
+
+def _latest_closed_bar_end(timeframe: str, now: object | None = None) -> pd.Timestamp:
+    current = _utc_timestamp(pd.Timestamp.now(tz="UTC") if now is None else now)
+    return current.floor(pd.Timedelta(timeframe))
+
+
 def _build_ccxt_bitget(proxy_url: str | None):
     # spec: "Try direct connection first. If direct connection fails, retry
     # with proxy." Probe with load_markets; on connection error, fall back to
@@ -69,6 +79,20 @@ def _upsert_checkpoint(conn, task_name: str, value: str) -> None:
     )
 
 
+def _quality_issues(quality: dict, prefix: str) -> list[str]:
+    return [
+        f"{prefix}.{field}"
+        for field in (
+            "duplicate_timestamp_symbol",
+            "missing_timestamps",
+            "non_monotonic_timestamps",
+            "null_values",
+            "negative_volume",
+        )
+        if int(quality.get(field) or 0) > 0
+    ]
+
+
 def run_backfill(
     symbol: str,
     start: str,
@@ -79,6 +103,7 @@ def run_backfill(
     proxy_url: str | None = "http://127.0.0.1:7897",
     exchange: object | None = None,
     funding_client: object | None = None,
+    now: object | None = None,
 ) -> BackfillResult:
     # ponytail: build real Bitget/CCXT clients only when not injected so tests
     # never touch the network or import ccxt. No factory, just a branch.
@@ -87,15 +112,15 @@ def run_backfill(
     if funding_client is None:
         funding_client = BitgetRestClient(proxy_url=proxy_url)
 
-    # ponytail: end=None means "now" (today, UTC) — the documented default CLI
-    # invocation omits --end (spec: backfill 2024-01-01→NOW). No config knob.
-    effective_end = end if end is not None else pd.Timestamp.now(tz="UTC").floor("D").strftime("%Y-%m-%d")
+    effective_end_ts = _utc_timestamp(end) if end is not None else _latest_closed_bar_end(timeframe, now)
+    effective_end = end if end is not None else effective_end_ts.isoformat()
 
     # ponytail: forward-paginate OHLCV by since_ms from start to end. Bitget
     # returns only the most recent page per call, so a single fetch would miss
     # historical data — page until we reach end_ms.
-    start_ms = int(pd.Timestamp(start, tz="UTC").value // 1_000_000)
-    end_ms = int(pd.Timestamp(effective_end, tz="UTC").value // 1_000_000)
+    start_ts = _utc_timestamp(start)
+    start_ms = int(start_ts.value // 1_000_000)
+    end_ms = int(effective_end_ts.value // 1_000_000)
     bar_ms = _timeframe_ms(timeframe)
     pages = []
     cursor = start_ms
@@ -119,8 +144,12 @@ def run_backfill(
     )
     if not ohlcv.empty:
         ohlcv["timestamp"] = pd.to_datetime(ohlcv["timestamp"], utc=True)
+        ohlcv = ohlcv[
+            (ohlcv["timestamp"] >= start_ts) & (ohlcv["timestamp"] < effective_end_ts)
+        ].reset_index(drop=True)
+    ohlcv_quality_frame = ohlcv
+    if not ohlcv.empty:
         ohlcv = ohlcv.drop_duplicates(subset=["timestamp", "symbol"]).reset_index(drop=True)
-        ohlcv = ohlcv[(ohlcv["timestamp"] >= pd.Timestamp(start_ms, unit="ms", tz="UTC")) & (ohlcv["timestamp"] < pd.Timestamp(end_ms, unit="ms", tz="UTC"))]
     if not ohlcv.empty:
         for day, day_frame in ohlcv.groupby(ohlcv["timestamp"].dt.floor("D")):
             write_daily_partition(
@@ -150,8 +179,8 @@ def run_backfill(
     # this filter a partial backfill writes/counts out-of-window rows.
     if not funding.empty:
         funding = funding[
-            (funding["timestamp"] >= pd.Timestamp(start_ms, unit="ms", tz="UTC"))
-            & (funding["timestamp"] < pd.Timestamp(end_ms, unit="ms", tz="UTC"))
+            (funding["timestamp"] >= start_ts)
+            & (funding["timestamp"] < effective_end_ts)
         ].reset_index(drop=True)
     if not funding.empty:
         for day, day_frame in funding.groupby(funding["timestamp"].dt.floor("D")):
@@ -164,8 +193,11 @@ def run_backfill(
                 date=day,
             )
 
-    ohlcv_quality = quality_summary(ohlcv, "ohlcv", timeframe)
+    ohlcv_quality = quality_summary(ohlcv_quality_frame, "ohlcv", timeframe)
     funding_quality = quality_summary(funding, "funding_rates")
+    issues = _quality_issues(ohlcv_quality, "ohlcv") + _quality_issues(
+        funding_quality, "funding"
+    )
 
     task_name = f"backfill:{EXCHANGE_NAME}:{symbol}:{timeframe}"
     summary = {
@@ -195,6 +227,31 @@ def run_backfill(
                 json.dumps(summary, sort_keys=True),
             ),
         )
+        if issues:
+            conn.execute(
+                """
+                insert into events (event_id, created_at, severity, component, message, payload_json)
+                values (?, datetime('now'), ?, ?, ?, ?)
+                """,
+                (
+                    str(uuid.uuid4()),
+                    "warning",
+                    "data.backfill",
+                    "data quality warning",
+                    json.dumps(
+                        {
+                            "symbol": symbol,
+                            "start": start,
+                            "end": effective_end,
+                            "timeframe": timeframe,
+                            "issues": issues,
+                            "ohlcv_quality": ohlcv_quality,
+                            "funding_quality": funding_quality,
+                        },
+                        sort_keys=True,
+                    ),
+                ),
+            )
         conn.commit()
 
     return BackfillResult(

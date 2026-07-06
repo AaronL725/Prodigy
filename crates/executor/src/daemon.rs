@@ -36,7 +36,7 @@ impl ReconcileSignal {
 }
 
 /// Cross-task "private account state is ready" flag. The private WS loop sets it
-/// true after a successful (re)connect (login + subscribe sent without error) and
+/// true after a successful (re)connect (login + subscribe acked without error) and
 /// false on disconnect; the daemon's intent loop reads it when risk-checking a new
 /// OPEN (spec: refuse new opening exposure when private state is not ready). Close /
 /// reduce / cancel bypass it (they're risk-reducing and use REST). Arc-shared so the
@@ -44,7 +44,7 @@ impl ReconcileSignal {
 /// the set/get semantics are unit-testable without a network round-trip.
 ///
 /// ponytail: "ready" means the private WS is connected, authenticated, and subscribed
-/// (login + subscribe sends succeeded) — NOT "we have received the first data push". An
+/// (login + subscribe acks succeeded) — NOT "we have received the first data push". An
 /// idle demo account may never push an orders/positions message, so gating on first
 /// data would deadlock all opens on an idle account. Connection-level readiness is the
 /// correct, non-deadlocking signal.
@@ -772,13 +772,54 @@ pub async fn run_private_ws_loop(
                     tokio::time::sleep(Duration::from_secs(1)).await;
                     continue;
                 }
-                // (Re)connect succeeded, login was ACKED, and we're subscribed:
+                let subscribe_deadline = std::time::Instant::now() + Duration::from_secs(10);
+                let mut subscribe_acks = crate::bitget::PrivateSubscribeAcks::default();
+                let mut subscribe_failure: Option<String> = None;
+                while std::time::Instant::now() < subscribe_deadline && !subscribe_acks.ready() {
+                    let msg = tokio::select! {
+                        _ = shutdown.changed() => {
+                            if *shutdown.borrow() {
+                                return Ok(());
+                            }
+                            continue;
+                        }
+                        msg = socket.next() => match msg {
+                            Some(Ok(m)) => m,
+                            Some(Err(_)) | None => break,
+                        },
+                    };
+                    let Ok(text) = msg.into_text() else {
+                        continue;
+                    };
+                    match crate::bitget::parse_private_ws_message(&text, &cfg) {
+                        Ok(update) if update.auth_error.is_some() => {
+                            subscribe_failure = update.auth_error;
+                            break;
+                        }
+                        Ok(update) => subscribe_acks.record(&update),
+                        Err(err) => {
+                            eprintln!("private ws parse error pre-subscribe-ack: {err}");
+                        }
+                    }
+                }
+                if let Some(detail) = subscribe_failure {
+                    emit_websocket_auth_failed(&cfg, &detail).await;
+                    eprintln!("private ws subscribe rejected: {detail}; reconnecting");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    continue;
+                }
+                if !subscribe_acks.ready() {
+                    eprintln!("private ws subscribe ack timed out; reconnecting");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    continue;
+                }
+                // (Re)connect succeeded, login was ACKED, and subscribe was ACKED:
                 // request a REST reconcile on the next main-loop tick (spec:
                 // reconcile after WS reconnect) so any orders/fills/positions gap
                 // is repaired, and mark private state READY so new opens are no
                 // longer gated out (spec: refuse new opening exposure when
                 // private state is not ready). Readiness is connection-level: we
-                // wait for the login ack but NOT for a first data push — an idle
+                // wait for subscribe ack but NOT for a first data push — an idle
                 // demo account may never push one, and gating on it would
                 // deadlock all opens on an idle account.
                 private_ready.set(true);
@@ -1006,6 +1047,22 @@ mod tests {
         assert!(
             r.is_ready(),
             "main loop sees the readiness through its own handle"
+        );
+    }
+
+    #[test]
+    fn private_ready_set_only_after_subscribe_ack() {
+        let source = include_str!("daemon.rs");
+        let subscribe_wait = source
+            .find("PrivateSubscribeAcks")
+            .expect("private WS loop should track subscribe acks");
+        let ready_set = source
+            .find("private_ready.set(true)")
+            .expect("private WS loop sets readiness");
+
+        assert!(
+            subscribe_wait < ready_set,
+            "private readiness must be set after subscribe ack handling, not after send"
         );
     }
 
@@ -1286,6 +1343,7 @@ mod tests {
             }],
             fills: vec![],
             account: None,
+            subscribe_ack_channel: None,
         };
 
         apply_private_ws_update(&conn, update).unwrap();

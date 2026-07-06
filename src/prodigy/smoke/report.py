@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
+from datetime import datetime
 from pathlib import Path
 from typing import Iterable
 
@@ -42,6 +43,48 @@ def build_smoke_report(
             table: _status_counts(conn, table)
             for table in STATUS_TABLES
         }
+        components = _state_entries(conn, "smoke:component:")
+        telegram_checks = _state_entries(conn, "smoke:telegram:")
+        control_commands = conn.execute(
+            """
+            select command_id, command, status, requested_by, error
+            from control_commands
+            order by created_at desc
+            limit 20
+            """
+        ).fetchall()
+        open_orders = conn.execute(
+            """
+            select symbol, side, action, status, size, filled_size, price
+            from orders
+            where status in ('submitted', 'live')
+            order by created_at desc
+            limit 20
+            """
+        ).fetchall()
+        fills = conn.execute(
+            """
+            select symbol, side, size, price, fee
+            from fills
+            order by created_at desc
+            limit 20
+            """
+        ).fetchall()
+        positions = conn.execute(
+            """
+            select symbol, side, notional, entry_price, unrealized_pnl, ownership
+            from positions
+            order by updated_at desc
+            """
+        ).fetchall()
+        pnl = conn.execute(
+            """
+            select equity, available_margin, unrealized_pnl, realized_pnl_24h
+            from equity_snapshots
+            order by created_at desc
+            limit 1
+            """
+        ).fetchone()
         events = conn.execute(
             """
             select created_at, severity, component, message
@@ -60,15 +103,26 @@ def build_smoke_report(
     )
     if working_orders > 0:
         report_issues.append(f"residual working orders: {working_orders}")
-    issue_lines = [f"- {issue}" for issue in report_issues] or ["- none"]
+    issue_lines = [f"- {issue}" for issue in report_issues]
+    issue_lines.extend(_event_issue_lines(events))
+    if not issue_lines:
+        issue_lines.append("- none")
     event_lines = [
         f"- {row['created_at']} | {row['severity']} | {row['component']} | {row['message']}"
         for row in events
     ] or ["- none"]
+    residual_lines = []
+    if counts["positions"] > 0:
+        residual_lines.append(f"- residual positions: {counts['positions']}")
+    if working_orders > 0:
+        residual_lines.append(f"- residual working orders: {working_orders}")
+    if not residual_lines:
+        residual_lines.append("- none")
+    has_risk = report_issues or events or counts["positions"] > 0 or working_orders > 0
     lines = [
         "# M6 Demo Smoke Report",
         "",
-        "## Metadata",
+        "## Run",
         f"started_at: {started_at}",
         f"ended_at: {ended_at}",
         f"duration_minutes: {duration_minutes}",
@@ -79,6 +133,31 @@ def build_smoke_report(
             f"- {SUMMARY_LABELS[table]}: {counts[table]}"
             for table in COUNT_TABLES
         ],
+        "",
+        "## Component Startup Status",
+        *_state_lines(components),
+        "",
+        "## Telegram Query/Control Checks",
+        *_state_lines(telegram_checks),
+        "",
+        "## Trade Intents",
+        *_status_lines(statuses["trade_intents"]),
+        "",
+        "## Control Commands",
+        *_status_lines(statuses["control_commands"]),
+        *_control_command_lines(control_commands),
+        "",
+        "## Open Orders",
+        *_order_lines(open_orders),
+        "",
+        "## Fills / Trade Flow",
+        *_fill_lines(fills),
+        "",
+        "## Positions",
+        *_position_lines(positions),
+        "",
+        "## PnL Snapshot",
+        *_pnl_lines(pnl),
         "",
         "## Status Counts",
     ]
@@ -92,11 +171,21 @@ def build_smoke_report(
     lines.extend(
         [
             "",
-            "## Issues",
+            "## WS/REST/SQLite/Telegram Issues",
             *issue_lines,
             "",
-            "## Recent Warning/Error/Critical Events",
+            "## Residual Positions / Orders",
+            *residual_lines,
+            "",
+            "## Warning/Error/Critical Events",
             *event_lines,
+            "",
+            "## Recommended Fixes",
+            *(
+                ["- Review listed issues and residual exposure before the next smoke run."]
+                if has_risk
+                else ["- none"]
+            ),
             "",
         ]
     )
@@ -138,4 +227,91 @@ def _status_counts(conn: sqlite3.Connection, table: str) -> list[tuple[str, int]
 
 
 def _filename_time(value: str) -> str:
-    return re.sub(r"[^0-9A-Za-z]+", "", value)
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).strftime("%Y%m%d-%H%M")
+    except ValueError:
+        digits = re.sub(r"\D+", "", value)
+        return f"{digits[:8]}-{digits[8:12]}" if len(digits) >= 12 else digits
+
+
+def _state_entries(conn: sqlite3.Connection, prefix: str) -> list[tuple[str, str]]:
+    rows = conn.execute(
+        """
+        select key, value
+        from executor_state
+        where key like ?
+        order by key
+        """,
+        (f"{prefix}%",),
+    ).fetchall()
+    return [(str(row["key"])[len(prefix):], str(row["value"])) for row in rows]
+
+
+def _state_lines(entries: list[tuple[str, str]]) -> list[str]:
+    return [f"- {key}: {value}" for key, value in entries] or ["- none recorded"]
+
+
+def _status_lines(statuses: list[tuple[str, int]]) -> list[str]:
+    return [f"- {status}: {count}" for status, count in statuses] or ["- none"]
+
+
+def _control_command_lines(rows: list[sqlite3.Row]) -> list[str]:
+    lines = []
+    for row in rows:
+        error = f" error={row['error']}" if row["error"] else ""
+        lines.append(
+            f"- {row['command']} {row['command_id']}: {row['status']} "
+            f"requested_by={row['requested_by']}{error}"
+        )
+    return lines or ["- none"]
+
+
+def _order_lines(rows: list[sqlite3.Row]) -> list[str]:
+    return [
+        f"- {row['symbol']} {row['side']} {row['action']} {row['status']} "
+        f"size={_num(row['size'])} filled={_num(row['filled_size'])} "
+        f"price={_num(row['price'])}"
+        for row in rows
+    ] or ["- none"]
+
+
+def _fill_lines(rows: list[sqlite3.Row]) -> list[str]:
+    return [
+        f"- {row['symbol']} {row['side']} size={_num(row['size'])} "
+        f"price={_num(row['price'])} fee={_num(row['fee'])}"
+        for row in rows
+    ] or ["- none"]
+
+
+def _position_lines(rows: list[sqlite3.Row]) -> list[str]:
+    return [
+        f"- {row['symbol']} {row['side']} notional={_num(row['notional'])} "
+        f"entry={_num(row['entry_price'])} unrealized_pnl={_num(row['unrealized_pnl'])} "
+        f"ownership={row['ownership']}"
+        for row in rows
+    ] or ["- none"]
+
+
+def _pnl_lines(row: sqlite3.Row | None) -> list[str]:
+    if row is None:
+        return ["- realized_pnl_24h: n/a", "- unrealized_pnl: n/a", "- total_pnl: n/a"]
+    total = float(row["realized_pnl_24h"]) + float(row["unrealized_pnl"])
+    return [
+        f"- equity: {_num(row['equity'])}",
+        f"- available_margin: {_num(row['available_margin'])}",
+        f"- realized_pnl_24h: {_num(row['realized_pnl_24h'])}",
+        f"- unrealized_pnl: {_num(row['unrealized_pnl'])}",
+        f"- total_pnl: {_num(total)}",
+    ]
+
+
+def _event_issue_lines(rows: list[sqlite3.Row]) -> list[str]:
+    return [
+        f"- {row['component']}: {row['message']}"
+        for row in rows
+        if str(row["component"]).lower() in {"ws", "websocket", "rest", "sqlite", "telegram"}
+    ]
+
+
+def _num(value: object) -> str:
+    return "n/a" if value is None else str(float(value))

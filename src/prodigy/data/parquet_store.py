@@ -7,6 +7,11 @@ import pandas as pd
 
 from prodigy.data.paths import ensure_dir, symbol_slug
 
+DATASET_REQUIRED_COLUMNS = {
+    "ohlcv": {"timestamp", "symbol", "open", "high", "low", "close", "volume"},
+    "funding_rates": {"timestamp", "symbol", "funding_rate"},
+}
+
 
 def partition_path(
     data_root: str | Path,
@@ -22,6 +27,15 @@ def partition_path(
         parts.append(f"timeframe={timeframe}")
     parts.append(f"date={day}.parquet.gzip")
     return Path(*parts)
+
+
+def _validate_required_columns(frame: pd.DataFrame, dataset: str) -> None:
+    required = DATASET_REQUIRED_COLUMNS.get(dataset, {"timestamp", "symbol"})
+    missing = sorted(required.difference(frame.columns))
+    if missing:
+        raise ValueError(
+            f"{dataset} partition missing required columns: {', '.join(missing)}"
+        )
 
 
 def _date_range(start: str | pd.Timestamp, end: str | pd.Timestamp) -> list[pd.Timestamp]:
@@ -41,6 +55,7 @@ def write_daily_partition(
 ) -> Path:
     path = partition_path(data_root, exchange, symbol, dataset, date, timeframe)
     ensure_dir(path.parent)
+    _validate_required_columns(frame, dataset)
     clean = frame.sort_values("timestamp").drop_duplicates(
         ["timestamp", "symbol"], keep="last"
     )
@@ -48,9 +63,13 @@ def write_daily_partition(
         suffix=".parquet.gzip", dir=path.parent, delete=False
     ) as tmp:
         tmp_path = Path(tmp.name)
-    clean.to_parquet(tmp_path, compression="gzip", index=False)
-    pd.read_parquet(tmp_path)
-    tmp_path.replace(path)
+    try:
+        clean.to_parquet(tmp_path, compression="gzip", index=False)
+        _validate_required_columns(pd.read_parquet(tmp_path), dataset)
+        tmp_path.replace(path)
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
     return path
 
 

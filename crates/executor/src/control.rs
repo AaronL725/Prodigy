@@ -166,7 +166,9 @@ pub async fn process_pending_control_commands_once(
         let result = match command.command.as_str() {
             "stop" => apply_stop(conn, &command.command_id),
             "resume" => apply_resume(conn, &command.command_id),
-            "cancel_all" => apply_cancel_all(conn, cfg, rest, &command.command_id).await,
+            "cancel_all" => {
+                apply_cancel_all_then_reconcile(conn, cfg, rest, &command.command_id).await
+            }
             "close_all" => apply_close_all(conn, cfg, rest, market_cache, &command).await,
             other => Err(anyhow::anyhow!("unsupported control command: {other}")),
         };
@@ -204,6 +206,24 @@ pub async fn process_pending_control_commands_once(
         }
     }
     Ok(())
+}
+
+async fn apply_cancel_all_then_reconcile(
+    conn: &rusqlite::Connection,
+    cfg: &ExecutorConfig,
+    rest: &BitgetRestClient,
+    command_id: &str,
+) -> Result<()> {
+    let cancel_result = apply_cancel_all(conn, cfg, rest, command_id).await;
+    let reconcile_result = reconcile_control(conn, cfg, rest).await;
+    match (cancel_result, reconcile_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(err), Ok(())) => Err(err),
+        (Ok(()), Err(err)) => Err(anyhow::anyhow!("cancel_all reconcile failed: {err}")),
+        (Err(cancel_err), Err(reconcile_err)) => Err(anyhow::anyhow!(
+            "cancel_all failed: {cancel_err}; reconcile failed: {reconcile_err}"
+        )),
+    }
 }
 
 async fn apply_cancel_all(
@@ -582,6 +602,55 @@ mod tests {
 
     fn http_stub() -> String {
         http_stub_with_cancel(true)
+    }
+
+    fn cancel_then_reconcile_http_stub() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let start = Instant::now();
+            let mut handled = 0usize;
+            while start.elapsed() < Duration::from_secs(3) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut buf = [0u8; 4096];
+                        let n = stream.read(&mut buf).unwrap_or(0);
+                        let request = String::from_utf8_lossy(&buf[..n]);
+                        let body = if request.starts_with("POST /api/v2/mix/order/cancel-order") {
+                            r#"{"code":"00000","data":{}}"#.to_string()
+                        } else if request.starts_with("GET /api/v2/mix/order/orders-pending") {
+                            r#"{"code":"00000","data":[]}"#.to_string()
+                        } else if request.starts_with("GET /api/v2/mix/order/detail") {
+                            r#"{"code":"00000","data":{"status":"canceled","baseVolume":"0"}}"#
+                                .to_string()
+                        } else if request.starts_with("GET /api/v2/mix/order/fills") {
+                            r#"{"code":"00000","data":{"fillList":[]}}"#.to_string()
+                        } else if request.starts_with("GET /api/v2/mix/position/all-position") {
+                            r#"{"code":"00000","data":[]}"#.to_string()
+                        } else if request.starts_with("GET /api/v2/mix/account/account") {
+                            r#"{"code":"00000","data":{"accountEquity":"1000","available":"900","unrealizedPL":"0"}}"#.to_string()
+                        } else {
+                            r#"{"code":"00000","data":{}}"#.to_string()
+                        };
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        stream.write_all(response.as_bytes()).unwrap();
+                        handled += 1;
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        if handled > 0 && start.elapsed() > Duration::from_millis(500) {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        format!("http://{addr}")
     }
 
     fn http_stub_with_cancel(cancel_ok: bool) -> String {
@@ -1056,6 +1125,61 @@ mod tests {
             .unwrap();
         assert!(messages.contains(&"control command accepted".to_string()));
         assert!(messages.contains(&"control command executed".to_string()));
+    }
+
+    #[tokio::test]
+    async fn cancel_all_command_runs_reconcile_after_cancel() {
+        let conn = conn();
+        insert_executed_open_intent(&conn);
+        insert_working_order(&conn);
+        conn.execute(
+            "insert into control_commands (
+              command_id, created_at, command, status, requested_by
+            ) values ('cmd-cancel', 'now', 'cancel_all', 'pending', '123')",
+            [],
+        )
+        .unwrap();
+        let cfg = crate::config::ExecutorConfig {
+            rest_base_url: cancel_then_reconcile_http_stub(),
+            ..crate::config::ExecutorConfig::demo_for_tests()
+        };
+        let rest = crate::bitget::BitgetRestClient::new(cfg.clone()).unwrap();
+
+        process_pending_control_commands_once(
+            &conn,
+            &cfg,
+            &rest,
+            &mut crate::executor::MarketCache::default(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            conn.query_row(
+                "select status from control_commands where command_id = 'cmd-cancel'",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "executed"
+        );
+        assert_eq!(
+            conn.query_row(
+                "select count(*) from events
+                 where component = 'executor' and message = 'reconciliation completed'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row("select count(*) from equity_snapshots", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap(),
+            1
+        );
     }
 
     #[tokio::test]

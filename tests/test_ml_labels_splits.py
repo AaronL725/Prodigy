@@ -68,6 +68,32 @@ def test_purged_walk_forward_excludes_final_holdout_and_gap():
     assert splits.final_holdout_start > splits.folds[-1].valid_end
 
 
+def test_purged_walk_forward_uses_timestamp_days_with_gaps():
+    ts = pd.date_range("2024-01-01", periods=120 * 48, freq="30min", tz="UTC")
+    sparse = pd.DataFrame(
+        {
+            "timestamp": ts,
+            "symbol": ["ETH/USDT:USDT"] * len(ts),
+            "close": [100 + i * 0.01 for i in range(len(ts))],
+        }
+    )
+
+    splits = purged_walk_forward_splits(
+        sparse,
+        min_train_days=10,
+        valid_days=30,
+        step_days=30,
+        final_holdout_days=30,
+        purge_gap_bars=4,
+    )
+
+    assert splits.folds
+    first = splits.folds[0]
+    valid_span = first.valid_end - first.valid_start
+    assert pd.Timedelta(days=29) <= valid_span <= pd.Timedelta(days=31)
+    assert splits.final_holdout_start == sparse["timestamp"].iloc[-1] - pd.Timedelta(days=30)
+
+
 def test_purged_walk_forward_no_label_leak_into_validation():
     # A 1h label uses 4 forward bars: target_i = forward[i+4]. With purge_gap_bars
     # == label_bars == 4, the last training sample's target must land STRICTLY

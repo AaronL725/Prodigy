@@ -297,6 +297,44 @@ fn fill_to_repair(
     })
 }
 
+fn handle_unmatched_fill_for_override(
+    conn: &Connection,
+    row: &serde_json::Value,
+    symbol: &str,
+    local_order_ids: &HashSet<String>,
+    detect_override: bool,
+    override_active: &mut bool,
+    entered_this_run: &mut bool,
+) -> Result<bool> {
+    if !detect_override || *override_active {
+        return Ok(false);
+    }
+    if str_field(row, "symbol") != symbol {
+        return Ok(false);
+    }
+    let order_id = str_field(row, "orderId");
+    if !order_id.is_empty() && local_order_ids.contains(&order_id) {
+        return Ok(false);
+    }
+
+    let override_key = format!("manual_override:{symbol}");
+    db::set_executor_state(conn, &override_key, "active")?;
+    *override_active = true;
+    *entered_this_run = true;
+    db::write_event(
+        conn,
+        "warning",
+        "executor",
+        "manual override entered (unmatched fill)",
+        &format!(
+            "{{\"symbol\":\"{symbol}\",\"order_id\":\"{}\",\"trade_id\":\"{}\"}}",
+            order_id,
+            str_field(row, "tradeId")
+        ),
+    )?;
+    Ok(true)
+}
+
 pub async fn reconcile_once(
     conn: &Connection,
     rest: &BitgetRestClient,
@@ -474,6 +512,23 @@ pub async fn reconcile_once(
             // mis-fires manual-override drift on our own (already-filled) position.
             db::sync_order_fill_state(conn, &order_id)?;
             repaired_fills += 1;
+        } else if handle_unmatched_fill_for_override(
+            conn,
+            &row,
+            &symbol,
+            &local_order_id_set,
+            detect_override,
+            &mut override_active,
+            &mut entered_this_run,
+        )? {
+            notify::send_telegram(
+                telegram_token,
+                telegram_chat,
+                "manual_override_entered",
+                &format!("manual override entered for {symbol} (unmatched fill)"),
+            )
+            .await
+            .ok();
         }
     }
 
@@ -1002,6 +1057,42 @@ mod tests {
             "cTime": "1",
         });
         assert!(fill_to_repair(&empty, &local_order_ids, &existing, client_oid_for).is_none());
+    }
+
+    #[test]
+    fn manual_override_set_for_unmatched_exchange_fill() {
+        let conn = exec_db();
+        let row = serde_json::json!({
+            "tradeId": "manual-trade-1",
+            "orderId": "foreign-order-1",
+            "symbol": "ETHUSDT",
+            "side": "buy",
+            "price": "1800",
+            "baseVolume": "0.05",
+            "cTime": "1783010850639"
+        });
+        let local_order_ids = std::collections::HashSet::new();
+        let mut override_active = false;
+        let mut entered_this_run = false;
+
+        let entered = handle_unmatched_fill_for_override(
+            &conn,
+            &row,
+            "ETHUSDT",
+            &local_order_ids,
+            true,
+            &mut override_active,
+            &mut entered_this_run,
+        )
+        .unwrap();
+
+        assert!(entered);
+        assert!(override_active);
+        assert!(entered_this_run);
+        assert_eq!(
+            db::get_executor_state(&conn, "manual_override:ETHUSDT").unwrap(),
+            Some("active".to_string())
+        );
     }
 
     #[test]
