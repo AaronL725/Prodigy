@@ -128,11 +128,11 @@ pub fn query_reply(conn: &Connection, text: &str) -> Result<Option<TelegramReply
     match command {
         "/status" => Ok(Some(status_reply(conn)?)),
         "/positions" => Ok(Some(positions_reply(conn)?)),
-        "/orders" => Ok(Some(orders_reply(conn)?)),
+        "/orders" => Ok(Some(orders_reply(conn, 1)?)),
         "/pnl" => Ok(Some(pnl_reply(conn)?)),
         "/risk" => Ok(Some(risk_reply(conn)?)),
-        "/trades" => Ok(Some(trades_reply(conn)?)),
-        "/events" => Ok(Some(events_reply(conn)?)),
+        "/trades" => Ok(Some(trades_reply(conn, 1)?)),
+        "/events" => Ok(Some(events_reply(conn, 1)?)),
         "/smoke_status" => Ok(Some(smoke_status_reply(conn)?)),
         "/help" => Ok(Some(help_reply())),
         "/stop" | "/resume" | "/cancel_all" | "/close_all" => Ok(Some(TelegramReply::plain(
@@ -240,6 +240,59 @@ fn html_card(title: &str, rows: Vec<String>, footer: Option<String>) -> Telegram
     html_card_with_keyboard(title, rows, footer, Some(navigation_keyboard()))
 }
 
+const PAGE_SIZE: usize = 8;
+const MAX_PAGES: usize = 5;
+
+fn clamp_page(page: usize) -> usize {
+    page.clamp(1, MAX_PAGES)
+}
+
+fn callback_page(callback_data: &str, prefix: &str) -> Option<usize> {
+    callback_data
+        .strip_prefix(prefix)
+        .and_then(|page| page.parse::<usize>().ok())
+        .map(clamp_page)
+}
+
+fn page_offset(page: usize) -> i64 {
+    ((clamp_page(page) - 1) * PAGE_SIZE) as i64
+}
+
+fn paginated_keyboard(section: &str, page: usize, has_next: bool) -> serde_json::Value {
+    let page = clamp_page(page);
+    let mut controls = Vec::new();
+    if page > 1 {
+        controls.push(button("Prev", &format!("tgux:{section}:{}", page - 1)));
+    }
+    controls.push(button(
+        &format!("Page {page}"),
+        &format!("tgux:{section}:{page}"),
+    ));
+    if has_next && page < MAX_PAGES {
+        controls.push(button("Next", &format!("tgux:{section}:{}", page + 1)));
+    }
+    inline_keyboard(vec![controls, vec![button("Back", "tgux:status")]])
+}
+
+fn paginated_card(
+    title: &str,
+    section: &str,
+    page: usize,
+    mut lines: Vec<String>,
+) -> TelegramReply {
+    let has_next = lines.len() > PAGE_SIZE && clamp_page(page) < MAX_PAGES;
+    lines.truncate(PAGE_SIZE);
+    if lines.is_empty() {
+        lines.push(row(title, "NONE"));
+    }
+    html_card_with_keyboard(
+        title,
+        vec![lines.join("\n\n")],
+        Some(format!("Page {}", clamp_page(page))),
+        Some(paginated_keyboard(section, page, has_next)),
+    )
+}
+
 pub fn operator_response(
     conn: &Connection,
     text: &str,
@@ -316,15 +369,24 @@ pub fn operator_callback_reply(
     if let Some(code) = callback_data.strip_prefix("tgux:cancel_close_all:") {
         return cancel_close_all_button(conn, code, from_user_id, now_ms).map(Some);
     }
+    if let Some(page) = callback_page(callback_data, "tgux:orders:") {
+        return orders_reply(conn, page).map(Some);
+    }
+    if let Some(page) = callback_page(callback_data, "tgux:trades:") {
+        return trades_reply(conn, page).map(Some);
+    }
+    if let Some(page) = callback_page(callback_data, "tgux:events:") {
+        return events_reply(conn, page).map(Some);
+    }
 
     match callback_data {
         "tgux:status" => query_reply(conn, "/status"),
         "tgux:pnl" => query_reply(conn, "/pnl"),
         "tgux:risk" => query_reply(conn, "/risk"),
         "tgux:positions" => query_reply(conn, "/positions"),
-        "tgux:orders" => query_reply(conn, "/orders"),
-        "tgux:trades" => query_reply(conn, "/trades"),
-        "tgux:events" => query_reply(conn, "/events"),
+        "tgux:orders" => orders_reply(conn, 1).map(Some),
+        "tgux:trades" => trades_reply(conn, 1).map(Some),
+        "tgux:events" => events_reply(conn, 1).map(Some),
         "tgux:smoke" => query_reply(conn, "/smoke_status"),
         "tgux:help" => Ok(Some(help_reply())),
         "tgux:control" => Ok(Some(control_panel_reply())),
@@ -529,7 +591,8 @@ fn positions_reply(conn: &Connection) -> Result<TelegramReply> {
     Ok(html_card("POSITIONS", vec![lines.join("\n\n")], None))
 }
 
-fn orders_reply(conn: &Connection) -> Result<TelegramReply> {
+fn orders_reply(conn: &Connection, page: usize) -> Result<TelegramReply> {
+    let page = clamp_page(page);
     let mut stmt = conn.prepare(
         "with working as (
            select client_oid, symbol, side, action, status, price, size, filled_size, updated_at, 0 as bucket
@@ -540,8 +603,6 @@ fn orders_reply(conn: &Connection) -> Result<TelegramReply> {
            select client_oid, symbol, side, action, status, price, size, filled_size, updated_at, 1 as bucket
            from orders
            where client_oid not in (select client_oid from working)
-           order by updated_at desc
-           limit 10
          )
          select client_oid, symbol, side, action, status, price, size, filled_size
          from (
@@ -549,50 +610,52 @@ fn orders_reply(conn: &Connection) -> Result<TelegramReply> {
            union all
            select * from recent
          )
-         order by bucket asc, updated_at desc",
+         order by bucket asc, updated_at desc
+         limit ? offset ?",
     )?;
-    let rows = stmt.query_map([], |r| {
-        Ok(format!(
-            "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
-            item_header("ORDER", r.get::<_, String>(0)?),
-            plain_row("SYMBOL", r.get::<_, String>(1)?),
-            plain_row("SIDE", r.get::<_, String>(2)?),
-            plain_row("ACTION", r.get::<_, String>(3)?),
-            plain_row("STATUS", r.get::<_, String>(4)?),
-            optional_metric_row("PRICE", r.get::<_, Option<f64>>(5)?),
-            metric_row("POSITION", r.get::<_, f64>(6)?),
-            metric_row("FILLED", r.get::<_, f64>(7)?),
-        ))
-    })?;
-    let mut lines = rows.collect::<Result<Vec<_>, _>>()?;
-    if lines.is_empty() {
-        lines.push(row("ORDERS", "NONE"));
-    }
-    Ok(html_card("ORDERS", vec![lines.join("\n\n")], None))
+    let rows = stmt.query_map(
+        rusqlite::params![(PAGE_SIZE + 1) as i64, page_offset(page)],
+        |r| {
+            Ok(format!(
+                "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+                item_header("ORDER", r.get::<_, String>(0)?),
+                plain_row("SYMBOL", r.get::<_, String>(1)?),
+                plain_row("SIDE", r.get::<_, String>(2)?),
+                plain_row("ACTION", r.get::<_, String>(3)?),
+                plain_row("STATUS", r.get::<_, String>(4)?),
+                optional_metric_row("PRICE", r.get::<_, Option<f64>>(5)?),
+                metric_row("POSITION", r.get::<_, f64>(6)?),
+                metric_row("FILLED", r.get::<_, f64>(7)?),
+            ))
+        },
+    )?;
+    let lines = rows.collect::<Result<Vec<_>, _>>()?;
+    Ok(paginated_card("ORDERS", "orders", page, lines))
 }
 
-fn trades_reply(conn: &Connection) -> Result<TelegramReply> {
+fn trades_reply(conn: &Connection, page: usize) -> Result<TelegramReply> {
+    let page = clamp_page(page);
     let mut stmt = conn.prepare(
         "select symbol, side, price, size, fee, created_at
-         from fills order by created_at desc limit 10",
+         from fills order by created_at desc limit ? offset ?",
     )?;
-    let rows = stmt.query_map([], |r| {
-        let symbol = r.get::<_, String>(0)?;
-        let side = r.get::<_, String>(1)?;
-        Ok(format!(
-            "{}\n{}\n{}\n{}\n{}",
-            item_header("TRADE", format!("{symbol} {side}")),
-            metric_row("PRICE", r.get::<_, f64>(2)?),
-            metric_row("POSITION", r.get::<_, f64>(3)?),
-            metric_row("FEE", r.get::<_, f64>(4)?),
-            plain_row("AT", r.get::<_, String>(5)?),
-        ))
-    })?;
-    let mut lines = rows.collect::<Result<Vec<_>, _>>()?;
-    if lines.is_empty() {
-        lines.push(row("TRADES", "NONE"));
-    }
-    Ok(html_card("TRADES", vec![lines.join("\n\n")], None))
+    let rows = stmt.query_map(
+        rusqlite::params![(PAGE_SIZE + 1) as i64, page_offset(page)],
+        |r| {
+            let symbol = r.get::<_, String>(0)?;
+            let side = r.get::<_, String>(1)?;
+            Ok(format!(
+                "{}\n{}\n{}\n{}\n{}",
+                item_header("TRADE", format!("{symbol} {side}")),
+                metric_row("PRICE", r.get::<_, f64>(2)?),
+                metric_row("POSITION", r.get::<_, f64>(3)?),
+                metric_row("FEE", r.get::<_, f64>(4)?),
+                plain_row("AT", r.get::<_, String>(5)?),
+            ))
+        },
+    )?;
+    let lines = rows.collect::<Result<Vec<_>, _>>()?;
+    Ok(paginated_card("TRADES", "trades", page, lines))
 }
 
 fn pnl_reply(conn: &Connection) -> Result<TelegramReply> {
@@ -691,30 +754,31 @@ fn risk_reply(conn: &Connection) -> Result<TelegramReply> {
     ))
 }
 
-fn events_reply(conn: &Connection) -> Result<TelegramReply> {
+fn events_reply(conn: &Connection, page: usize) -> Result<TelegramReply> {
+    let page = clamp_page(page);
     let mut stmt = conn.prepare(
         "select created_at, severity, component, message
          from events
          where severity in ('warning', 'error', 'critical')
-         order by created_at desc limit 10",
+         order by created_at desc limit ? offset ?",
     )?;
-    let rows = stmt.query_map([], |r| {
-        Ok(row(
-            "EVENT",
-            format!(
-                "{} {} {}: {}",
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, String>(3)?,
-            ),
-        ))
-    })?;
-    let mut lines = rows.collect::<Result<Vec<_>, _>>()?;
-    if lines.is_empty() {
-        lines.push(row("EVENTS", "NONE"));
-    }
-    Ok(html_card("EVENTS", lines, None))
+    let rows = stmt.query_map(
+        rusqlite::params![(PAGE_SIZE + 1) as i64, page_offset(page)],
+        |r| {
+            Ok(row(
+                "EVENT",
+                format!(
+                    "{} {} {}: {}",
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                ),
+            ))
+        },
+    )?;
+    let lines = rows.collect::<Result<Vec<_>, _>>()?;
+    Ok(paginated_card("EVENTS", "events", page, lines))
 }
 
 fn smoke_status_reply(conn: &Connection) -> Result<TelegramReply> {
@@ -1888,6 +1952,77 @@ mod tests {
             .unwrap();
         assert!(old_working < newest_recent);
         assert_eq!(response.matches("old-working").count(), 1);
+    }
+
+    #[test]
+    fn orders_trades_and_events_callbacks_paginate_eight_rows_with_five_page_cap() {
+        let conn = test_conn();
+        for n in 0..45 {
+            let id = format!("{n:05}");
+            let stamp = format!("2026-07-06T00:{n:02}:00Z");
+            conn.execute(
+                "insert into orders (
+                   order_id, client_oid, intent_id, symbol, side, action, order_type,
+                   status, price, size, filled_size, created_at, updated_at
+                 ) values (?, ?, null, 'ETHUSDT', 'buy', 'open',
+                   'market', 'filled', 2000.0, 0.1, 0.1, ?, ?)",
+                rusqlite::params![format!("order-{id}"), format!("order-{id}"), stamp, stamp,],
+            )
+            .unwrap();
+            conn.execute(
+                "insert into fills (
+                   fill_id, order_id, symbol, side, price, size, fee, created_at,
+                   trade_id, client_oid, raw_json
+                 ) values (?, ?, ?, 'buy', 2000.0, 0.1, 0.2, ?, ?, ?, '{}')",
+                rusqlite::params![
+                    format!("fill-{id}"),
+                    format!("order-{id}"),
+                    format!("SYM{id}"),
+                    stamp,
+                    format!("trade-{id}"),
+                    format!("order-{id}"),
+                ],
+            )
+            .unwrap();
+            conn.execute(
+                "insert into events (
+                   event_id, created_at, severity, component, message, payload_json
+                 ) values (?, ?, 'warning', 'telegram', ?, '{}')",
+                rusqlite::params![format!("event-{id}"), stamp, format!("event-{id}")],
+            )
+            .unwrap();
+        }
+
+        for (callback, marker, visible, hidden) in [
+            (
+                "tgux:orders:5",
+                "<b>Order</b> —",
+                "order-00012",
+                "order-00004",
+            ),
+            ("tgux:trades:5", "<b>Trade</b> —", "SYM00012", "SYM00004"),
+            (
+                "tgux:events:5",
+                "<b>Event</b> —",
+                "event-00012",
+                "event-00004",
+            ),
+        ] {
+            let reply =
+                operator_callback_reply(&conn, callback, "123", &["123".to_string()], 1_000)
+                    .unwrap()
+                    .unwrap();
+            let markup = serde_json::to_string(&reply.reply_markup).unwrap();
+
+            assert_eq!(reply.text.matches(marker).count(), 8, "{callback}");
+            assert!(reply.text.contains(visible), "{callback}");
+            assert!(!reply.text.contains(hidden), "{callback}");
+            assert!(markup.contains(&callback.replace(":5", ":4")), "{callback}");
+            assert!(
+                !markup.contains(&callback.replace(":5", ":6")),
+                "{callback}"
+            );
+        }
     }
 
     #[test]
