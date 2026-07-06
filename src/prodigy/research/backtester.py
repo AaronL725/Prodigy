@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+import numpy as np
 import pandas as pd
 
 from prodigy.research.evaluator import (
@@ -72,7 +73,7 @@ class Backtester:
         merged = merged.dropna(subset=["value", "forward_return"])
         if merged.empty:
             return {"mean_forward_return": 0.0, "observations": 0}
-        signed = merged["value"].apply(lambda x: 1 if x > 0 else -1 if x < 0 else 0)
+        signed = np.sign(merged["value"])
         strategy_return = signed * merged["forward_return"]
         return {
             "mean_forward_return": float(strategy_return.mean()),

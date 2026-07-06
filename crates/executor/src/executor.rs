@@ -808,13 +808,13 @@ async fn close_existing_demo_position_if_any(
             ],
         )
         .await?;
-    let rows = positions
+    for row in positions
         .get("data")
         .and_then(serde_json::Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    for row in rows {
-        let (size, hold_side) = match position_row_closeable(&row, &cfg.bitget_symbol) {
+        .into_iter()
+        .flatten()
+    {
+        let (size, hold_side) = match position_row_closeable(row, &cfg.bitget_symbol) {
             Some(v) => v,
             None => continue,
         };
@@ -1414,14 +1414,14 @@ pub async fn process_one_intent(
                 ],
             )
             .await?;
-        let rows = positions
+        let base = positions
             .get("data")
             .and_then(serde_json::Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        let base = rows
-            .iter()
-            .find_map(|row| position_row_close_base_for_side(row, &cfg.bitget_symbol, &intent.side))
+            .and_then(|rows| {
+                rows.iter().find_map(|row| {
+                    position_row_close_base_for_side(row, &cfg.bitget_symbol, &intent.side)
+                })
+            })
             .unwrap_or(0.0);
         if base <= DUST_BASE {
             db::fail_intent(

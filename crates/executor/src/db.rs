@@ -21,11 +21,7 @@ pub fn pending_intents(conn: &Connection) -> Result<Vec<TradeIntent>> {
         })
     })?;
 
-    let mut intents = Vec::new();
-    for row in rows {
-        intents.push(row?);
-    }
-    Ok(intents)
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 pub fn accept_intent(conn: &Connection, intent_id: &str) -> Result<bool> {
@@ -73,11 +69,7 @@ pub fn pending_control_commands(conn: &Connection) -> Result<Vec<ControlCommand>
         })
     })?;
 
-    let mut commands = Vec::new();
-    for row in rows {
-        commands.push(row?);
-    }
-    Ok(commands)
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 pub fn accept_control_command(conn: &Connection, command_id: &str) -> Result<bool> {
@@ -330,11 +322,7 @@ pub fn system_positions(conn: &Connection) -> Result<Vec<PositionRecord>> {
         })
     })?;
 
-    let mut positions = Vec::new();
-    for row in rows {
-        positions.push(row?);
-    }
-    Ok(positions)
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 /// client_oids of orders we already have locally (used to detect exchange orders
@@ -342,11 +330,7 @@ pub fn system_positions(conn: &Connection) -> Result<Vec<PositionRecord>> {
 pub fn local_order_client_oids(conn: &Connection) -> Result<std::collections::HashSet<String>> {
     let mut stmt = conn.prepare("select client_oid from orders")?;
     let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-    let mut set = std::collections::HashSet::new();
-    for row in rows {
-        set.insert(row?);
-    }
-    Ok(set)
+    Ok(rows.collect::<rusqlite::Result<std::collections::HashSet<_>>>()?)
 }
 
 /// Signed net base the system expects to hold for a symbol, summed across all
@@ -396,11 +380,7 @@ pub fn system_net_base_for_symbol(conn: &Connection, symbol: &str) -> Result<(f6
 pub fn local_fill_trade_ids(conn: &Connection) -> Result<std::collections::HashSet<String>> {
     let mut stmt = conn.prepare("select trade_id from fills where trade_id is not null")?;
     let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-    let mut set = std::collections::HashSet::new();
-    for row in rows {
-        set.insert(row?);
-    }
-    Ok(set)
+    Ok(rows.collect::<rusqlite::Result<std::collections::HashSet<_>>>()?)
 }
 
 /// Map of exchange order_id → our client_oid for orders we placed. The exchange
@@ -414,12 +394,7 @@ pub fn local_order_id_to_client_oid(
     let rows = stmt.query_map([], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
     })?;
-    let mut map = std::collections::HashMap::new();
-    for row in rows {
-        let (oid, cid) = row?;
-        map.insert(oid, cid);
-    }
-    Ok(map)
+    Ok(rows.collect::<rusqlite::Result<std::collections::HashMap<_, _>>>()?)
 }
 
 /// Set an order's filled_size/status directly from the exchange order-detail's
@@ -554,11 +529,7 @@ pub fn local_working_system_orders(
             row.get::<_, f64>(2)?,
         ))
     })?;
-    let mut out = Vec::new();
-    for row in rows {
-        out.push(row?);
-    }
-    Ok(out)
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 /// Mark a system order externally_cancelled after the client cancelled it in the

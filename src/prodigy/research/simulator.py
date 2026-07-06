@@ -11,6 +11,7 @@ is the right shape. No state-machine framework, no speculative abstraction.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -74,19 +75,19 @@ def _atr(prices: pd.DataFrame, window: int) -> pd.Series:
     return tr_series.rolling(window=window, min_periods=window).mean()
 
 
-def _signal_lookup(signals: pd.DataFrame) -> dict[tuple, pd.DataFrame]:
+def _signal_lookup(signals: pd.DataFrame) -> dict[tuple, list[dict]]:
     """Index signals by (timestamp, symbol) for O(1) per-bar lookup.
 
     A bar may carry multiple signals (e.g. a close then an open). Returns them
     in original row order so the simulator can process closes before opens.
     """
-    lookup: dict[tuple, pd.DataFrame] = {}
+    lookup: dict[tuple, list[dict]] = {}
     if signals.empty:
         return lookup
     for key, frame in signals.groupby(
         [signals["timestamp"], signals["symbol"]], sort=False
     ):
-        lookup[key] = frame
+        lookup[key] = frame.to_dict("records")
     return lookup
 
 
@@ -96,10 +97,7 @@ def _raw_score_lookup(signals: pd.DataFrame) -> dict[tuple, float]:
         return {}
     if not {"timestamp", "symbol", "score"}.issubset(scores.columns):
         return {}
-    return {
-        (row["timestamp"], row["symbol"]): float(row["score"])
-        for _, row in scores.iterrows()
-    }
+    return scores.set_index(["timestamp", "symbol"])["score"].astype(float).to_dict()
 
 
 def _net_fee(params: BacktestParams) -> float:
@@ -152,7 +150,7 @@ def simulate_lots(
         key = (ts, symbol)
 
         # 1. Process signals at this bar: opposite-signal closes first, then opens.
-        for _, signal in sig_by_bar.get(key, pd.DataFrame()).iterrows():
+        for signal in sig_by_bar.get(key, ()):
             if signal["action"] == "close":
                 lot_id = signal["lot_id"]
                 lot = next((lot for lot in open_lots if lot["lot_id"] == lot_id), None)
@@ -235,7 +233,7 @@ def simulate_lots(
 
 
 def _open_lot(
-    signal: pd.Series,
+    signal: Mapping[str, object],
     close: float,
     slippage: float,
     net_fee: float,
@@ -402,14 +400,12 @@ def _evaluate_exits(
             else False
         )
         if raw_score is None:
-            frame = sig_by_bar.get(key)
-            if frame is not None and not frame.empty:
-                for _, signal in frame.iterrows():
-                    if signal["action"] == "open":
-                        score = float(signal["score"])
-                        if score_confirms_side(score, lot["side"], review_threshold):
-                            confirming = True
-                            break
+            for signal in sig_by_bar.get(key, ()):
+                if signal["action"] == "open":
+                    score = float(signal["score"])
+                    if score_confirms_side(score, lot["side"], review_threshold):
+                        confirming = True
+                        break
         if confirming:
             lot["extended"] = True
             # ponytail: extend the review deadline by extension_hours (1h = 4 bars

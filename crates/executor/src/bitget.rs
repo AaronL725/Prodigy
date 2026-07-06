@@ -173,13 +173,13 @@ impl BitgetRestClient {
                 ],
             )
             .await?;
-        let rows = pending
+        let mut cancelled = 0u32;
+        for row in pending
             .get("data")
             .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        let mut cancelled = 0u32;
-        for row in rows {
+            .into_iter()
+            .flatten()
+        {
             if row.get("symbol").and_then(Value::as_str) != Some(self.cfg.bitget_symbol.as_str()) {
                 continue;
             }

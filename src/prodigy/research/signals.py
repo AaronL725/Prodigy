@@ -43,10 +43,10 @@ def score_to_lot_signals(scores: pd.DataFrame, params: SignalParams) -> pd.DataF
     last_open: dict[str, int] = {}  # direction -> bar idx
     open_notional = 0.0  # sum of notional across currently-open lots
 
-    for bar, frame in scores.reset_index(drop=True).iterrows():
-        symbol = frame["symbol"]
-        score = float(frame["score"])
-        ts = frame["timestamp"]
+    for bar, frame in enumerate(scores.reset_index(drop=True).itertuples(index=False)):
+        symbol = frame.symbol
+        score = float(frame.score)
+        ts = frame.timestamp
 
         # Opposite close: an open LONG closes when score <= -close_threshold;
         # an open SHORT closes when score >= +close_threshold.

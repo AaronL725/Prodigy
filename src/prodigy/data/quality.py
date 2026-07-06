@@ -8,6 +8,11 @@ def _utc_timestamp(value: object) -> pd.Timestamp:
     return ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
 
 
+def _counts_by_day(values: pd.DatetimeIndex) -> dict[str, int]:
+    counts = pd.Series(values.strftime("%Y-%m-%d")).value_counts(sort=False)
+    return {str(day): int(count) for day, count in counts.items()}
+
+
 def quality_summary(
     frame: pd.DataFrame,
     dataset: str,
@@ -31,10 +36,7 @@ def quality_summary(
         expected_count = 0
         if expected is not None:
             expected_count = int(len(expected))
-            expected_per_day = {
-                str(day): int(count)
-                for day, count in pd.Series(expected.strftime("%Y-%m-%d")).value_counts(sort=False).items()
-            }
+            expected_per_day = _counts_by_day(expected)
             missing_per_day = expected_per_day
         summary = {
             "dataset": dataset,
@@ -60,7 +62,7 @@ def quality_summary(
     duplicate_count = int(clean.duplicated(["timestamp", "symbol"]).sum())
     non_monotonic = int((clean["timestamp"].diff() < pd.Timedelta(0)).sum())
     null_values = int(clean.isna().sum().sum())
-    negative_volume = int((clean.get("volume", pd.Series(dtype=float)) < 0).sum())
+    negative_volume = int((clean["volume"] < 0).sum()) if "volume" in clean else 0
     rows_per_day = {
         str(day): int(count)
         for day, count in clean.groupby(clean["timestamp"].dt.strftime("%Y-%m-%d")).size().items()
@@ -81,15 +83,9 @@ def quality_summary(
         actual = pd.DatetimeIndex(clean["timestamp"].drop_duplicates().sort_values())
         missing_index = expected.difference(actual)
         expected_count = int(len(expected))
-        expected_per_day = {
-            str(day): int(count)
-            for day, count in pd.Series(expected.strftime("%Y-%m-%d")).value_counts(sort=False).items()
-        }
+        expected_per_day = _counts_by_day(expected)
         missing = int(len(missing_index))
-        missing_per_day = {
-            str(day): int(count)
-            for day, count in pd.Series(missing_index.strftime("%Y-%m-%d")).value_counts(sort=False).items()
-        }
+        missing_per_day = _counts_by_day(missing_index)
 
     summary = {
         "dataset": dataset,

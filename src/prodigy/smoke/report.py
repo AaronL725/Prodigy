@@ -203,7 +203,7 @@ def write_smoke_report(
     report_dir = Path(report_dir)
     report_dir.mkdir(parents=True, exist_ok=True)
     report_path = report_dir / f"m6-demo-smoke-{_filename_time(ended_at)}.md"
-    report = build_smoke_report(db_path, started_at, ended_at, duration_minutes, list(issues))
+    report = build_smoke_report(db_path, started_at, ended_at, duration_minutes, issues)
     report_path.write_text(report, encoding="utf-8")
 
     with connect(db_path) as conn:
