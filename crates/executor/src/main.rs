@@ -190,6 +190,7 @@ fn read_optional(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prodigy_executor::config::TradingMode;
     use std::collections::HashMap;
 
     // Injected fake demo creds so the parse tests never touch `.env.local` or
@@ -244,6 +245,21 @@ mod tests {
         assert_eq!(parsed.cfg.telegram_bot_token.as_deref(), Some("test-token"));
         assert_eq!(parsed.cfg.telegram_allowed_user_ids, vec!["123", "456"]);
         assert!(parsed.cfg.telegram_chat_id.is_none());
+    }
+
+    #[test]
+    fn ignores_live_key_names_and_loads_demo_credentials_only() {
+        let mut env = fake_env();
+        env.insert("BITGET_LIVE_API_KEY".into(), "live-key".into());
+        env.insert("BITGET_LIVE_API_SECRET".into(), "live-secret".into());
+        env.insert("BITGET_LIVE_API_PASSPHRASE".into(), "live-pass".into());
+
+        let parsed = parse_args_from_env(["prodigy-executor", "--daemon"], &env).unwrap();
+
+        assert_eq!(parsed.cfg.mode, TradingMode::Demo);
+        assert_eq!(parsed.cfg.secrets.api_key, "test-key");
+        assert_eq!(parsed.cfg.secrets.api_secret, "test-secret");
+        assert_eq!(parsed.cfg.secrets.passphrase, "test-pass");
     }
 
     #[test]
