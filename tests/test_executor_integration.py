@@ -371,3 +371,37 @@ def test_m7_live_readiness_scope_scan_targets_dangerous_patterns_only():
     telegram_query = (repo_root / "crates/executor/src/telegram_query.rs").read_text()
     for forbidden in ("BitgetRestClient", "/api/v2", "place-order", "cancel-order"):
         assert forbidden not in telegram_query
+
+    daemon_rs = (repo_root / "crates/executor/src/daemon.rs").read_text()
+    telegram_loop = daemon_rs.split("pub async fn run_telegram_query_loop", 1)[1]
+    telegram_loop = telegram_loop.split("/// Record a `websocket_auth_failed`", 1)[0]
+    for forbidden in ("BitgetRestClient", "/api/v2", "place-order", "cancel-order"):
+        assert forbidden not in telegram_loop
+
+    m75_forbidden = subprocess.run(
+        [
+            "rg",
+            "-n",
+            "tgux:open|tgux:set_param|tgux:model_debug|tgux:shell|tgux:live|remote_shell|model_debug_from_telegram",
+            "src",
+            "crates",
+        ],
+        check=False,
+        text=True,
+        capture_output=True,
+        cwd=repo_root,
+    )
+    assert m75_forbidden.returncode in (0, 1), (
+        m75_forbidden.stdout + m75_forbidden.stderr
+    )
+    m75_production_hits = []
+    for hit in m75_forbidden.stdout.splitlines():
+        path_text, line_text, _ = hit.split(":", 2)
+        path = repo_root / path_text
+        line_no = int(line_text)
+        if path.suffix == ".rs":
+            cfg_test_ranges.setdefault(path, rust_cfg_test_ranges(path))
+            if any(start <= line_no <= end for start, end in cfg_test_ranges[path]):
+                continue
+        m75_production_hits.append(hit)
+    assert not m75_production_hits, "\n".join(m75_production_hits)
