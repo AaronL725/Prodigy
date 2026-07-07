@@ -146,7 +146,7 @@ pub async fn process_pending_control_commands_once(
     market_cache: &mut MarketCache,
 ) -> Result<()> {
     cfg.validate_demo_only()?;
-    let commands = crate::db::pending_control_commands(conn, "demo", "test-instance")?;
+    let commands = crate::db::pending_control_commands(conn, "demo", "")?;
     for command in commands {
         if !crate::db::accept_control_command(conn, &command.command_id)? {
             continue;
@@ -971,7 +971,7 @@ mod tests {
             command: "close_all".to_string(),
             requested_by: "123".to_string(),
             mode: "demo".to_string(),
-            instance_id: Some("test-instance".to_string()),
+            instance_id: None,
         };
 
         let err = apply_close_all(
@@ -1101,8 +1101,8 @@ mod tests {
         let conn = conn();
         conn.execute(
             "insert into control_commands (
-              command_id, created_at, command, status, requested_by, mode, instance_id
-            ) values ('cmd-stop', 'now', 'stop', 'pending', '123', 'demo', 'test-instance')",
+              command_id, created_at, command, status, requested_by
+            ) values ('cmd-stop', 'now', 'stop', 'pending', '123')",
             [],
         )
         .unwrap();
@@ -1136,8 +1136,8 @@ mod tests {
         insert_working_order(&conn);
         conn.execute(
             "insert into control_commands (
-              command_id, created_at, command, status, requested_by, mode, instance_id
-            ) values ('cmd-cancel', 'now', 'cancel_all', 'pending', '123', 'demo', 'test-instance')",
+              command_id, created_at, command, status, requested_by
+            ) values ('cmd-cancel', 'now', 'cancel_all', 'pending', '123')",
             [],
         )
         .unwrap();
@@ -1201,8 +1201,8 @@ mod tests {
         .unwrap();
         conn.execute(
             "insert into control_commands (
-              command_id, created_at, command, status, requested_by, mode, instance_id
-            ) values ('cmd-close', 'now', 'close_all', 'pending', '123', 'demo', 'test-instance')",
+              command_id, created_at, command, status, requested_by
+            ) values ('cmd-close', 'now', 'close_all', 'pending', '123')",
             [],
         )
         .unwrap();
@@ -1249,8 +1249,8 @@ mod tests {
         .unwrap();
         conn.execute(
             "insert into control_commands (
-              command_id, created_at, command, status, requested_by, mode, instance_id
-            ) values ('cmd-close', 'now', 'close_all', 'pending', '123', 'demo', 'test-instance')",
+              command_id, created_at, command, status, requested_by
+            ) values ('cmd-close', 'now', 'close_all', 'pending', '123')",
             [],
         )
         .unwrap();

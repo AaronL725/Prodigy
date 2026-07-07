@@ -62,7 +62,7 @@ pub fn pending_control_commands(
     let mut stmt = conn.prepare(
         "select command_id, command, requested_by, mode, instance_id
          from control_commands
-         where status = 'pending' and mode = ? and instance_id = ?
+         where status = 'pending' and mode = ? and coalesce(instance_id, '') = ?
          order by created_at asc",
     )?;
     let rows = stmt.query_map(params![mode, instance_id], |row| {
@@ -713,14 +713,13 @@ mod tests {
         let conn = memory_db();
         conn.execute(
             "insert into control_commands (
-              command_id, created_at, command, status, requested_by, mode, instance_id
-            ) values ('cmd-1', '2026-07-06T00:00:00Z', 'stop', 'pending', '123',
-              'demo', 'test-instance')",
+              command_id, created_at, command, status, requested_by
+            ) values ('cmd-1', '2026-07-06T00:00:00Z', 'stop', 'pending', '123')",
             [],
         )
         .unwrap();
 
-        let pending = pending_control_commands(&conn, "demo", "test-instance").unwrap();
+        let pending = pending_control_commands(&conn, "demo", "").unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].command, "stop");
         assert!(accept_control_command(&conn, "cmd-1").unwrap());

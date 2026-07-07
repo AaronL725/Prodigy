@@ -1321,9 +1321,8 @@ mod tests {
         let conn = test_conn();
         conn.execute(
             "insert into control_commands (
-              command_id, created_at, command, status, requested_by, mode, instance_id
-            ) values ('cmd-stop', '2026-07-01T00:00:00Z', 'stop', 'pending', '123',
-              'demo', 'test-instance')",
+              command_id, created_at, command, status, requested_by
+            ) values ('cmd-stop', '2026-07-01T00:00:00Z', 'stop', 'pending', '123')",
             [],
         )
         .unwrap();
