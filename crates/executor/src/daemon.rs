@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,6 +29,7 @@ pub async fn run_live_dry_validate(cfg: ExecutorConfig) -> Result<()> {
     if crate::bitget::should_send_paptrading(&cfg) {
         anyhow::bail!("live dry validation would send PAPTRADING");
     }
+    validate_live_dry_no_private_api_boundaries()?;
     println!("live dry validation passed");
     Ok(())
 }
@@ -78,6 +79,171 @@ fn initialize_executor_schema(conn: &rusqlite::Connection) -> Result<()> {
           on fills(order_id, symbol, created_at);
         ",
     )?;
+    Ok(())
+}
+
+fn validate_live_dry_no_private_api_boundaries() -> Result<()> {
+    let conn = rusqlite::Connection::open_in_memory()
+        .context("live dry validation open in-memory safety DB")?;
+    initialize_executor_schema(&conn)
+        .context("live dry validation initialize in-memory safety DB")?;
+
+    crate::db::acquire_active_executor_lock(&conn, "live", "dry-validate", 1_000, 30_000)
+        .context("live dry validation active lock initial acquire")?;
+    if crate::db::acquire_active_executor_lock(&conn, "demo", "other", 2_000, 30_000).is_ok() {
+        anyhow::bail!("live dry validation active lock allowed non-stale second acquire");
+    }
+    crate::db::acquire_active_executor_lock(&conn, "demo", "other", 31_001, 30_000)
+        .context("live dry validation active lock stale takeover")?;
+    if !crate::db::release_active_executor_lock(&conn, "demo", "other")
+        .context("live dry validation active lock release")?
+    {
+        anyhow::bail!("live dry validation active lock release did not clear owner");
+    }
+    for key in [
+        crate::db::ACTIVE_MODE_KEY,
+        crate::db::ACTIVE_INSTANCE_ID_KEY,
+        crate::db::ACTIVE_STARTED_AT_KEY,
+        crate::db::ACTIVE_HEARTBEAT_AT_KEY,
+    ] {
+        if crate::db::get_executor_state(&conn, key)
+            .with_context(|| format!("live dry validation read active lock key {key}"))?
+            .is_some()
+        {
+            anyhow::bail!("live dry validation active lock release left key {key}");
+        }
+    }
+
+    for (key, value) in [
+        (crate::db::ACTIVE_MODE_KEY, "live"),
+        (crate::db::ACTIVE_INSTANCE_ID_KEY, "dry-validate"),
+        (crate::db::ACTIVE_STARTED_AT_KEY, "0"),
+        (crate::db::ACTIVE_HEARTBEAT_AT_KEY, "0"),
+    ] {
+        crate::db::set_executor_state(&conn, key, value)
+            .with_context(|| format!("live dry validation set stale active key {key}"))?;
+    }
+    let allowed = ["123".to_string()];
+    let stale = crate::telegram_query::operator_reply(&conn, "/stop", "123", &allowed, 1_000)
+        .context("live dry validation Telegram stale stop")?
+        .context("live dry validation Telegram stale stop returned no reply")?;
+    if !stale.text.contains("no active executor") {
+        anyhow::bail!("live dry validation Telegram stale target queued control");
+    }
+    let queued: i64 = conn
+        .query_row("select count(*) from control_commands", [], |row| {
+            row.get(0)
+        })
+        .context("live dry validation count stale Telegram controls")?;
+    if queued != 0 {
+        anyhow::bail!("live dry validation Telegram stale target inserted {queued} controls");
+    }
+
+    let fresh_now_ms = crate::bitget::now_ms();
+    for (key, value) in [
+        (crate::db::ACTIVE_MODE_KEY, "live"),
+        (crate::db::ACTIVE_INSTANCE_ID_KEY, "dry-validate"),
+        (crate::db::ACTIVE_STARTED_AT_KEY, fresh_now_ms.as_str()),
+        (crate::db::ACTIVE_HEARTBEAT_AT_KEY, fresh_now_ms.as_str()),
+    ] {
+        crate::db::set_executor_state(&conn, key, value)
+            .with_context(|| format!("live dry validation set fresh active key {key}"))?;
+    }
+    crate::telegram_query::operator_reply(
+        &conn,
+        "/stop",
+        "123",
+        &allowed,
+        fresh_now_ms
+            .parse()
+            .context("live dry validation parse fresh now_ms")?,
+    )
+    .context("live dry validation Telegram fresh stop")?
+    .context("live dry validation Telegram fresh stop returned no reply")?;
+    let pending = crate::db::pending_control_commands(&conn, "live", "dry-validate")
+        .context("live dry validation read bound Telegram control")?;
+    if pending.len() != 1
+        || pending[0].command != "stop"
+        || pending[0].mode != "live"
+        || pending[0].instance_id.as_deref() != Some("dry-validate")
+    {
+        anyhow::bail!("live dry validation Telegram fresh target binding failed");
+    }
+    if !crate::db::pending_control_commands(&conn, "demo", "other")
+        .context("live dry validation read foreign Telegram controls")?
+        .is_empty()
+    {
+        anyhow::bail!("live dry validation Telegram control leaked to foreign target");
+    }
+    crate::db::release_active_executor_lock(&conn, "live", "dry-validate")
+        .context("live dry validation release fresh Telegram target")?;
+
+    let expect_runtime_rejects = |cfg: ExecutorConfig, label: &str, expected: &str| -> Result<()> {
+        match cfg.validate_for_runtime() {
+            Ok(()) => anyhow::bail!("live dry validation runtime gate accepted {label}"),
+            Err(err) if err.to_string().contains(expected) => Ok(()),
+            Err(err) => anyhow::bail!(
+                "live dry validation runtime gate rejected {label} with unexpected error: {err}"
+            ),
+        }
+    };
+
+    expect_runtime_rejects(
+        ExecutorConfig::live_for_tests(),
+        "missing credentials",
+        "missing Bitget live credentials",
+    )?;
+
+    let with_keys = ExecutorConfig {
+        secrets: crate::config::BitgetSecrets {
+            api_key: "key".to_string(),
+            api_secret: "secret".to_string(),
+            passphrase: "pass".to_string(),
+        },
+        ..ExecutorConfig::live_for_tests()
+    };
+    expect_runtime_rejects(
+        with_keys.clone(),
+        "missing live enable",
+        "live trading enable flag is required",
+    )?;
+
+    let enabled = ExecutorConfig {
+        live_safety: crate::config::LiveSafety {
+            enabled: true,
+            confirm_phrase: None,
+        },
+        ..with_keys.clone()
+    };
+    expect_runtime_rejects(
+        enabled,
+        "missing confirmation",
+        "live confirmation phrase is required",
+    )?;
+
+    let wrong_confirm = ExecutorConfig {
+        live_safety: crate::config::LiveSafety {
+            enabled: true,
+            confirm_phrase: Some("wrong".to_string()),
+        },
+        ..with_keys.clone()
+    };
+    expect_runtime_rejects(
+        wrong_confirm,
+        "wrong confirmation",
+        "live confirmation phrase is required",
+    )?;
+
+    ExecutorConfig {
+        live_safety: crate::config::LiveSafety {
+            enabled: true,
+            confirm_phrase: Some(crate::config::LIVE_CONFIRM_PHRASE.to_string()),
+        },
+        ..with_keys
+    }
+    .validate_for_runtime()
+    .context("live dry validation runtime gate rejected exact live confirmation")?;
+
     Ok(())
 }
 
@@ -1330,6 +1496,32 @@ mod tests {
 
         assert!(before_db.contains("cfg.validate_for_runtime()?"));
         assert!(!before_db.contains("cfg.validate_demo_only()?"));
+    }
+
+    #[test]
+    fn live_dry_validate_runs_no_private_api_boundary_self_check() {
+        let source = include_str!("daemon.rs");
+        let start = source.find("pub async fn run_live_dry_validate").unwrap();
+        let end = source.find("fn initialize_executor_schema").unwrap();
+        let run_live_dry_validate = &source[start..end];
+
+        let paptrading = run_live_dry_validate
+            .find("should_send_paptrading")
+            .expect("PAPTRADING check exists");
+        let self_check = run_live_dry_validate
+            .find("validate_live_dry_no_private_api_boundaries")
+            .expect("no-private-API boundary self-check runs");
+        let passed = run_live_dry_validate
+            .find("live dry validation passed")
+            .expect("success print exists");
+
+        assert!(paptrading < self_check);
+        assert!(self_check < passed);
+    }
+
+    #[test]
+    fn live_dry_validate_no_private_api_boundary_self_check_passes() {
+        validate_live_dry_no_private_api_boundaries().unwrap();
     }
 
     #[tokio::test]
