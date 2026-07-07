@@ -35,16 +35,71 @@ pub async fn run_live_dry_validate(cfg: ExecutorConfig) -> Result<()> {
 
 fn initialize_executor_schema(conn: &rusqlite::Connection) -> Result<()> {
     conn.execute_batch(include_str!("../../../schema/001_initial.sql"))?;
-    let has_executor_state: bool = conn.query_row(
-        "select exists(
-           select 1 from sqlite_master
-           where type = 'table' and name = 'executor_state'
-         )",
-        [],
-        |row| row.get(0),
+    for (table, column, definition) in [
+        (
+            "control_commands",
+            "mode",
+            "mode text not null default 'demo'",
+        ),
+        ("control_commands", "instance_id", "instance_id text"),
+        ("orders", "exchange_order_id", "exchange_order_id text"),
+        ("orders", "attempt", "attempt integer not null default 1"),
+        ("orders", "raw_json", "raw_json text not null default '{}'"),
+        ("orders", "last_error", "last_error text"),
+        ("fills", "trade_id", "trade_id text"),
+        ("fills", "client_oid", "client_oid text"),
+        ("fills", "raw_json", "raw_json text not null default '{}'"),
+        (
+            "positions",
+            "ownership",
+            "ownership text not null default 'system' check (ownership in ('system', 'imported'))",
+        ),
+        ("positions", "opened_at", "opened_at text"),
+        ("positions", "adopted_at", "adopted_at text"),
+        ("positions", "source_intent_id", "source_intent_id text"),
+        (
+            "positions",
+            "raw_json",
+            "raw_json text not null default '{}'",
+        ),
+    ] {
+        add_column_if_missing(conn, table, column, definition)?;
+    }
+    conn.execute_batch(
+        "
+        create table if not exists executor_state (
+          key text primary key,
+          value text not null,
+          updated_at text not null
+        );
+        create index if not exists idx_orders_intent_status
+          on orders(intent_id, status, updated_at);
+        create index if not exists idx_fills_order_symbol
+          on fills(order_id, symbol, created_at);
+        ",
     )?;
-    if !has_executor_state {
-        conn.execute_batch(include_str!("../../../schema/002_execution.sql"))?;
+    Ok(())
+}
+
+fn column_exists(conn: &rusqlite::Connection, table: &str, column: &str) -> Result<bool> {
+    let mut stmt = conn.prepare(&format!("pragma table_info({table})"))?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        if row.get::<_, String>(1)? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn add_column_if_missing(
+    conn: &rusqlite::Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> Result<()> {
+    if !column_exists(conn, table, column)? {
+        conn.execute(&format!("alter table {table} add column {definition}"), [])?;
     }
     Ok(())
 }
@@ -1251,6 +1306,47 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn live_dry_validate_handles_partial_execution_schema_without_active_lock() {
+        let db_path = temp_db_path("live-dry-validate-partial-schema");
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(include_str!("../../../schema/001_initial.sql"))
+                .unwrap();
+            conn.execute("alter table orders add column exchange_order_id text", [])
+                .unwrap();
+        }
+
+        let cfg = ExecutorConfig {
+            db_path: db_path.clone(),
+            ..ExecutorConfig::live_for_tests()
+        };
+        run_live_dry_validate(cfg).await.unwrap();
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        assert_eq!(
+            crate::db::get_executor_state(&conn, crate::db::ACTIVE_MODE_KEY).unwrap(),
+            None
+        );
+        assert_eq!(
+            crate::db::get_executor_state(&conn, crate::db::ACTIVE_INSTANCE_ID_KEY).unwrap(),
+            None
+        );
+        let has_executor_state: bool = conn
+            .query_row(
+                "select exists(
+                   select 1 from sqlite_master
+                   where type = 'table' and name = 'executor_state'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(has_executor_state);
+
+        let _ = std::fs::remove_file(&db_path);
+    }
+
     #[test]
     fn daemon_options_default_runs_forever() {
         let options = DaemonOptions::default();
@@ -1261,13 +1357,18 @@ mod tests {
     #[test]
     fn live_clean_state_gate_appears_before_private_exchange_calls() {
         let source = include_str!("daemon.rs");
-        let clean_state = source
+        let start = source.find("pub async fn run_daemon").unwrap();
+        let end = source.find("fn new_instance_id").unwrap();
+        let run_daemon = &source[start..end];
+        let clean_state = run_daemon
             .find("live_startup_clean_state")
             .expect("clean-state gate exists");
-        let rest_new = source
+        let rest_new = run_daemon
             .find("BitgetRestClient::new")
             .expect("REST client exists");
-        let set_leverage = source.find("set_leverage").expect("set leverage exists");
+        let set_leverage = run_daemon
+            .find("set_leverage")
+            .expect("set leverage exists");
 
         assert!(
             clean_state < rest_new,
