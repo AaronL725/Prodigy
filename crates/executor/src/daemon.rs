@@ -3,7 +3,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::config::ExecutorConfig;
+use crate::config::{ExecutorConfig, TradingMode};
+
+const LIVE_STARTUP_INSTANCE_ID: &str = "live-startup";
 
 #[derive(Debug, Clone, Default)]
 pub struct DaemonOptions {
@@ -93,6 +95,9 @@ pub async fn run_daemon(cfg: ExecutorConfig, options: DaemonOptions) -> Result<(
         )?;
     }
     conn.busy_timeout(Duration::from_secs(5))?;
+    if cfg.mode == TradingMode::Live {
+        crate::db::live_startup_clean_state(&conn, "live", LIVE_STARTUP_INSTANCE_ID)?;
+    }
     let rest = crate::bitget::BitgetRestClient::new(cfg.clone())?;
 
     if cfg.test_reset_demo_state {
@@ -1074,6 +1079,27 @@ mod tests {
         let options = DaemonOptions::default();
 
         assert!(options.max_runtime.is_none());
+    }
+
+    #[test]
+    fn live_clean_state_gate_appears_before_private_exchange_calls() {
+        let source = include_str!("daemon.rs");
+        let clean_state = source
+            .find("live_startup_clean_state")
+            .expect("clean-state gate exists");
+        let rest_new = source
+            .find("BitgetRestClient::new")
+            .expect("REST client exists");
+        let set_leverage = source.find("set_leverage").expect("set leverage exists");
+
+        assert!(
+            clean_state < rest_new,
+            "clean-state gate must precede REST client creation"
+        );
+        assert!(
+            clean_state < set_leverage,
+            "clean-state gate must precede set-leverage"
+        );
     }
 
     #[test]

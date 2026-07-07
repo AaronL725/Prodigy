@@ -6,12 +6,14 @@ use crate::bitget::{
     verify_private_ws_connects, verify_public_ws_connects, BitgetRestClient, CancelOrderRequest,
     PlaceOrderRequest,
 };
-use crate::config::ExecutorConfig;
+use crate::config::{ExecutorConfig, TradingMode};
 use crate::db;
 use crate::reconcile::reconcile_once;
 use crate::risk::{check_intent, AccountRiskSnapshot, RiskParams};
 use crate::state::{ExecutionCommand, ExecutionPolicy, IntentExecution};
 use crate::types::{MarketUpdate, OrderRecord, TradeIntent};
+
+const LIVE_STARTUP_INSTANCE_ID: &str = "live-startup";
 
 #[derive(Debug, Clone, Default)]
 pub struct MarketCache {
@@ -325,6 +327,9 @@ pub async fn run_once_or_loop(cfg: ExecutorConfig) -> Result<()> {
     cfg.validate_demo_only()?;
     let conn = Connection::open(&cfg.db_path)?;
     conn.busy_timeout(Duration::from_secs(5))?;
+    if cfg.mode == TradingMode::Live {
+        db::live_startup_clean_state(&conn, "live", LIVE_STARTUP_INSTANCE_ID)?;
+    }
     let rest = BitgetRestClient::new(cfg.clone())?;
 
     if cfg.test_reset_demo_state {

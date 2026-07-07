@@ -78,6 +78,51 @@ pub fn pending_control_commands(
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
+pub fn live_startup_clean_state(conn: &Connection, mode: &str, instance_id: &str) -> Result<()> {
+    let pending_intents: i64 = conn.query_row(
+        "select count(*) from trade_intents where status in ('pending', 'accepted')",
+        [],
+        |r| r.get(0),
+    )?;
+    if pending_intents > 0 {
+        anyhow::bail!("live startup blocked: {pending_intents} pending trade intents");
+    }
+
+    let foreign_controls: i64 = conn.query_row(
+        "select count(*) from control_commands
+         where status in ('pending', 'accepted')
+           and (mode != ?1 or coalesce(instance_id, '') != ?2)",
+        params![mode, instance_id],
+        |r| r.get(0),
+    )?;
+    if foreign_controls > 0 {
+        anyhow::bail!(
+            "live startup blocked: {foreign_controls} pending control commands for other mode/instance"
+        );
+    }
+
+    let working_orders: i64 = conn.query_row(
+        "select count(*) from orders
+         where intent_id is not null and status in ('submitted', 'live')",
+        [],
+        |r| r.get(0),
+    )?;
+    if working_orders > 0 {
+        anyhow::bail!("live startup blocked: {working_orders} working system orders");
+    }
+
+    let system_positions: i64 = conn.query_row(
+        "select count(*) from positions where ownership = 'system'",
+        [],
+        |r| r.get(0),
+    )?;
+    if system_positions > 0 {
+        anyhow::bail!("live startup blocked: {system_positions} system positions");
+    }
+
+    Ok(())
+}
+
 pub fn accept_control_command(conn: &Connection, command_id: &str) -> Result<bool> {
     let rows = conn.execute(
         "update control_commands
@@ -762,6 +807,42 @@ mod tests {
         conn.execute_batch(include_str!("../../../schema/002_execution.sql"))
             .unwrap();
         conn
+    }
+
+    #[test]
+    fn live_clean_state_rejects_pending_intents_working_orders_and_positions() {
+        let conn = memory_db();
+        assert!(live_startup_clean_state(&conn, "live", "inst-live").is_ok());
+
+        conn.execute(
+            "insert into trade_intents (
+              intent_id, created_at, symbol, side, action, target_notional,
+              max_order_notional, status, source
+            ) values ('i1', '2026-07-07T00:00:00Z', 'ETHUSDT', 'long', 'open', 1, 1, 'pending', 'test')",
+            [],
+        )
+        .unwrap();
+        assert!(live_startup_clean_state(&conn, "live", "inst-live")
+            .unwrap_err()
+            .to_string()
+            .contains("pending trade intents"));
+    }
+
+    #[test]
+    fn live_clean_state_rejects_other_instance_pending_controls() {
+        let conn = memory_db();
+        conn.execute(
+            "insert into control_commands (
+              command_id, created_at, command, status, requested_by, mode, instance_id
+            ) values ('c1', '2026-07-07T00:00:00Z', 'stop', 'pending', '123', 'demo', 'inst-demo')",
+            [],
+        )
+        .unwrap();
+
+        assert!(live_startup_clean_state(&conn, "live", "inst-live")
+            .unwrap_err()
+            .to_string()
+            .contains("pending control commands"));
     }
 
     #[test]
