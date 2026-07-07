@@ -50,7 +50,7 @@ pub fn signed_headers(
     path: &str,
     body: &str,
 ) -> Result<HashMap<String, String>> {
-    cfg.validate_demo_only()?;
+    cfg.validate_for_runtime()?;
     let mut headers = HashMap::new();
     headers.insert("ACCESS-KEY".to_string(), cfg.secrets.api_key.clone());
     headers.insert(
@@ -64,7 +64,9 @@ pub fn signed_headers(
     headers.insert("ACCESS-TIMESTAMP".to_string(), timestamp.to_string());
     headers.insert("locale".to_string(), "en-US".to_string());
     headers.insert("Content-Type".to_string(), "application/json".to_string());
-    headers.insert("PAPTRADING".to_string(), "1".to_string());
+    if cfg.mode == crate::config::TradingMode::Demo {
+        headers.insert("PAPTRADING".to_string(), "1".to_string());
+    }
     Ok(headers)
 }
 
@@ -86,7 +88,7 @@ pub struct BitgetRestClient {
 
 impl BitgetRestClient {
     pub fn new(cfg: ExecutorConfig) -> Result<Self> {
-        cfg.validate_demo_only()?;
+        cfg.validate_for_runtime()?;
         Ok(Self {
             cfg,
             client: reqwest::Client::builder()
@@ -834,12 +836,28 @@ mod tests {
     }
 
     #[test]
-    fn demo_rest_headers_include_paptrading() {
-        let cfg = crate::config::ExecutorConfig::demo_for_tests();
-        let headers = signed_headers(&cfg, "1", "GET", "/api/v2/mix/account/account", "").unwrap();
+    fn signed_headers_include_paptrading_only_for_demo() {
+        let demo = ExecutorConfig::demo_for_tests();
+        let demo_headers =
+            signed_headers(&demo, "1", "GET", "/api/v2/mix/account/account", "").unwrap();
+        assert_eq!(demo_headers.get("PAPTRADING").map(String::as_str), Some("1"));
 
-        assert_eq!(headers.get("PAPTRADING").unwrap(), "1");
-        assert_eq!(headers.get("ACCESS-KEY").unwrap(), "key");
+        let live = ExecutorConfig {
+            secrets: crate::config::BitgetSecrets {
+                api_key: "live-key".to_string(),
+                api_secret: "live-secret".to_string(),
+                passphrase: "live-pass".to_string(),
+            },
+            live_safety: crate::config::LiveSafety {
+                enabled: true,
+                confirm_phrase: Some(crate::config::LIVE_CONFIRM_PHRASE.to_string()),
+            },
+            ..ExecutorConfig::live_for_tests()
+        };
+        let live_headers =
+            signed_headers(&live, "1", "GET", "/api/v2/mix/account/account", "").unwrap();
+        assert!(!live_headers.contains_key("PAPTRADING"));
+        assert_eq!(live_headers.get("ACCESS-KEY").map(String::as_str), Some("live-key"));
     }
 
     #[test]
