@@ -101,6 +101,9 @@ pub async fn run_daemon(cfg: ExecutorConfig, options: DaemonOptions) -> Result<(
         now_ms_i64(),
         30_000,
     )?;
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let mut active_lock_heartbeat_task =
+        spawn_active_lock_heartbeat(&cfg, &instance_id, shutdown_rx.clone());
     if cfg.mode == TradingMode::Live {
         crate::db::live_startup_clean_state(&conn, cfg.mode.as_str(), &instance_id)?;
     }
@@ -140,7 +143,6 @@ pub async fn run_daemon(cfg: ExecutorConfig, options: DaemonOptions) -> Result<(
     let market_cache = Arc::new(tokio::sync::Mutex::new(
         crate::executor::MarketCache::default(),
     ));
-    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
     // Cross-task signal: a WS (re)connect sets it, the main loop consumes it on
     // each tick to run a REST reconcile immediately (spec: reconcile after WS
@@ -271,6 +273,14 @@ pub async fn run_daemon(cfg: ExecutorConfig, options: DaemonOptions) -> Result<(
     // abort() is the hard fallback so the process still exits within the
     // bounded test runtime if a task is stuck mid-await on a socket read.
     let _ = shutdown_tx.send(true);
+    if tokio::time::timeout(Duration::from_millis(200), &mut active_lock_heartbeat_task)
+        .await
+        .is_err()
+    {
+        active_lock_heartbeat_task.abort();
+        let _ =
+            tokio::time::timeout(Duration::from_millis(50), &mut active_lock_heartbeat_task).await;
+    }
     let _ = tokio::time::timeout(
         Duration::from_millis(200),
         futures_util::future::join3(&mut public_task, &mut private_task, &mut telegram_task),
@@ -299,6 +309,69 @@ fn release_lock_on_shutdown(
 ) -> Result<()> {
     crate::db::release_active_executor_lock(conn, cfg.mode.as_str(), instance_id)?;
     Ok(())
+}
+
+fn active_lock_heartbeat_interval() -> Duration {
+    Duration::from_secs(5)
+}
+
+fn spawn_active_lock_heartbeat(
+    cfg: &ExecutorConfig,
+    instance_id: &str,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    let db_path = cfg.db_path.clone();
+    let mode = cfg.mode.as_str().to_string();
+    let instance_id = instance_id.to_string();
+    tokio::spawn(async move {
+        if let Err(err) = active_lock_heartbeat_loop(
+            db_path,
+            mode,
+            instance_id,
+            shutdown,
+            active_lock_heartbeat_interval(),
+        )
+        .await
+        {
+            eprintln!("active lock heartbeat stopped: {err}");
+        }
+    })
+}
+
+async fn active_lock_heartbeat_loop(
+    db_path: std::path::PathBuf,
+    mode: String,
+    instance_id: String,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    interval: Duration,
+) -> Result<()> {
+    let conn = rusqlite::Connection::open(db_path)?;
+    conn.busy_timeout(Duration::from_secs(5))?;
+    let mut shutdown = shutdown;
+    loop {
+        if *shutdown.borrow() {
+            return Ok(());
+        }
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return Ok(());
+                }
+            }
+            _ = tokio::time::sleep(interval) => {
+                match crate::db::heartbeat_active_executor_lock(
+                    &conn,
+                    &mode,
+                    &instance_id,
+                    now_ms_i64(),
+                ) {
+                    Ok(true) => {}
+                    Ok(false) => anyhow::bail!("active executor lock lost for {instance_id}"),
+                    Err(err) => eprintln!("active lock heartbeat failed: {err}"),
+                }
+            }
+        }
+    }
 }
 
 async fn process_daemon_queues_once(
@@ -1089,6 +1162,17 @@ mod tests {
         conn
     }
 
+    fn temp_db_path(name: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "prodigy-test-{name}-{}-{nanos}.sqlite",
+            std::process::id()
+        ))
+    }
+
     fn insert_pending_open_intent(conn: &rusqlite::Connection, intent_id: &str) {
         conn.execute(
             "insert into trade_intents (
@@ -1160,6 +1244,63 @@ mod tests {
             crate::db::get_executor_state(&conn, crate::db::ACTIVE_INSTANCE_ID_KEY).unwrap(),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn active_lock_background_heartbeat_refreshes_during_long_tick() {
+        let db_path = temp_db_path("active-heartbeat");
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(include_str!("../../../schema/001_initial.sql"))
+                .unwrap();
+            conn.execute_batch(include_str!("../../../schema/002_execution.sql"))
+                .unwrap();
+            crate::db::acquire_active_executor_lock(&conn, "demo", "inst-demo", 1_000, 30_000)
+                .unwrap();
+        }
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let mut task = tokio::spawn(active_lock_heartbeat_loop(
+            db_path.clone(),
+            "demo".to_string(),
+            "inst-demo".to_string(),
+            shutdown_rx,
+            Duration::from_millis(10),
+        ));
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        assert_ne!(
+            crate::db::get_executor_state(&conn, crate::db::ACTIVE_HEARTBEAT_AT_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("1000")
+        );
+
+        let _ = shutdown_tx.send(true);
+        tokio::time::timeout(Duration::from_millis(100), &mut task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn active_lock_heartbeat_starts_before_rest_client() {
+        let source = include_str!("daemon.rs");
+        let acquire = source
+            .find("acquire_active_executor_lock")
+            .expect("active lock acquisition exists");
+        let heartbeat_spawn = source
+            .find("spawn_active_lock_heartbeat(&cfg, &instance_id")
+            .expect("active lock heartbeat task is spawned");
+        let rest_new = source
+            .find("BitgetRestClient::new")
+            .expect("REST client exists");
+
+        assert!(acquire < heartbeat_spawn);
+        assert!(heartbeat_spawn < rest_new);
     }
 
     #[test]
