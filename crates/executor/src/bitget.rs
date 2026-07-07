@@ -741,7 +741,7 @@ pub fn public_ws_message_confirms_subscription(text: &str, cfg: &ExecutorConfig)
 }
 
 pub async fn verify_public_ws_connects(cfg: &ExecutorConfig) -> Result<()> {
-    cfg.validate_demo_only()?;
+    cfg.validate_for_runtime()?;
     let (mut socket, _) = tokio_tungstenite::connect_async(&cfg.public_ws_url).await?;
     use futures_util::{SinkExt, StreamExt};
     let msg = public_books5_subscribe_message(cfg);
@@ -767,7 +767,7 @@ pub async fn verify_public_ws_connects(cfg: &ExecutorConfig) -> Result<()> {
 }
 
 pub async fn verify_private_ws_connects(cfg: &ExecutorConfig) -> Result<()> {
-    cfg.validate_demo_only()?;
+    cfg.validate_for_runtime()?;
     let (mut socket, _) = tokio_tungstenite::connect_async(&cfg.private_ws_url).await?;
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;
@@ -837,6 +837,22 @@ mod tests {
         let sig = websocket_sign("secret", "1538054050");
 
         assert_eq!(sig, "QW9NDIxQTfljkfSeZydUIsfx+5D1GgkIbDzvrCplpp4=");
+    }
+
+    #[test]
+    fn websocket_verify_functions_use_runtime_validation() {
+        let source = include_str!("bitget.rs");
+        for function in [
+            "pub async fn verify_public_ws_connects",
+            "pub async fn verify_private_ws_connects",
+        ] {
+            let start = source.find(function).unwrap();
+            let tail = &source[start..];
+            let body = &tail[..tail.find("tokio_tungstenite::connect_async").unwrap()];
+
+            assert!(body.contains("cfg.validate_for_runtime()?"));
+            assert!(!body.contains("cfg.validate_demo_only()?"));
+        }
     }
 
     #[test]

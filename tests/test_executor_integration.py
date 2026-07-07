@@ -200,10 +200,10 @@ def test_rust_demo_daemon_processes_pending_intent_once(tmp_path):
     assert "daemon" in result.stdout or result.stderr == ""
 
 
-def test_rust_daemon_live_mode_requires_credentials_and_enable(tmp_path):
+def test_live_daemon_without_keys_fails_before_private_calls(tmp_path):
     db_path = tmp_path / "prodigy.sqlite"
     live_env = {
-        **os.environ,
+        **_cargo_env_without_exchange_keys(),
         "BITGET_LIVE_API_KEY": "",
         "BITGET_LIVE_API_SECRET": "",
         "BITGET_LIVE_API_PASSPHRASE": "",
@@ -233,14 +233,20 @@ def test_rust_daemon_live_mode_requires_credentials_and_enable(tmp_path):
 
     assert missing_creds.returncode != 0
     assert "BITGET_LIVE_API_KEY" in missing_creds.stderr
+    assert not db_path.exists()
 
-    live_env.update(
-        {
-            "BITGET_LIVE_API_KEY": "live-key",
-            "BITGET_LIVE_API_SECRET": "live-secret",
-            "BITGET_LIVE_API_PASSPHRASE": "live-pass",
-        }
-    )
+
+def test_live_daemon_with_fake_keys_missing_enable_fails_before_private_calls(tmp_path):
+    db_path = tmp_path / "prodigy.sqlite"
+    live_env = {
+        **_cargo_env_without_exchange_keys(),
+        "BITGET_LIVE_API_KEY": "live-key",
+        "BITGET_LIVE_API_SECRET": "live-secret",
+        "BITGET_LIVE_API_PASSPHRASE": "live-pass",
+        "PRODIGY_LIVE_TRADING_ENABLED": "",
+        "PRODIGY_LIVE_CONFIRM": "",
+    }
+
     missing_enable = subprocess.run(
         [
             "cargo",
@@ -263,6 +269,59 @@ def test_rust_daemon_live_mode_requires_credentials_and_enable(tmp_path):
 
     assert missing_enable.returncode != 0
     assert "live trading enable flag is required" in missing_enable.stderr
+    assert not db_path.exists()
+
+
+def test_live_daemon_with_pending_intent_fails_clean_state_before_private_calls(tmp_path):
+    db_path = tmp_path / "prodigy.sqlite"
+    with connect(db_path) as conn:
+        init_db(conn)
+        write_trade_intent(
+            conn,
+            TradeIntent(
+                intent_id="live-pending-1",
+                created_at="2026-07-05T00:00:00Z",
+                symbol="ETH/USDT:USDT",
+                side="long",
+                action="open",
+                target_notional=100.0,
+                max_order_notional=100.0,
+                source="test",
+                reason="live startup gate",
+                model_version="smoke-test",
+            ),
+        )
+
+    result = subprocess.run(
+        [
+            "cargo",
+            "run",
+            "-q",
+            "-p",
+            "prodigy-executor",
+            "--",
+            "--db",
+            str(db_path),
+            "--daemon",
+            "--mode",
+            "live",
+        ],
+        check=False,
+        text=True,
+        capture_output=True,
+        env={
+            **_cargo_env_without_exchange_keys(),
+            "BITGET_LIVE_API_KEY": "live-key",
+            "BITGET_LIVE_API_SECRET": "live-secret",
+            "BITGET_LIVE_API_PASSPHRASE": "live-pass",
+            "PRODIGY_LIVE_TRADING_ENABLED": "1",
+            "PRODIGY_LIVE_CONFIRM": "I_UNDERSTAND_THIS_CAN_TRADE_REAL_MONEY",
+        },
+    )
+
+    assert result.returncode != 0
+    assert "live startup blocked: 1 pending trade intents" in result.stderr
+    assert "prodigy executor only supports Bitget demo mode" not in result.stderr
 
 
 def test_live_dry_validate_needs_no_keys_and_leaves_no_active_executor(tmp_path):

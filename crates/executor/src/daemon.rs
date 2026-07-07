@@ -152,7 +152,7 @@ impl PrivateStateReady {
 }
 
 pub async fn run_daemon(cfg: ExecutorConfig, options: DaemonOptions) -> Result<()> {
-    cfg.validate_demo_only()?;
+    cfg.validate_for_runtime()?;
     let conn = rusqlite::Connection::open(&cfg.db_path)?;
     // ponytail: WAL persists in the DB file header (idempotent; matches src/prodigy/db.py).
     // M6 has Python writing intents, the daemon R/W, the private WS writing, and Telegram
@@ -604,7 +604,7 @@ pub fn apply_private_ws_update(
 /// Long-running public-WS loop: connect, subscribe books5 for the configured
 /// symbol, parse every incoming books5 message and refresh the shared market
 /// cache with a LOCAL timestamp. Disconnects (or shutdown) reset the loop.
-/// Spawned by `run_daemon`; demo-only invariant enforced at entry.
+/// Spawned by `run_daemon`; runtime config invariant enforced at entry.
 pub async fn run_public_ws_loop(
     cfg: ExecutorConfig,
     market_cache: Arc<tokio::sync::Mutex<crate::executor::MarketCache>>,
@@ -614,7 +614,7 @@ pub async fn run_public_ws_loop(
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;
 
-    cfg.validate_demo_only()?;
+    cfg.validate_for_runtime()?;
     let mut shutdown = shutdown;
     loop {
         if *shutdown.borrow() {
@@ -978,7 +978,7 @@ async fn emit_websocket_auth_failed(cfg: &ExecutorConfig, detail: &str) {
 /// positions to SQLite via `apply_private_ws_update`. A parse error or a SQLite
 /// apply error is logged and the loop continues — the daemon must not crash on a
 /// bad update. Disconnects (or shutdown) reset the loop. Spawned by `run_daemon`
-/// (Task 7 wires it); demo-only invariant enforced at entry.
+/// (Task 7 wires it); runtime config invariant enforced at entry.
 pub async fn run_private_ws_loop(
     cfg: ExecutorConfig,
     shutdown: tokio::sync::watch::Receiver<bool>,
@@ -988,7 +988,7 @@ pub async fn run_private_ws_loop(
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;
 
-    cfg.validate_demo_only()?;
+    cfg.validate_for_runtime()?;
     let mut shutdown = shutdown;
     loop {
         if *shutdown.borrow() {
@@ -1276,6 +1276,18 @@ mod tests {
         .unwrap()
     }
 
+    #[test]
+    fn run_daemon_uses_runtime_validation() {
+        let source = include_str!("daemon.rs");
+        let start = source.find("pub async fn run_daemon").unwrap();
+        let end = source.find("fn new_instance_id").unwrap();
+        let run_daemon = &source[start..end];
+        let before_db = &run_daemon[..run_daemon.find("Connection::open").unwrap()];
+
+        assert!(before_db.contains("cfg.validate_for_runtime()?"));
+        assert!(!before_db.contains("cfg.validate_demo_only()?"));
+    }
+
     #[tokio::test]
     async fn live_dry_validate_leaves_no_active_lock() {
         let db_path = temp_db_path("live-dry-validate-lock");
@@ -1369,6 +1381,12 @@ mod tests {
         let set_leverage = run_daemon
             .find("set_leverage")
             .expect("set leverage exists");
+        let reconcile = run_daemon
+            .find("reconcile_once")
+            .expect("startup reconcile exists");
+        let private_ws = run_daemon
+            .find("run_private_ws_loop")
+            .expect("private websocket loop exists");
 
         assert!(
             clean_state < rest_new,
@@ -1377,6 +1395,14 @@ mod tests {
         assert!(
             clean_state < set_leverage,
             "clean-state gate must precede set-leverage"
+        );
+        assert!(
+            clean_state < reconcile,
+            "clean-state gate must precede startup reconcile"
+        );
+        assert!(
+            clean_state < private_ws,
+            "clean-state gate must precede private websocket login"
         );
     }
 
@@ -1680,10 +1706,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn daemon_rejects_non_demo_mode_before_opening_db() {
+    async fn daemon_runtime_validation_happens_before_opening_db() {
+        let db_path = temp_db_path("daemon-runtime-validation");
         let cfg = ExecutorConfig {
-            mode: TradingMode::Live,
-            ..ExecutorConfig::demo_for_tests()
+            db_path: db_path.clone(),
+            ..ExecutorConfig::live_for_tests()
         };
 
         let err = run_daemon(
@@ -1695,7 +1722,8 @@ mod tests {
         .await
         .unwrap_err();
 
-        assert!(err.to_string().contains("demo"));
+        assert!(err.to_string().contains("missing Bitget live credentials"));
+        assert!(!db_path.exists());
     }
 
     #[tokio::test]

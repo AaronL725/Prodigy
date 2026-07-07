@@ -324,7 +324,7 @@ pub async fn process_pending_intents_once(
 }
 
 pub async fn run_once_or_loop(cfg: ExecutorConfig) -> Result<()> {
-    cfg.validate_demo_only()?;
+    cfg.validate_for_runtime()?;
     let conn = Connection::open(&cfg.db_path)?;
     conn.busy_timeout(Duration::from_secs(5))?;
     if cfg.mode == TradingMode::Live {
@@ -1989,6 +1989,41 @@ mod tests {
             }
         });
         format!("http://{addr}")
+    }
+
+    #[test]
+    fn run_once_or_loop_uses_runtime_validation() {
+        let source = include_str!("executor.rs");
+        let start = source.find("pub async fn run_once_or_loop").unwrap();
+        let end = source.find("/// Fetch real account equity").unwrap();
+        let run_once = &source[start..end];
+        let before_db = &run_once[..run_once.find("Connection::open").unwrap()];
+
+        assert!(before_db.contains("cfg.validate_for_runtime()?"));
+        assert!(!before_db.contains("cfg.validate_demo_only()?"));
+    }
+
+    #[test]
+    fn run_once_live_clean_state_precedes_private_exchange_calls() {
+        let source = include_str!("executor.rs");
+        let start = source.find("pub async fn run_once_or_loop").unwrap();
+        let end = source.find("/// Fetch real account equity").unwrap();
+        let run_once = &source[start..end];
+        let clean_state = run_once
+            .find("live_startup_clean_state")
+            .expect("clean-state gate exists");
+
+        for call in [
+            "BitgetRestClient::new",
+            "verify_private_ws_connects",
+            "set_leverage",
+            "reconcile_once",
+        ] {
+            let pos = run_once
+                .find(call)
+                .unwrap_or_else(|| panic!("{call} exists"));
+            assert!(clean_state < pos, "clean-state gate must precede {call}");
+        }
     }
 
     #[test]
