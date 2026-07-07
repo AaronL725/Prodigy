@@ -322,6 +322,22 @@ def test_live_daemon_with_pending_intent_fails_clean_state_before_private_calls(
     assert result.returncode != 0
     assert "live startup blocked: 1 pending trade intents" in result.stderr
     assert "prodigy executor only supports Bitget demo mode" not in result.stderr
+    with connect(db_path) as conn:
+        active_keys = {
+            row["key"]
+            for row in conn.execute(
+                """
+                select key from executor_state
+                where key in (
+                  'active_mode',
+                  'active_instance_id',
+                  'active_started_at',
+                  'active_heartbeat_at'
+                )
+                """
+            ).fetchall()
+        }
+    assert active_keys == set()
 
 
 def test_live_dry_validate_needs_no_keys_and_leaves_no_active_executor(tmp_path):

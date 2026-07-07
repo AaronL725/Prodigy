@@ -173,6 +173,9 @@ pub async fn run_daemon(cfg: ExecutorConfig, options: DaemonOptions) -> Result<(
     }
     conn.busy_timeout(Duration::from_secs(5))?;
     let instance_id = new_instance_id(&conn)?;
+    if cfg.mode == TradingMode::Live {
+        crate::db::live_startup_clean_state(&conn, cfg.mode.as_str(), &instance_id)?;
+    }
     crate::db::acquire_active_executor_lock(
         &conn,
         cfg.mode.as_str(),
@@ -183,9 +186,6 @@ pub async fn run_daemon(cfg: ExecutorConfig, options: DaemonOptions) -> Result<(
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let mut active_lock_heartbeat_task =
         spawn_active_lock_heartbeat(&cfg, &instance_id, shutdown_rx.clone());
-    if cfg.mode == TradingMode::Live {
-        crate::db::live_startup_clean_state(&conn, cfg.mode.as_str(), &instance_id)?;
-    }
     let rest = crate::bitget::BitgetRestClient::new(cfg.clone())?;
 
     if cfg.test_reset_demo_state {
@@ -1375,6 +1375,12 @@ mod tests {
         let clean_state = run_daemon
             .find("live_startup_clean_state")
             .expect("clean-state gate exists");
+        let active_lock = run_daemon
+            .find("acquire_active_executor_lock")
+            .expect("active lock exists");
+        let heartbeat = run_daemon
+            .find("spawn_active_lock_heartbeat")
+            .expect("active lock heartbeat exists");
         let rest_new = run_daemon
             .find("BitgetRestClient::new")
             .expect("REST client exists");
@@ -1388,6 +1394,14 @@ mod tests {
             .find("run_private_ws_loop")
             .expect("private websocket loop exists");
 
+        assert!(
+            clean_state < active_lock,
+            "clean-state gate must precede active lock acquisition"
+        );
+        assert!(
+            clean_state < heartbeat,
+            "clean-state gate must precede active lock heartbeat"
+        );
         assert!(
             clean_state < rest_new,
             "clean-state gate must precede REST client creation"
