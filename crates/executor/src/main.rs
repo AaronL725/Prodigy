@@ -148,6 +148,9 @@ where
     if dry_validate && cfg.mode != TradingMode::Live {
         bail!("--dry-validate requires --mode live");
     }
+    if cfg.mode == TradingMode::Live && cfg.test_reset_demo_state {
+        bail!("test reset demo state is only supported in demo mode (--test-reset-demo-state)");
+    }
 
     cfg.secrets = match cfg.mode {
         TradingMode::Demo => BitgetSecrets {
@@ -319,6 +322,44 @@ mod tests {
         assert_eq!(parsed.cfg.mode, TradingMode::Live);
         assert_eq!(parsed.cfg.secrets.api_key, "live-key");
         assert!(parsed.cfg.live_safety.enabled);
+    }
+
+    #[test]
+    fn rejects_live_mode_with_test_reset_demo_state() {
+        let mut env = fake_env();
+        env.insert("BITGET_LIVE_API_KEY".into(), "live-key".into());
+        env.insert("BITGET_LIVE_API_SECRET".into(), "live-secret".into());
+        env.insert("BITGET_LIVE_API_PASSPHRASE".into(), "live-pass".into());
+
+        let err = parse_args_from_env(
+            [
+                "prodigy-executor",
+                "--test-reset-demo-state",
+                "--mode",
+                "live",
+            ],
+            &env,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("--test-reset-demo-state"));
+    }
+
+    #[test]
+    fn demo_mode_accepts_test_reset_demo_state() {
+        let parsed = parse_args_from_env(
+            [
+                "prodigy-executor",
+                "--mode",
+                "demo",
+                "--test-reset-demo-state",
+            ],
+            &fake_env(),
+        )
+        .unwrap();
+
+        assert_eq!(parsed.cfg.mode, TradingMode::Demo);
+        assert!(parsed.cfg.test_reset_demo_state);
     }
 
     #[test]

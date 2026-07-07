@@ -186,38 +186,55 @@ pub async fn run_daemon(cfg: ExecutorConfig, options: DaemonOptions) -> Result<(
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let mut active_lock_heartbeat_task =
         spawn_active_lock_heartbeat(&cfg, &instance_id, shutdown_rx.clone());
-    let rest = crate::bitget::BitgetRestClient::new(cfg.clone())?;
 
-    if cfg.test_reset_demo_state {
-        crate::db::write_event(
+    let startup: Result<crate::bitget::BitgetRestClient> = async {
+        let rest = crate::bitget::BitgetRestClient::new(cfg.clone())?;
+
+        if cfg.test_reset_demo_state {
+            crate::db::write_event(
+                &conn,
+                "warning",
+                "daemon",
+                "test reset requested in daemon mode",
+                "{}",
+            )?;
+        }
+
+        rest.set_leverage(cfg.leverage).await.map_err(|e| {
+            anyhow::anyhow!(
+                "set-leverage failed (configured {}x): {e} — refusing to trade at unknown leverage",
+                cfg.leverage
+            )
+        })?;
+        // Startup reconcile BEFORE processing intents: repair any local/exchange
+        // divergence left over from a prior run so the first tick starts from
+        // exchange-truth. (Daemon mode does NOT call reset_demo_symbol_state here —
+        // reset is the one-shot's job; daemon only logs the warning above.)
+        crate::reconcile::reconcile_once(
             &conn,
-            "warning",
-            "daemon",
-            "test reset requested in daemon mode",
-            "{}",
-        )?;
-    }
-
-    rest.set_leverage(cfg.leverage).await.map_err(|e| {
-        anyhow::anyhow!(
-            "set-leverage failed (configured {}x): {e} — refusing to trade at unknown leverage",
-            cfg.leverage
+            &rest,
+            "daemon-startup",
+            !cfg.test_reset_demo_state,
+            cfg.telegram_bot_token.as_deref(),
+            cfg.telegram_chat_id.as_deref(),
         )
-    })?;
-    // Startup reconcile BEFORE processing intents: repair any local/exchange
-    // divergence left over from a prior run so the first tick starts from
-    // exchange-truth. (Daemon mode does NOT call reset_demo_symbol_state here —
-    // reset is the one-shot's job; daemon only logs the warning above.)
-    crate::reconcile::reconcile_once(
-        &conn,
-        &rest,
-        "daemon-startup",
-        !cfg.test_reset_demo_state,
-        cfg.telegram_bot_token.as_deref(),
-        cfg.telegram_chat_id.as_deref(),
-    )
-    .await?;
-    crate::db::write_event(&conn, "info", "daemon", "daemon started", "{}")?;
+        .await?;
+        crate::db::write_event(&conn, "info", "daemon", "daemon started", "{}")?;
+        Ok(rest)
+    }
+    .await;
+    let rest = match startup {
+        Ok(rest) => rest,
+        Err(err) => {
+            stop_active_lock_heartbeat(&shutdown_tx, &mut active_lock_heartbeat_task).await;
+            if let Err(cleanup_err) = release_lock_on_shutdown(&conn, &cfg, &instance_id) {
+                return Err(anyhow::anyhow!(
+                    "{err}; startup cleanup failed: {cleanup_err}"
+                ));
+            }
+            return Err(err);
+        }
+    };
 
     let market_cache = Arc::new(tokio::sync::Mutex::new(
         crate::executor::MarketCache::default(),
@@ -351,15 +368,7 @@ pub async fn run_daemon(cfg: ExecutorConfig, options: DaemonOptions) -> Result<(
     // a short grace window to observe it and return cooperatively (flush/close).
     // abort() is the hard fallback so the process still exits within the
     // bounded test runtime if a task is stuck mid-await on a socket read.
-    let _ = shutdown_tx.send(true);
-    if tokio::time::timeout(Duration::from_millis(200), &mut active_lock_heartbeat_task)
-        .await
-        .is_err()
-    {
-        active_lock_heartbeat_task.abort();
-        let _ =
-            tokio::time::timeout(Duration::from_millis(50), &mut active_lock_heartbeat_task).await;
-    }
+    stop_active_lock_heartbeat(&shutdown_tx, &mut active_lock_heartbeat_task).await;
     let _ = tokio::time::timeout(
         Duration::from_millis(200),
         futures_util::future::join3(&mut public_task, &mut private_task, &mut telegram_task),
@@ -388,6 +397,21 @@ fn release_lock_on_shutdown(
 ) -> Result<()> {
     crate::db::release_active_executor_lock(conn, cfg.mode.as_str(), instance_id)?;
     Ok(())
+}
+
+async fn stop_active_lock_heartbeat(
+    shutdown_tx: &tokio::sync::watch::Sender<bool>,
+    active_lock_heartbeat_task: &mut tokio::task::JoinHandle<()>,
+) {
+    let _ = shutdown_tx.send(true);
+    if tokio::time::timeout(Duration::from_millis(200), &mut *active_lock_heartbeat_task)
+        .await
+        .is_err()
+    {
+        active_lock_heartbeat_task.abort();
+        let _ =
+            tokio::time::timeout(Duration::from_millis(50), &mut *active_lock_heartbeat_task).await;
+    }
 }
 
 fn active_lock_heartbeat_interval() -> Duration {
@@ -1252,6 +1276,26 @@ mod tests {
         ))
     }
 
+    fn one_status_server(status: u16, body: &'static str) -> String {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(1)));
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let response = format!(
+                    "HTTP/1.1 {status} ERR\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        format!("http://{addr}")
+    }
+
     fn insert_pending_open_intent(conn: &rusqlite::Connection, intent_id: &str) {
         conn.execute(
             "insert into trade_intents (
@@ -1478,6 +1522,45 @@ mod tests {
             .unwrap()
             .unwrap()
             .unwrap();
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[tokio::test]
+    async fn daemon_startup_set_leverage_failure_releases_active_lock() {
+        let db_path = temp_db_path("startup-lock-release");
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(include_str!("../../../schema/001_initial.sql"))
+                .unwrap();
+            conn.execute_batch(include_str!("../../../schema/002_execution.sql"))
+                .unwrap();
+        }
+
+        let cfg = ExecutorConfig {
+            db_path: db_path.clone(),
+            rest_base_url: one_status_server(500, r#"{"code":"500","msg":"boom"}"#),
+            ..ExecutorConfig::demo_for_tests()
+        };
+
+        let err = run_daemon(
+            cfg,
+            DaemonOptions {
+                max_runtime: Some(std::time::Duration::from_millis(1)),
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.to_string().contains("set-leverage failed"));
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        assert_eq!(
+            crate::db::get_executor_state(&conn, crate::db::ACTIVE_MODE_KEY).unwrap(),
+            None
+        );
+        assert_eq!(
+            crate::db::get_executor_state(&conn, crate::db::ACTIVE_INSTANCE_ID_KEY).unwrap(),
+            None
+        );
         let _ = std::fs::remove_file(&db_path);
     }
 

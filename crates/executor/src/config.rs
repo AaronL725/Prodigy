@@ -122,6 +122,9 @@ impl ExecutorConfig {
 
     pub fn validate_for_runtime(&self) -> Result<()> {
         self.validate_urls_for_mode()?;
+        if self.mode == TradingMode::Live && self.test_reset_demo_state {
+            bail!("test reset demo state is only supported in demo mode (--test-reset-demo-state)");
+        }
         if self.secrets.api_key.trim().is_empty()
             || self.secrets.api_secret.trim().is_empty()
             || self.secrets.passphrase.trim().is_empty()
@@ -290,6 +293,36 @@ mod tests {
             ..ExecutorConfig::live_for_tests()
         };
         enabled.validate_for_runtime().unwrap();
+    }
+
+    #[test]
+    fn live_runtime_validation_rejects_test_reset_demo_state() {
+        let cfg = ExecutorConfig {
+            test_reset_demo_state: true,
+            live_safety: LiveSafety {
+                enabled: true,
+                confirm_phrase: Some(LIVE_CONFIRM_PHRASE.to_string()),
+            },
+            secrets: BitgetSecrets {
+                api_key: "live-key".to_string(),
+                api_secret: "live-secret".to_string(),
+                passphrase: "live-pass".to_string(),
+            },
+            ..ExecutorConfig::live_for_tests()
+        };
+
+        assert!(cfg
+            .validate_for_runtime()
+            .unwrap_err()
+            .to_string()
+            .contains("test reset"));
+
+        ExecutorConfig {
+            test_reset_demo_state: true,
+            ..ExecutorConfig::demo_for_tests()
+        }
+        .validate_for_runtime()
+        .unwrap();
     }
 
     #[test]
