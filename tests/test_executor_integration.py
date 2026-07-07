@@ -3,6 +3,7 @@ import subprocess
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 from prodigy.db import connect, init_db
 from prodigy.signals.daemon import RunOnceConfig, run_once
@@ -579,11 +580,28 @@ def test_m8_scope_scan_has_no_remote_open_or_live_bypass():
         path_text, line_text, _ = hit.split(":", 2)
         path = repo_root / path_text
         line_no = int(line_text)
-        if "/tests/" in path_text:
-            continue
         if path.suffix == ".rs":
             cfg_test_ranges.setdefault(path, _rust_cfg_test_ranges(path))
             if any(start <= line_no <= end for start, end in cfg_test_ranges[path]):
                 continue
         production_hits.append(hit)
     assert not production_hits, "\n".join(production_hits)
+
+
+def test_m8_scope_scan_reports_rust_integration_test_hits(monkeypatch):
+    hit = "crates/executor/tests/live_bypass.rs:1:allow_live_without_confirm"
+
+    def fake_run(*args, **kwargs):
+        return subprocess.CompletedProcess(
+            args=args[0],
+            returncode=0,
+            stdout=f"{hit}\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setitem(globals(), "_rust_cfg_test_ranges", lambda path: [])
+
+    with pytest.raises(AssertionError) as excinfo:
+        test_m8_scope_scan_has_no_remote_open_or_live_bypass()
+    assert hit in str(excinfo.value)
