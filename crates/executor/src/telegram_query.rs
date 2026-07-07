@@ -420,6 +420,23 @@ fn help_reply() -> TelegramReply {
     )
 }
 
+#[derive(Debug, Clone)]
+struct ActiveExecutorTarget {
+    mode: String,
+    instance_id: String,
+}
+
+fn active_executor_target(conn: &Connection) -> Result<Option<ActiveExecutorTarget>> {
+    let Some(mode) = crate::db::get_executor_state(conn, crate::db::ACTIVE_MODE_KEY)? else {
+        return Ok(None);
+    };
+    let Some(instance_id) = crate::db::get_executor_state(conn, crate::db::ACTIVE_INSTANCE_ID_KEY)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(ActiveExecutorTarget { mode, instance_id }))
+}
+
 fn status_reply(conn: &Connection) -> Result<TelegramReply> {
     let pending: i64 = conn.query_row(
         "select count(*) from trade_intents where status = 'pending'",
@@ -435,7 +452,12 @@ fn status_reply(conn: &Connection) -> Result<TelegramReply> {
     Ok(html_card(
         "PRODIGY OPERATOR",
         vec![
-            row("MODE", "DEMO"),
+            row(
+                "MODE",
+                active_executor_target(conn)?
+                    .map(|target| target.mode.to_uppercase())
+                    .unwrap_or_else(|| "NO ACTIVE EXECUTOR".to_string()),
+            ),
             row("DAEMON", latest_daemon_status(conn)?),
             row("SIGNAL", latest_signal_status(conn)?),
             row("RECONCILE", latest_reconcile_status(conn)?),
@@ -805,14 +827,33 @@ fn with_savepoint<T>(
 }
 
 fn queue_control_command(conn: &Connection, command: &str, requested_by: &str) -> Result<String> {
+    let Some(target) = active_executor_target(conn)? else {
+        audit(
+            conn,
+            "telegram control command rejected",
+            &serde_json::json!({
+                "command": command,
+                "requested_by": requested_by,
+                "error": "no_active_executor",
+            })
+            .to_string(),
+        )?;
+        anyhow::bail!("no active executor");
+    };
     with_savepoint(conn, "telegram_queue_control", |conn| {
         let command_id: String =
             conn.query_row("select lower(hex(randomblob(16)))", [], |r| r.get(0))?;
         conn.execute(
             "insert into control_commands (
-               command_id, created_at, command, status, requested_by
-             ) values (?, datetime('now'), ?, 'pending', ?)",
-            rusqlite::params![command_id, command, requested_by],
+               command_id, created_at, command, status, requested_by, mode, instance_id
+             ) values (?, datetime('now'), ?, 'pending', ?, ?, ?)",
+            rusqlite::params![
+                command_id,
+                command,
+                requested_by,
+                &target.mode,
+                &target.instance_id,
+            ],
         )?;
         audit(
             conn,
@@ -821,6 +862,8 @@ fn queue_control_command(conn: &Connection, command: &str, requested_by: &str) -
                 "command_id": command_id,
                 "command": command,
                 "requested_by": requested_by,
+                "mode": &target.mode,
+                "instance_id": &target.instance_id,
             })
             .to_string(),
         )?;
@@ -838,12 +881,27 @@ fn start_close_all_confirmation_reply(
     requested_by: &str,
     now_ms: i64,
 ) -> Result<TelegramReply> {
+    let Some(target) = active_executor_target(conn)? else {
+        audit(
+            conn,
+            "telegram control command rejected",
+            &serde_json::json!({
+                "command": "close_all",
+                "requested_by": requested_by,
+                "error": "no_active_executor",
+            })
+            .to_string(),
+        )?;
+        anyhow::bail!("no active executor");
+    };
     let code: String = conn.query_row("select lower(hex(randomblob(3)))", [], |r| r.get(0))?;
     let value = serde_json::json!({
         "status": "pending",
         "requested_by": requested_by,
         "code_hash": sha256_hex(&code),
         "expires_ms": now_ms + 60_000,
+        "mode": &target.mode,
+        "instance_id": &target.instance_id,
     })
     .to_string();
     with_savepoint(conn, "telegram_close_all_confirm", |conn| {
@@ -854,6 +912,8 @@ fn start_close_all_confirmation_reply(
             &serde_json::json!({
                 "requested_by": requested_by,
                 "expires_ms": now_ms + 60_000,
+                "mode": &target.mode,
+                "instance_id": &target.instance_id,
             })
             .to_string(),
         )
@@ -901,7 +961,7 @@ fn close_all_confirmation_rejected(
         })
         .to_string(),
     )?;
-    Ok("confirmation rejected".to_string())
+    Ok(format!("confirmation rejected: {reason}"))
 }
 
 fn close_all_confirmation_expired(conn: &Connection, requested_by: &str) -> Result<String> {
@@ -985,10 +1045,21 @@ fn confirm_close_all(
         if expected != sha256_hex(code) {
             return close_all_confirmation_rejected(conn, "bad_code", requested_by);
         }
+        let Some(target) = active_executor_target(conn)? else {
+            return close_all_confirmation_rejected(conn, "stale", requested_by);
+        };
+        if value.get("mode").and_then(serde_json::Value::as_str) != Some(target.mode.as_str())
+            || value.get("instance_id").and_then(serde_json::Value::as_str)
+                != Some(target.instance_id.as_str())
+        {
+            return close_all_confirmation_rejected(conn, "stale", requested_by);
+        }
         let claimed = serde_json::json!({
             "status": "accepting",
             "requested_by": requested_by,
             "accepted_ms": now_ms,
+            "mode": &target.mode,
+            "instance_id": &target.instance_id,
         })
         .to_string();
         let updated = conn.execute(
@@ -1007,6 +1078,8 @@ fn confirm_close_all(
             &serde_json::json!({
                 "command_id": command_id,
                 "requested_by": requested_by,
+                "mode": &target.mode,
+                "instance_id": &target.instance_id,
             })
             .to_string(),
         )?;
@@ -1018,6 +1091,8 @@ fn confirm_close_all(
                 "requested_by": requested_by,
                 "command_id": command_id,
                 "used_ms": now_ms,
+                "mode": &target.mode,
+                "instance_id": &target.instance_id,
             })
             .to_string(),
         )?;
@@ -1194,6 +1269,71 @@ mod tests {
         .unwrap()
     }
 
+    fn set_active_executor(conn: &Connection) {
+        crate::db::set_executor_state(conn, crate::db::ACTIVE_MODE_KEY, "demo").unwrap();
+        crate::db::set_executor_state(conn, crate::db::ACTIVE_INSTANCE_ID_KEY, "inst-demo")
+            .unwrap();
+    }
+
+    #[test]
+    fn telegram_control_requires_active_executor_and_writes_mode_instance() {
+        let conn = test_conn();
+        let reply = operator_reply(&conn, "/stop", "123", &["123".to_string()], 1_000)
+            .unwrap()
+            .unwrap();
+        assert!(reply.text.contains("no active executor"));
+        let queued: i64 = conn
+            .query_row("select count(*) from control_commands", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(queued, 0);
+
+        crate::db::set_executor_state(&conn, crate::db::ACTIVE_MODE_KEY, "live").unwrap();
+        crate::db::set_executor_state(&conn, crate::db::ACTIVE_INSTANCE_ID_KEY, "inst-live")
+            .unwrap();
+        let reply = operator_reply(&conn, "/stop", "123", &["123".to_string()], 2_000)
+            .unwrap()
+            .unwrap();
+        assert!(reply.text.contains("queued"));
+
+        let row: (String, Option<String>) = conn
+            .query_row(
+                "select mode, instance_id from control_commands where command = 'stop'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(row, ("live".to_string(), Some("inst-live".to_string())));
+    }
+
+    #[test]
+    fn close_all_confirmation_rejects_stale_mode_instance() {
+        let conn = test_conn();
+        crate::db::set_executor_state(&conn, crate::db::ACTIVE_MODE_KEY, "demo").unwrap();
+        crate::db::set_executor_state(&conn, crate::db::ACTIVE_INSTANCE_ID_KEY, "inst-demo")
+            .unwrap();
+
+        let reply = start_close_all_confirmation_reply(&conn, "123", 1_000).unwrap();
+        assert!(reply.text.contains("confirm"));
+
+        crate::db::set_executor_state(&conn, crate::db::ACTIVE_MODE_KEY, "live").unwrap();
+        crate::db::set_executor_state(&conn, crate::db::ACTIVE_INSTANCE_ID_KEY, "inst-live")
+            .unwrap();
+
+        let code = callback_data(&reply, "tgux:confirm_close_all:")
+            .trim_start_matches("tgux:confirm_close_all:")
+            .to_string();
+        let rejected = confirm_close_all(&conn, &code, "123", 2_000).unwrap();
+        assert!(rejected.contains("stale") || rejected.contains("expired"));
+        let queued: i64 = conn
+            .query_row(
+                "select count(*) from control_commands where command = 'close_all'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(queued, 0);
+    }
+
     #[test]
     fn html_escape_escapes_dynamic_telegram_values() {
         assert_eq!(html_escape("ETH<&>USDT"), "ETH&lt;&amp;&gt;USDT");
@@ -1282,7 +1422,7 @@ mod tests {
         assert_eq!(reply.parse_mode, Some("HTML"));
         assert!(reply.text.contains("◆ <b>Prodigy Operator</b>"));
         assert!(reply.text.contains("<b>Mode</b>"));
-        assert!(reply.text.contains("DEMO"));
+        assert!(reply.text.contains("NO ACTIVE EXECUTOR"));
         assert!(reply.text.contains("<b>Daemon</b>"));
         assert!(reply.reply_markup.is_some());
     }
@@ -1304,6 +1444,7 @@ mod tests {
     #[test]
     fn status_title_and_rows_use_bold_title_case_labels_only() {
         let conn = test_conn();
+        set_active_executor(&conn);
         crate::db::write_event(&conn, "info", "daemon", "daemon started", "{}").unwrap();
 
         let reply = query_reply(&conn, "/status").unwrap().unwrap();
@@ -1404,6 +1545,7 @@ mod tests {
         assert!(control.starts_with("◆ <b>Control</b>"));
         assert!(control.contains("<b>Stop</b> — block new opening exposure"));
 
+        set_active_executor(&conn);
         let close_all =
             operator_callback_reply(&conn, "tgux:close_all", "123", &["123".to_string()], 1_000)
                 .unwrap()
@@ -1466,6 +1608,7 @@ mod tests {
     #[test]
     fn callback_control_write_failure_reuses_slash_failure_semantics() {
         let conn = test_conn();
+        set_active_executor(&conn);
         conn.execute("drop table control_commands", []).unwrap();
 
         let response =
@@ -1485,6 +1628,7 @@ mod tests {
             ("tgux:cancel_all", "cancel_all"),
         ] {
             let conn = test_conn();
+            set_active_executor(&conn);
 
             let response =
                 operator_callback_reply(&conn, callback_data, "123", &["123".to_string()], 1_000)
@@ -1519,6 +1663,7 @@ mod tests {
     #[test]
     fn callback_close_all_creates_pending_confirmation_without_queueing_command() {
         let conn = test_conn();
+        set_active_executor(&conn);
 
         let response =
             operator_callback_reply(&conn, "tgux:close_all", "123", &["123".to_string()], 10_000)
@@ -1536,6 +1681,8 @@ mod tests {
         assert_eq!(command_count, 0);
         assert_eq!(state["requested_by"], "123");
         assert_eq!(state["expires_ms"], 70_000);
+        assert_eq!(state["mode"], "demo");
+        assert_eq!(state["instance_id"], "inst-demo");
         assert_eq!(
             telegram_event_count(&conn, "telegram close_all confirmation generated"),
             1
@@ -1564,6 +1711,7 @@ mod tests {
     fn close_all_exact_static_confirm_and_cancel_callbacks_reject_with_pending_state() {
         for callback_data in ["tgux:confirm_close_all", "tgux:cancel_close_all"] {
             let conn = test_conn();
+            set_active_executor(&conn);
             operator_callback_reply(&conn, "tgux:close_all", "123", &["123".to_string()], 10_000)
                 .unwrap()
                 .unwrap();
@@ -1589,6 +1737,7 @@ mod tests {
     #[test]
     fn close_all_stale_button_callback_rejects_after_new_confirmation() {
         let conn = test_conn();
+        set_active_executor(&conn);
         let first =
             operator_callback_reply(&conn, "tgux:close_all", "123", &["123".to_string()], 10_000)
                 .unwrap()
@@ -1626,6 +1775,7 @@ mod tests {
     #[test]
     fn close_all_button_requires_button_confirmation_before_queueing() {
         let conn = test_conn();
+        set_active_executor(&conn);
         let first =
             operator_callback_reply(&conn, "tgux:close_all", "123", &["123".to_string()], 10_000)
                 .unwrap()
@@ -1659,6 +1809,7 @@ mod tests {
     #[test]
     fn close_all_button_confirmation_rejects_wrong_user_expiry_and_replay() {
         let conn = test_conn();
+        set_active_executor(&conn);
         let first = operator_callback_reply(
             &conn,
             "tgux:close_all",
@@ -1720,6 +1871,7 @@ mod tests {
     #[test]
     fn cancel_close_all_button_clears_pending_confirmation_without_queueing() {
         let conn = test_conn();
+        set_active_executor(&conn);
         let reply =
             operator_callback_reply(&conn, "tgux:close_all", "123", &["123".to_string()], 10_000)
                 .unwrap()
@@ -2100,6 +2252,7 @@ mod tests {
             ("/cancel_all", "cancel_all"),
         ] {
             let conn = test_conn();
+            set_active_executor(&conn);
             let response = operator_response(&conn, text, "123", &["123".to_string()], 1_000)
                 .unwrap()
                 .unwrap();
@@ -2140,6 +2293,7 @@ mod tests {
     #[test]
     fn control_command_write_failure_returns_failure_reply_without_queued_semantics() {
         let conn = test_conn();
+        set_active_executor(&conn);
         conn.execute("drop table control_commands", []).unwrap();
 
         let response = operator_response(&conn, "/stop", "123", &["123".to_string()], 1_000)
@@ -2161,6 +2315,7 @@ mod tests {
     #[test]
     fn audit_write_failure_returns_failure_reply_and_rolls_back_control_command() {
         let conn = test_conn();
+        set_active_executor(&conn);
         conn.execute("drop table events", []).unwrap();
 
         let response = operator_response(&conn, "/stop", "123", &["123".to_string()], 1_000)
@@ -2178,6 +2333,7 @@ mod tests {
     #[test]
     fn close_all_requires_same_user_confirmation_before_queueing() {
         let conn = test_conn();
+        set_active_executor(&conn);
         let first = operator_response(&conn, "/close_all", "123", &["123".to_string()], 10_000)
             .unwrap()
             .unwrap();
@@ -2195,6 +2351,8 @@ mod tests {
         let state: serde_json::Value = serde_json::from_str(&raw_state).unwrap();
         assert_eq!(state["requested_by"], "123");
         assert_eq!(state["expires_ms"], 70_000);
+        assert_eq!(state["mode"], "demo");
+        assert_eq!(state["instance_id"], "inst-demo");
         assert!(state["code_hash"].as_str().unwrap().len() >= 64);
 
         let code = first.split_whitespace().last().unwrap().to_string();
@@ -2230,6 +2388,7 @@ mod tests {
     #[test]
     fn close_all_pending_confirmation_write_failure_returns_failure_without_pending_state() {
         let conn = test_conn();
+        set_active_executor(&conn);
         conn.execute("drop table events", []).unwrap();
 
         let response = operator_response(&conn, "/close_all", "123", &["123".to_string()], 1_000)
@@ -2245,6 +2404,7 @@ mod tests {
     #[test]
     fn confirm_write_failure_returns_failure_reply_without_queueing_close_all() {
         let conn = test_conn();
+        set_active_executor(&conn);
         crate::db::set_executor_state(
             &conn,
             "close_all_confirm:123",
@@ -2253,6 +2413,8 @@ mod tests {
                 "requested_by": "123",
                 "code_hash": sha256_hex("abc123"),
                 "expires_ms": 70_000,
+                "mode": "demo",
+                "instance_id": "inst-demo",
             })
             .to_string(),
         )
@@ -2280,6 +2442,7 @@ mod tests {
     #[test]
     fn close_all_confirmation_rejects_wrong_user_wrong_code_and_expiry() {
         let conn = test_conn();
+        set_active_executor(&conn);
         let first = operator_response(&conn, "/close_all", "123", &["123".to_string()], 10_000)
             .unwrap()
             .unwrap();
@@ -2329,6 +2492,7 @@ mod tests {
     #[test]
     fn close_all_confirmation_rejects_replay_and_expiry_boundary() {
         let conn = test_conn();
+        set_active_executor(&conn);
         let first = operator_response(&conn, "/close_all", "123", &["123".to_string()], 10_000)
             .unwrap()
             .unwrap();
