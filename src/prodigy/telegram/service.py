@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import json
 import sqlite3
+import time
 import uuid
+
+ACTIVE_LOCK_STALE_TIMEOUT_MS = 30_000
 
 
 class TelegramCommandService:
@@ -30,22 +34,58 @@ class TelegramCommandService:
     def _write_command(self, user_id: str | int, now: str, command: str) -> str:
         if str(user_id) not in self.allowed_user_ids:
             return "unauthorized"
-        target = self.conn.execute(
-            """
-            select
-              (select value from executor_state where key = 'active_mode'),
-              (select value from executor_state where key = 'active_instance_id')
-            """
-        ).fetchone()
-        if not target[0] or not target[1]:
+        target = self._active_executor_target()
+        if target is None:
+            self.conn.execute(
+                """
+                insert into events (
+                  event_id, created_at, severity, component, message, payload_json
+                ) values (?, ?, 'warning', 'telegram', ?, ?)
+                """,
+                (
+                    str(uuid.uuid4()),
+                    now,
+                    "telegram control command rejected",
+                    json.dumps(
+                        {
+                            "command": command,
+                            "requested_by": user_id,
+                            "error": "no_active_executor",
+                        }
+                    ),
+                ),
+            )
+            self.conn.commit()
             return "no active executor"
+        mode, instance_id = target
         self.conn.execute(
             """
             insert into control_commands (
               command_id, created_at, command, status, requested_by, mode, instance_id
             ) values (?, ?, ?, 'pending', ?, ?, ?)
             """,
-            (str(uuid.uuid4()), now, command, user_id, target[0], target[1]),
+            (str(uuid.uuid4()), now, command, user_id, mode, instance_id),
         )
         self.conn.commit()
         return f"{command} command queued"
+
+    def _active_executor_target(self) -> tuple[str, str] | None:
+        target = self.conn.execute(
+            """
+            select
+              (select value from executor_state where key = 'active_mode'),
+              (select value from executor_state where key = 'active_instance_id'),
+              (select value from executor_state where key = 'active_started_at'),
+              (select value from executor_state where key = 'active_heartbeat_at')
+            """
+        ).fetchone()
+        mode, instance_id, started_at, heartbeat_at = target
+        if not mode or not instance_id or not started_at or not heartbeat_at:
+            return None
+        try:
+            heartbeat_ms = int(heartbeat_at)
+        except ValueError:
+            return None
+        if int(time.time() * 1000) - heartbeat_ms > ACTIVE_LOCK_STALE_TIMEOUT_MS:
+            return None
+        return str(mode), str(instance_id)

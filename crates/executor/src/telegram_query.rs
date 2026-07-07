@@ -427,19 +427,37 @@ struct ActiveExecutorTarget {
 }
 
 fn active_executor_target(conn: &Connection) -> Result<Option<ActiveExecutorTarget>> {
-    let (mode, instance_id): (Option<String>, Option<String>) = conn.query_row(
+    let (mode, instance_id, started_at, heartbeat_at): (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) = conn.query_row(
         "select
            (select value from executor_state where key = ?1),
-           (select value from executor_state where key = ?2)",
+           (select value from executor_state where key = ?2),
+           (select value from executor_state where key = ?3),
+           (select value from executor_state where key = ?4)",
         rusqlite::params![
             crate::db::ACTIVE_MODE_KEY,
-            crate::db::ACTIVE_INSTANCE_ID_KEY
+            crate::db::ACTIVE_INSTANCE_ID_KEY,
+            crate::db::ACTIVE_STARTED_AT_KEY,
+            crate::db::ACTIVE_HEARTBEAT_AT_KEY,
         ],
-        |r| Ok((r.get(0)?, r.get(1)?)),
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
     )?;
-    let (Some(mode), Some(instance_id)) = (mode, instance_id) else {
+    let (Some(mode), Some(instance_id), Some(_started_at), Some(heartbeat_at)) =
+        (mode, instance_id, started_at, heartbeat_at)
+    else {
         return Ok(None);
     };
+    let Ok(heartbeat_ms) = heartbeat_at.parse::<i64>() else {
+        return Ok(None);
+    };
+    let now_ms = crate::bitget::now_ms().parse::<i64>()?;
+    if now_ms.saturating_sub(heartbeat_ms) > 30_000 {
+        return Ok(None);
+    }
     Ok(Some(ActiveExecutorTarget { mode, instance_id }))
 }
 
@@ -1275,14 +1293,21 @@ mod tests {
         .unwrap()
     }
 
-    fn set_active_executor(conn: &Connection) {
-        crate::db::set_executor_state(conn, crate::db::ACTIVE_MODE_KEY, "demo").unwrap();
-        crate::db::set_executor_state(conn, crate::db::ACTIVE_INSTANCE_ID_KEY, "inst-demo")
+    fn set_active_executor_target(conn: &Connection, mode: &str, instance_id: &str) {
+        let now_ms = crate::bitget::now_ms();
+        crate::db::set_executor_state(conn, crate::db::ACTIVE_MODE_KEY, mode).unwrap();
+        crate::db::set_executor_state(conn, crate::db::ACTIVE_INSTANCE_ID_KEY, instance_id)
             .unwrap();
+        crate::db::set_executor_state(conn, crate::db::ACTIVE_STARTED_AT_KEY, &now_ms).unwrap();
+        crate::db::set_executor_state(conn, crate::db::ACTIVE_HEARTBEAT_AT_KEY, &now_ms).unwrap();
+    }
+
+    fn set_active_executor(conn: &Connection) {
+        set_active_executor_target(conn, "demo", "inst-demo");
     }
 
     #[test]
-    fn active_executor_target_reads_mode_and_instance_in_one_sql_statement() {
+    fn active_executor_target_reads_active_lock_in_one_sql_statement() {
         let source = include_str!("telegram_query.rs");
         let body = source
             .split("fn active_executor_target(conn: &Connection)")
@@ -1296,6 +1321,8 @@ mod tests {
         assert!(!body.contains("get_executor_state("));
         assert!(body.contains("ACTIVE_MODE_KEY"));
         assert!(body.contains("ACTIVE_INSTANCE_ID_KEY"));
+        assert!(body.contains("ACTIVE_STARTED_AT_KEY"));
+        assert!(body.contains("ACTIVE_HEARTBEAT_AT_KEY"));
     }
 
     #[test]
@@ -1310,9 +1337,7 @@ mod tests {
             .unwrap();
         assert_eq!(queued, 0);
 
-        crate::db::set_executor_state(&conn, crate::db::ACTIVE_MODE_KEY, "live").unwrap();
-        crate::db::set_executor_state(&conn, crate::db::ACTIVE_INSTANCE_ID_KEY, "inst-live")
-            .unwrap();
+        set_active_executor_target(&conn, "live", "inst-live");
         let reply = operator_reply(&conn, "/stop", "123", &["123".to_string()], 2_000)
             .unwrap()
             .unwrap();
@@ -1329,18 +1354,55 @@ mod tests {
     }
 
     #[test]
+    fn status_with_stale_active_lock_reports_no_active_executor() {
+        let conn = test_conn();
+        crate::db::set_executor_state(&conn, crate::db::ACTIVE_MODE_KEY, "live").unwrap();
+        crate::db::set_executor_state(&conn, crate::db::ACTIVE_INSTANCE_ID_KEY, "inst-live")
+            .unwrap();
+        crate::db::set_executor_state(&conn, crate::db::ACTIVE_STARTED_AT_KEY, "0").unwrap();
+        crate::db::set_executor_state(&conn, crate::db::ACTIVE_HEARTBEAT_AT_KEY, "0").unwrap();
+
+        let reply = query_reply(&conn, "/status").unwrap().unwrap();
+
+        assert!(reply.text.contains("NO ACTIVE EXECUTOR"));
+        assert!(!reply.text.contains("LIVE"));
+    }
+
+    #[test]
+    fn stale_active_lock_rejects_stop_resume_and_cancel_all_controls() {
+        let conn = test_conn();
+        crate::db::set_executor_state(&conn, crate::db::ACTIVE_MODE_KEY, "live").unwrap();
+        crate::db::set_executor_state(&conn, crate::db::ACTIVE_INSTANCE_ID_KEY, "inst-live")
+            .unwrap();
+        crate::db::set_executor_state(&conn, crate::db::ACTIVE_STARTED_AT_KEY, "0").unwrap();
+        crate::db::set_executor_state(&conn, crate::db::ACTIVE_HEARTBEAT_AT_KEY, "0").unwrap();
+
+        for command in ["/stop", "/resume", "/cancel_all"] {
+            let reply = operator_reply(&conn, command, "123", &["123".to_string()], 1_000)
+                .unwrap()
+                .unwrap();
+            assert!(reply.text.contains("no active executor"));
+        }
+
+        let queued: i64 = conn
+            .query_row("select count(*) from control_commands", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(queued, 0);
+        assert_eq!(
+            telegram_event_count(&conn, "telegram control command rejected"),
+            3
+        );
+    }
+
+    #[test]
     fn close_all_confirmation_rejects_stale_mode_instance() {
         let conn = test_conn();
-        crate::db::set_executor_state(&conn, crate::db::ACTIVE_MODE_KEY, "demo").unwrap();
-        crate::db::set_executor_state(&conn, crate::db::ACTIVE_INSTANCE_ID_KEY, "inst-demo")
-            .unwrap();
+        set_active_executor(&conn);
 
         let reply = start_close_all_confirmation_reply(&conn, "123", 1_000).unwrap();
         assert!(reply.text.contains("confirm"));
 
-        crate::db::set_executor_state(&conn, crate::db::ACTIVE_MODE_KEY, "live").unwrap();
-        crate::db::set_executor_state(&conn, crate::db::ACTIVE_INSTANCE_ID_KEY, "inst-live")
-            .unwrap();
+        set_active_executor_target(&conn, "live", "inst-live");
 
         let code = callback_data(&reply, "tgux:confirm_close_all:")
             .trim_start_matches("tgux:confirm_close_all:")
