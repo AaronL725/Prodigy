@@ -9,7 +9,7 @@ use sha2::Sha256;
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::config::ExecutorConfig;
+use crate::config::{ExecutorConfig, TradingMode};
 use crate::types::{
     AccountSnapshotUpdate, MarketUpdate, OrderRecord, PositionRecord, PrivateWsUpdate,
 };
@@ -64,10 +64,14 @@ pub fn signed_headers(
     headers.insert("ACCESS-TIMESTAMP".to_string(), timestamp.to_string());
     headers.insert("locale".to_string(), "en-US".to_string());
     headers.insert("Content-Type".to_string(), "application/json".to_string());
-    if cfg.mode == crate::config::TradingMode::Demo {
+    if should_send_paptrading(cfg) {
         headers.insert("PAPTRADING".to_string(), "1".to_string());
     }
     Ok(headers)
+}
+
+pub fn should_send_paptrading(cfg: &ExecutorConfig) -> bool {
+    cfg.mode == TradingMode::Demo
 }
 
 fn to_headermap(headers: HashMap<String, String>) -> Result<HeaderMap> {
@@ -838,6 +842,7 @@ mod tests {
     #[test]
     fn signed_headers_include_paptrading_only_for_demo() {
         let demo = ExecutorConfig::demo_for_tests();
+        assert!(should_send_paptrading(&demo));
         let demo_headers =
             signed_headers(&demo, "1", "GET", "/api/v2/mix/account/account", "").unwrap();
         assert_eq!(
@@ -857,6 +862,7 @@ mod tests {
             },
             ..ExecutorConfig::live_for_tests()
         };
+        assert!(!should_send_paptrading(&live));
         let live_headers =
             signed_headers(&live, "1", "GET", "/api/v2/mix/account/account", "").unwrap();
         assert!(!live_headers.contains_key("PAPTRADING"));

@@ -22,6 +22,30 @@ pub struct ReconcileSignal {
 
 pub async fn run_live_dry_validate(cfg: ExecutorConfig) -> Result<()> {
     cfg.validate_for_dry_validate()?;
+    let conn = rusqlite::Connection::open(&cfg.db_path)?;
+    conn.busy_timeout(Duration::from_secs(5))?;
+    initialize_executor_schema(&conn)?;
+    crate::db::live_startup_clean_state(&conn, cfg.mode.as_str(), "dry-validate")?;
+    if crate::bitget::should_send_paptrading(&cfg) {
+        anyhow::bail!("live dry validation would send PAPTRADING");
+    }
+    println!("live dry validation passed");
+    Ok(())
+}
+
+fn initialize_executor_schema(conn: &rusqlite::Connection) -> Result<()> {
+    conn.execute_batch(include_str!("../../../schema/001_initial.sql"))?;
+    let has_executor_state: bool = conn.query_row(
+        "select exists(
+           select 1 from sqlite_master
+           where type = 'table' and name = 'executor_state'
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_executor_state {
+        conn.execute_batch(include_str!("../../../schema/002_execution.sql"))?;
+    }
     Ok(())
 }
 
@@ -1195,6 +1219,36 @@ mod tests {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn live_dry_validate_leaves_no_active_lock() {
+        let db_path = temp_db_path("live-dry-validate-lock");
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(include_str!("../../../schema/001_initial.sql"))
+                .unwrap();
+            conn.execute_batch(include_str!("../../../schema/002_execution.sql"))
+                .unwrap();
+            insert_pending_open_intent(&conn, "dry-pending-1");
+        }
+
+        let cfg = ExecutorConfig {
+            db_path: db_path.clone(),
+            ..ExecutorConfig::live_for_tests()
+        };
+        let err = run_live_dry_validate(cfg).await.unwrap_err();
+
+        assert!(err.to_string().contains("live startup blocked"));
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        assert_eq!(
+            crate::db::get_executor_state(&conn, crate::db::ACTIVE_MODE_KEY).unwrap(),
+            None
+        );
+        assert_eq!(
+            crate::db::get_executor_state(&conn, crate::db::ACTIVE_INSTANCE_ID_KEY).unwrap(),
+            None
+        );
     }
 
     #[test]

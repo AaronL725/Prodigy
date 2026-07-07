@@ -8,6 +8,25 @@ from prodigy.db import connect, init_db
 from prodigy.signals.daemon import RunOnceConfig, run_once
 from prodigy.signals.intents import TradeIntent, write_trade_intent
 
+
+def _cargo_env_without_exchange_keys():
+    keep = (
+        "PATH",
+        "HOME",
+        "CARGO_HOME",
+        "RUSTUP_HOME",
+        "CARGO_TARGET_DIR",
+        "TMPDIR",
+        "TEMP",
+        "TMP",
+        "RUSTC_WRAPPER",
+        "RUSTFLAGS",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+    )
+    return {key: os.environ[key] for key in keep if key in os.environ}
+
+
 def test_rust_demo_executor_processes_pending_intent(tmp_path):
     db_path = tmp_path / "prodigy.sqlite"
 
@@ -244,6 +263,46 @@ def test_rust_daemon_live_mode_requires_credentials_and_enable(tmp_path):
 
     assert missing_enable.returncode != 0
     assert "live trading enable flag is required" in missing_enable.stderr
+
+
+def test_live_dry_validate_needs_no_keys_and_leaves_no_active_executor(tmp_path):
+    db_path = tmp_path / "prodigy.sqlite"
+
+    result = subprocess.run(
+        [
+            "cargo",
+            "run",
+            "-q",
+            "-p",
+            "prodigy-executor",
+            "--",
+            "--db",
+            str(db_path),
+            "--mode",
+            "live",
+            "--dry-validate",
+        ],
+        check=True,
+        text=True,
+        capture_output=True,
+        env=_cargo_env_without_exchange_keys(),
+    )
+
+    assert "live dry validation passed" in result.stdout
+    with connect(db_path) as conn:
+        init_db(conn)
+        assert (
+            conn.execute(
+                "select value from executor_state where key = 'active_mode'"
+            ).fetchone()
+            is None
+        )
+        assert (
+            conn.execute(
+                "select value from executor_state where key = 'active_instance_id'"
+            ).fetchone()
+            is None
+        )
 
 
 def test_signal_run_once_writes_intent_for_executor(tmp_path):
