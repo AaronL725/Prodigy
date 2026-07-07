@@ -5,8 +5,6 @@ use std::time::Duration;
 
 use crate::config::{ExecutorConfig, TradingMode};
 
-const LIVE_STARTUP_INSTANCE_ID: &str = "live-startup";
-
 #[derive(Debug, Clone, Default)]
 pub struct DaemonOptions {
     pub max_runtime: Option<Duration>,
@@ -95,8 +93,16 @@ pub async fn run_daemon(cfg: ExecutorConfig, options: DaemonOptions) -> Result<(
         )?;
     }
     conn.busy_timeout(Duration::from_secs(5))?;
+    let instance_id = new_instance_id(&conn)?;
+    crate::db::acquire_active_executor_lock(
+        &conn,
+        cfg.mode.as_str(),
+        &instance_id,
+        now_ms_i64(),
+        30_000,
+    )?;
     if cfg.mode == TradingMode::Live {
-        crate::db::live_startup_clean_state(&conn, "live", LIVE_STARTUP_INSTANCE_ID)?;
+        crate::db::live_startup_clean_state(&conn, cfg.mode.as_str(), &instance_id)?;
     }
     let rest = crate::bitget::BitgetRestClient::new(cfg.clone())?;
 
@@ -165,7 +171,7 @@ pub async fn run_daemon(cfg: ExecutorConfig, options: DaemonOptions) -> Result<(
     // wall-clock skew that SystemTime would inject mid-loop.
     let started = tokio::time::Instant::now();
     let mut poll = tokio::time::interval(Duration::from_millis(250));
-    let mut last_reconcile_ms = crate::bitget::now_ms().parse::<i64>().unwrap_or(0);
+    let mut last_reconcile_ms = now_ms_i64();
 
     loop {
         tokio::select! {
@@ -174,6 +180,15 @@ pub async fn run_daemon(cfg: ExecutorConfig, options: DaemonOptions) -> Result<(
                 break;
             }
             _ = poll.tick() => {
+                let now_ms = now_ms_i64();
+                if !crate::db::heartbeat_active_executor_lock(
+                    &conn,
+                    cfg.mode.as_str(),
+                    &instance_id,
+                    now_ms,
+                )? {
+                    anyhow::bail!("active executor lock lost for {}", instance_id);
+                }
                 if options.max_runtime.is_some_and(|max| started.elapsed() >= max) {
                     crate::db::write_event(
                         &conn,
@@ -184,7 +199,6 @@ pub async fn run_daemon(cfg: ExecutorConfig, options: DaemonOptions) -> Result<(
                     )?;
                     break;
                 }
-                let now_ms = crate::bitget::now_ms().parse::<i64>().unwrap_or(0);
                 // Reconnect-triggered reconcile takes priority over the periodic
                 // interval: a WS (re)connect set the signal, so run the SAME
                 // error-isolated reconcile immediately and reset the interval
@@ -242,6 +256,7 @@ pub async fn run_daemon(cfg: ExecutorConfig, options: DaemonOptions) -> Result<(
                 process_daemon_queues_once(
                     &conn,
                     &cfg,
+                    &instance_id,
                     &rest,
                     &local_cache,
                     private_ready.is_ready(),
@@ -265,18 +280,36 @@ pub async fn run_daemon(cfg: ExecutorConfig, options: DaemonOptions) -> Result<(
     private_task.abort();
     telegram_task.abort();
     crate::db::write_event(&conn, "info", "daemon", "daemon stopped", "{}")?;
+    release_lock_on_shutdown(&conn, &cfg, &instance_id)?;
+    Ok(())
+}
+
+fn new_instance_id(conn: &rusqlite::Connection) -> Result<String> {
+    Ok(conn.query_row("select lower(hex(randomblob(16)))", [], |row| row.get(0))?)
+}
+
+fn now_ms_i64() -> i64 {
+    crate::bitget::now_ms().parse().unwrap_or(0)
+}
+
+fn release_lock_on_shutdown(
+    conn: &rusqlite::Connection,
+    cfg: &ExecutorConfig,
+    instance_id: &str,
+) -> Result<()> {
+    crate::db::release_active_executor_lock(conn, cfg.mode.as_str(), instance_id)?;
     Ok(())
 }
 
 async fn process_daemon_queues_once(
     conn: &rusqlite::Connection,
     cfg: &ExecutorConfig,
+    instance_id: &str,
     rest: &crate::bitget::BitgetRestClient,
     market_cache: &crate::executor::MarketCache,
     private_state_ready: bool,
 ) -> Result<()> {
     let mut control_cache = market_cache.clone();
-    let instance_id = "";
     if let Err(err) = crate::control::process_pending_control_commands_once(
         conn,
         cfg,
@@ -1109,6 +1142,27 @@ mod tests {
     }
 
     #[test]
+    fn daemon_release_helper_clears_only_matching_active_lock() {
+        let conn = test_conn();
+        let cfg = ExecutorConfig::demo_for_tests();
+        crate::db::acquire_active_executor_lock(&conn, "demo", "inst-demo", 1_000, 30_000).unwrap();
+
+        release_lock_on_shutdown(&conn, &cfg, "other").unwrap();
+        assert_eq!(
+            crate::db::get_executor_state(&conn, crate::db::ACTIVE_INSTANCE_ID_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("inst-demo")
+        );
+
+        release_lock_on_shutdown(&conn, &cfg, "inst-demo").unwrap();
+        assert_eq!(
+            crate::db::get_executor_state(&conn, crate::db::ACTIVE_INSTANCE_ID_KEY).unwrap(),
+            None
+        );
+    }
+
+    #[test]
     fn should_run_reconcile_when_interval_elapsed() {
         assert!(should_run_reconcile(10_000, 0, 10));
         assert!(!should_run_reconcile(9_999, 0, 10));
@@ -1353,8 +1407,8 @@ mod tests {
         let conn = test_conn();
         conn.execute(
             "insert into control_commands (
-              command_id, created_at, command, status, requested_by
-            ) values ('cmd-stop', '2026-07-01T00:00:00Z', 'stop', 'pending', '123')",
+              command_id, created_at, command, status, requested_by, mode, instance_id
+            ) values ('cmd-stop', '2026-07-01T00:00:00Z', 'stop', 'pending', '123', 'demo', 'inst-demo')",
             [],
         )
         .unwrap();
@@ -1368,6 +1422,7 @@ mod tests {
         process_daemon_queues_once(
             &conn,
             &cfg,
+            "inst-demo",
             &rest,
             &crate::executor::MarketCache::default(),
             false,
@@ -1423,6 +1478,7 @@ mod tests {
         process_daemon_queues_once(
             &conn,
             &live_cfg,
+            "inst-demo",
             &rest,
             &crate::executor::MarketCache::default(),
             false,
