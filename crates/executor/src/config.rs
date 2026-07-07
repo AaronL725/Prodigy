@@ -9,6 +9,15 @@ pub enum TradingMode {
     Live,
 }
 
+impl TradingMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TradingMode::Demo => "demo",
+            TradingMode::Live => "live",
+        }
+    }
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct BitgetSecrets {
     pub api_key: String,

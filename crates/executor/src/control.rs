@@ -142,11 +142,13 @@ fn audit_skipped_non_system_positions(
 pub async fn process_pending_control_commands_once(
     conn: &rusqlite::Connection,
     cfg: &ExecutorConfig,
+    instance_id: &str,
     rest: &BitgetRestClient,
     market_cache: &mut MarketCache,
 ) -> Result<()> {
-    cfg.validate_demo_only()?;
-    let commands = crate::db::pending_control_commands(conn, "demo", "")?;
+    cfg.validate_for_runtime()?;
+    let mode = cfg.mode.as_str();
+    let commands = crate::db::pending_control_commands(conn, mode, instance_id)?;
     for command in commands {
         if !crate::db::accept_control_command(conn, &command.command_id)? {
             continue;
@@ -159,7 +161,9 @@ pub async fn process_pending_control_commands_once(
             &serde_json::json!({
                 "command_id": command.command_id,
                 "command": command.command,
-                "requested_by": command.requested_by
+                "requested_by": command.requested_by,
+                "mode": &command.mode,
+                "instance_id": &command.instance_id
             })
             .to_string(),
         )?;
@@ -183,7 +187,9 @@ pub async fn process_pending_control_commands_once(
                     &serde_json::json!({
                         "command_id": command.command_id,
                         "command": command.command,
-                        "requested_by": command.requested_by
+                        "requested_by": command.requested_by,
+                        "mode": &command.mode,
+                        "instance_id": &command.instance_id
                     })
                     .to_string(),
                 )?;
@@ -198,7 +204,9 @@ pub async fn process_pending_control_commands_once(
                     &serde_json::json!({
                         "command_id": command.command_id,
                         "command": command.command,
-                        "requested_by": command.requested_by
+                        "requested_by": command.requested_by,
+                        "mode": &command.mode,
+                        "instance_id": &command.instance_id
                     })
                     .to_string(),
                 )?;
@@ -1097,6 +1105,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn process_controls_ignores_other_mode_and_instance() {
+        let conn = conn();
+        conn.execute_batch(
+            "
+            insert into control_commands (
+              command_id, created_at, command, status, requested_by, mode, instance_id
+            ) values
+              ('demo-stop', '2026-07-07T00:00:00Z', 'stop', 'pending', '123', 'demo', 'inst-demo'),
+              ('live-stop', '2026-07-07T00:00:01Z', 'stop', 'pending', '123', 'live', 'inst-live');
+            ",
+        )
+        .unwrap();
+        let cfg = crate::config::ExecutorConfig::demo_for_tests();
+        let rest = crate::bitget::BitgetRestClient::new(cfg.clone()).unwrap();
+        let mut market_cache = crate::executor::MarketCache::default();
+
+        process_pending_control_commands_once(&conn, &cfg, "inst-demo", &rest, &mut market_cache)
+            .await
+            .unwrap();
+
+        let statuses: Vec<(String, String)> = conn
+            .prepare("select command_id, status from control_commands order by command_id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+
+        assert_eq!(
+            statuses,
+            vec![
+                ("demo-stop".to_string(), "executed".to_string()),
+                ("live-stop".to_string(), "pending".to_string()),
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn control_processor_audits_accepted_and_executed_commands() {
         let conn = conn();
         conn.execute(
@@ -1112,6 +1158,7 @@ mod tests {
         process_pending_control_commands_once(
             &conn,
             &cfg,
+            "",
             &rest,
             &mut crate::executor::MarketCache::default(),
         )
@@ -1150,6 +1197,7 @@ mod tests {
         process_pending_control_commands_once(
             &conn,
             &cfg,
+            "",
             &rest,
             &mut crate::executor::MarketCache::default(),
         )
@@ -1215,6 +1263,7 @@ mod tests {
         process_pending_control_commands_once(
             &conn,
             &cfg,
+            "",
             &rest,
             &mut crate::executor::MarketCache::default(),
         )
@@ -1263,6 +1312,7 @@ mod tests {
         process_pending_control_commands_once(
             &conn,
             &cfg,
+            "",
             &rest,
             &mut crate::executor::MarketCache::default(),
         )

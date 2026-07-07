@@ -276,9 +276,15 @@ async fn process_daemon_queues_once(
     private_state_ready: bool,
 ) -> Result<()> {
     let mut control_cache = market_cache.clone();
-    if let Err(err) =
-        crate::control::process_pending_control_commands_once(conn, cfg, rest, &mut control_cache)
-            .await
+    let instance_id = "test-instance";
+    if let Err(err) = crate::control::process_pending_control_commands_once(
+        conn,
+        cfg,
+        instance_id,
+        rest,
+        &mut control_cache,
+    )
+    .await
     {
         let _ = crate::db::write_event(
             conn,
@@ -1347,8 +1353,8 @@ mod tests {
         let conn = test_conn();
         conn.execute(
             "insert into control_commands (
-              command_id, created_at, command, status, requested_by
-            ) values ('cmd-stop', '2026-07-01T00:00:00Z', 'stop', 'pending', '123')",
+              command_id, created_at, command, status, requested_by, mode, instance_id
+            ) values ('cmd-stop', '2026-07-01T00:00:00Z', 'stop', 'pending', '123', 'demo', 'test-instance')",
             [],
         )
         .unwrap();
@@ -1429,7 +1435,7 @@ mod tests {
                 "select count(*) from events
                  where component = 'control_loop'
                    and severity = 'error'
-                   and message like 'control loop failed:%demo%'",
+                   and message like 'control loop failed:%live profile must use Bitget live websocket URLs%'",
                 [],
                 |row| row.get(0),
             )
