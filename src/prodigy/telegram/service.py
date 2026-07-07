@@ -80,6 +80,8 @@ class TelegramCommandService:
             """
         ).fetchone()
         mode, instance_id, started_at, heartbeat_at = target
+        mode = str(mode).strip() if mode is not None else ""
+        instance_id = str(instance_id).strip() if instance_id is not None else ""
         if not mode or not instance_id or not started_at or not heartbeat_at:
             return None
         try:
@@ -89,4 +91,4 @@ class TelegramCommandService:
             return None
         if int(time.time() * 1000) - heartbeat_ms > ACTIVE_LOCK_STALE_TIMEOUT_MS:
             return None
-        return str(mode), str(instance_id)
+        return mode, instance_id
