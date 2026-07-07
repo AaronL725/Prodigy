@@ -54,18 +54,24 @@ pub fn fail_intent(conn: &Connection, intent_id: &str, reason: &str) -> Result<(
     Ok(())
 }
 
-pub fn pending_control_commands(conn: &Connection) -> Result<Vec<ControlCommand>> {
+pub fn pending_control_commands(
+    conn: &Connection,
+    mode: &str,
+    instance_id: &str,
+) -> Result<Vec<ControlCommand>> {
     let mut stmt = conn.prepare(
-        "select command_id, command, requested_by
+        "select command_id, command, requested_by, mode, instance_id
          from control_commands
-         where status = 'pending'
+         where status = 'pending' and mode = ? and instance_id = ?
          order by created_at asc",
     )?;
-    let rows = stmt.query_map([], |row| {
+    let rows = stmt.query_map(params![mode, instance_id], |row| {
         Ok(ControlCommand {
             command_id: row.get(0)?,
             command: row.get(1)?,
             requested_by: row.get(2)?,
+            mode: row.get(3)?,
+            instance_id: row.get(4)?,
         })
     })?;
 
@@ -707,17 +713,41 @@ mod tests {
         let conn = memory_db();
         conn.execute(
             "insert into control_commands (
-              command_id, created_at, command, status, requested_by
-            ) values ('cmd-1', '2026-07-06T00:00:00Z', 'stop', 'pending', '123')",
+              command_id, created_at, command, status, requested_by, mode, instance_id
+            ) values ('cmd-1', '2026-07-06T00:00:00Z', 'stop', 'pending', '123',
+              'demo', 'test-instance')",
             [],
         )
         .unwrap();
 
-        let pending = pending_control_commands(&conn).unwrap();
+        let pending = pending_control_commands(&conn, "demo", "test-instance").unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].command, "stop");
         assert!(accept_control_command(&conn, "cmd-1").unwrap());
         assert!(!accept_control_command(&conn, "cmd-1").unwrap());
+    }
+
+    #[test]
+    fn pending_control_commands_filter_by_mode_and_instance() {
+        let conn = memory_db();
+        conn.execute_batch(
+            "
+            insert into control_commands (
+              command_id, created_at, command, status, requested_by, mode, instance_id
+            ) values
+              ('cmd-demo-a', '2026-07-01T00:00:00Z', 'stop', 'pending', '123', 'demo', 'inst-a'),
+              ('cmd-demo-b', '2026-07-01T00:00:01Z', 'resume', 'pending', '123', 'demo', 'inst-b'),
+              ('cmd-live-a', '2026-07-01T00:00:02Z', 'stop', 'pending', '123', 'live', 'inst-a');
+            ",
+        )
+        .unwrap();
+
+        let pending = pending_control_commands(&conn, "demo", "inst-a").unwrap();
+
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].command_id, "cmd-demo-a");
+        assert_eq!(pending[0].mode, "demo");
+        assert_eq!(pending[0].instance_id.as_deref(), Some("inst-a"));
     }
 
     #[test]

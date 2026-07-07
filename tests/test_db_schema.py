@@ -46,6 +46,20 @@ def test_control_commands_accept_cancel_all_on_new_db(tmp_path):
     assert row["command"] == "cancel_all"
 
 
+def test_control_commands_has_mode_and_instance_on_new_db(tmp_path):
+    db_path = tmp_path / "prodigy.sqlite"
+    with connect(db_path) as conn:
+        init_db(conn)
+        columns = {
+            row["name"]: row
+            for row in conn.execute("pragma table_info(control_commands)").fetchall()
+        }
+
+    assert columns["mode"]["notnull"] == 1
+    assert columns["mode"]["dflt_value"] == "'demo'"
+    assert "instance_id" in columns
+
+
 def test_init_db_migrates_old_control_commands_check_constraint(tmp_path):
     db_path = tmp_path / "prodigy.sqlite"
     raw = sqlite3.connect(db_path)
@@ -137,6 +151,37 @@ def test_control_commands_migration_rolls_back_on_copy_failure(tmp_path):
     assert "control_commands" in tables
     assert "control_commands_old" not in tables
     assert row[0] == "bad"
+
+
+def test_init_db_migrates_control_commands_mode_instance(tmp_path):
+    db_path = tmp_path / "prodigy.sqlite"
+    raw = sqlite3.connect(db_path)
+    raw.executescript(
+        """
+        create table control_commands (
+          command_id text primary key,
+          created_at text not null,
+          command text not null check (command in ('stop', 'resume', 'close_all', 'cancel_all')),
+          status text not null check (status in ('pending', 'accepted', 'rejected', 'executed', 'failed')),
+          requested_by text not null,
+          processed_at text,
+          error text
+        );
+        insert into control_commands (
+          command_id, created_at, command, status, requested_by
+        ) values ('old-stop', '2026-07-06T00:00:00Z', 'stop', 'pending', '123');
+        """
+    )
+    raw.commit()
+    raw.close()
+
+    with connect(db_path) as conn:
+        init_db(conn)
+        row = conn.execute(
+            "select command, mode, instance_id from control_commands where command_id = 'old-stop'"
+        ).fetchone()
+
+    assert dict(row) == {"command": "stop", "mode": "demo", "instance_id": None}
 
 
 def test_trade_intents_are_unique_by_id(tmp_path):

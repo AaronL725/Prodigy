@@ -20,6 +20,8 @@ create table if not exists control_commands (
   command text not null check (command in ('stop', 'resume', 'close_all', 'cancel_all')),
   status text not null check (status in ('pending', 'accepted', 'rejected', 'executed', 'failed')),
   requested_by text not null,
+  mode text not null default 'demo',
+  instance_id text,
   processed_at text,
   error text
 );

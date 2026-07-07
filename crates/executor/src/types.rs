@@ -13,6 +13,8 @@ pub struct ControlCommand {
     pub command_id: String,
     pub command: String,
     pub requested_by: String,
+    pub mode: String,
+    pub instance_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

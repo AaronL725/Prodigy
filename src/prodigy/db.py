@@ -92,6 +92,13 @@ def _ensure_control_commands_support_cancel_all(conn: sqlite3.Connection) -> Non
 
 def _ensure_execution_schema(conn: sqlite3.Connection) -> None:
     _ensure_control_commands_support_cancel_all(conn)
+    _add_column_if_missing(
+        conn,
+        "control_commands",
+        "mode",
+        "mode text not null default 'demo'",
+    )
+    _add_column_if_missing(conn, "control_commands", "instance_id", "instance_id text")
     _add_column_if_missing(conn, "orders", "exchange_order_id", "exchange_order_id text")
     _add_column_if_missing(conn, "orders", "attempt", "attempt integer not null default 1")
     _add_column_if_missing(conn, "orders", "raw_json", "raw_json text not null default '{}'")
