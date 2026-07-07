@@ -148,6 +148,9 @@ where
     if dry_validate && cfg.mode != TradingMode::Live {
         bail!("--dry-validate requires --mode live");
     }
+    if cfg.mode == TradingMode::Live && run_mode == RunMode::Once && !dry_validate {
+        bail!("live mode requires --daemon or --dry-validate");
+    }
     if cfg.mode == TradingMode::Live && cfg.test_reset_demo_state {
         bail!("test reset demo state is only supported in demo mode (--test-reset-demo-state)");
     }
@@ -317,11 +320,29 @@ mod tests {
             "I_UNDERSTAND_THIS_CAN_TRADE_REAL_MONEY".into(),
         );
 
-        let parsed = parse_args_from_env(["prodigy-executor", "--mode", "live"], &env).unwrap();
+        let parsed =
+            parse_args_from_env(["prodigy-executor", "--mode", "live", "--daemon"], &env).unwrap();
 
         assert_eq!(parsed.cfg.mode, TradingMode::Live);
         assert_eq!(parsed.cfg.secrets.api_key, "live-key");
         assert!(parsed.cfg.live_safety.enabled);
+    }
+
+    #[test]
+    fn live_mode_requires_daemon_or_dry_validate() {
+        let mut env = fake_env();
+        env.insert("BITGET_LIVE_API_KEY".into(), "live-key".into());
+        env.insert("BITGET_LIVE_API_SECRET".into(), "live-secret".into());
+        env.insert("BITGET_LIVE_API_PASSPHRASE".into(), "live-pass".into());
+        env.insert("PRODIGY_LIVE_TRADING_ENABLED".into(), "1".into());
+        env.insert(
+            "PRODIGY_LIVE_CONFIRM".into(),
+            "I_UNDERSTAND_THIS_CAN_TRADE_REAL_MONEY".into(),
+        );
+
+        let err = parse_args_from_env(["prodigy-executor", "--mode", "live"], &env).unwrap_err();
+
+        assert!(err.to_string().contains("--daemon"));
     }
 
     #[test]
@@ -334,6 +355,7 @@ mod tests {
         let err = parse_args_from_env(
             [
                 "prodigy-executor",
+                "--daemon",
                 "--test-reset-demo-state",
                 "--mode",
                 "live",
