@@ -1,3 +1,4 @@
+import os
 import subprocess
 from pathlib import Path
 
@@ -180,9 +181,18 @@ def test_rust_demo_daemon_processes_pending_intent_once(tmp_path):
     assert "daemon" in result.stdout or result.stderr == ""
 
 
-def test_rust_daemon_rejects_live_mode(tmp_path):
+def test_rust_daemon_live_mode_requires_credentials_and_enable(tmp_path):
     db_path = tmp_path / "prodigy.sqlite"
-    result = subprocess.run(
+    live_env = {
+        **os.environ,
+        "BITGET_LIVE_API_KEY": "",
+        "BITGET_LIVE_API_SECRET": "",
+        "BITGET_LIVE_API_PASSPHRASE": "",
+        "PRODIGY_LIVE_TRADING_ENABLED": "",
+        "PRODIGY_LIVE_CONFIRM": "",
+    }
+
+    missing_creds = subprocess.run(
         [
             "cargo",
             "run",
@@ -199,10 +209,41 @@ def test_rust_daemon_rejects_live_mode(tmp_path):
         check=False,
         text=True,
         capture_output=True,
+        env=live_env,
     )
 
-    assert result.returncode != 0
-    assert "only supports --mode demo" in result.stderr
+    assert missing_creds.returncode != 0
+    assert "BITGET_LIVE_API_KEY" in missing_creds.stderr
+
+    live_env.update(
+        {
+            "BITGET_LIVE_API_KEY": "live-key",
+            "BITGET_LIVE_API_SECRET": "live-secret",
+            "BITGET_LIVE_API_PASSPHRASE": "live-pass",
+        }
+    )
+    missing_enable = subprocess.run(
+        [
+            "cargo",
+            "run",
+            "-q",
+            "-p",
+            "prodigy-executor",
+            "--",
+            "--db",
+            str(db_path),
+            "--daemon",
+            "--mode",
+            "live",
+        ],
+        check=False,
+        text=True,
+        capture_output=True,
+        env=live_env,
+    )
+
+    assert missing_enable.returncode != 0
+    assert "live trading enable flag is required" in missing_enable.stderr
 
 
 def test_signal_run_once_writes_intent_for_executor(tmp_path):
@@ -321,14 +362,12 @@ def test_m7_live_readiness_scope_scan_targets_dangerous_patterns_only():
     assert not production_hits, "\n".join(production_hits)
 
     config_rs = (repo_root / "crates/executor/src/config.rs").read_text()
-    production_config, test_config = config_rs.split("#[cfg(test)]", 1)
 
-    # M7 deliberately allows safe live-rejection code; do not ban every "live"
-    # string. The dangerous scan above is targeted at enablement patterns.
+    # M8 Task 1 allows live websocket URLs for exact profile validation. The
+    # dangerous scan above is targeted at enablement patterns.
     assert "TradingMode::Live" in config_rs
-    assert "ws.bitget.com" not in production_config
-    assert "wss://ws.bitget.com/v2/ws/public" in test_config
-    assert "wss://ws.bitget.com/v2/ws/private" in test_config
+    assert "wss://ws.bitget.com/v2/ws/public" in config_rs
+    assert "wss://ws.bitget.com/v2/ws/private" in config_rs
 
     telegram_query = (repo_root / "crates/executor/src/telegram_query.rs").read_text()
     for forbidden in ("BitgetRestClient", "/api/v2", "place-order", "cancel-order"):

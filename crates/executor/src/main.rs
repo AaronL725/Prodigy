@@ -145,6 +145,9 @@ where
     if explicit_once && explicit_daemon {
         bail!("cannot use --once and --daemon together");
     }
+    if dry_validate && cfg.mode != TradingMode::Live {
+        bail!("--dry-validate requires --mode live");
+    }
 
     cfg.secrets = match cfg.mode {
         TradingMode::Demo => BitgetSecrets {
@@ -331,6 +334,16 @@ mod tests {
         assert_eq!(parsed.cfg.mode, TradingMode::Live);
         assert!(parsed.dry_validate);
         assert!(parsed.cfg.secrets.api_key.is_empty());
+    }
+
+    #[test]
+    fn dry_validate_requires_live_mode_before_demo_credentials() {
+        let err = parse_args_from_env(["prodigy-executor", "--dry-validate"], &HashMap::new())
+            .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("--dry-validate requires --mode live"));
     }
 
     #[test]

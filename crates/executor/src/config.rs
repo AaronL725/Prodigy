@@ -146,17 +146,15 @@ impl ExecutorConfig {
     pub fn validate_urls_for_mode(&self) -> Result<()> {
         match self.mode {
             TradingMode::Demo => {
-                if !self.public_ws_url.contains("wspap.bitget.com")
-                    || !self.private_ws_url.contains("wspap.bitget.com")
+                if self.public_ws_url != "wss://wspap.bitget.com/v2/ws/public"
+                    || self.private_ws_url != "wss://wspap.bitget.com/v2/ws/private"
                 {
                     bail!("demo profile must use Bitget demo websocket URLs");
                 }
             }
             TradingMode::Live => {
-                if !self.public_ws_url.contains("ws.bitget.com")
-                    || !self.private_ws_url.contains("ws.bitget.com")
-                    || self.public_ws_url.contains("wspap.bitget.com")
-                    || self.private_ws_url.contains("wspap.bitget.com")
+                if self.public_ws_url != "wss://ws.bitget.com/v2/ws/public"
+                    || self.private_ws_url != "wss://ws.bitget.com/v2/ws/private"
                 {
                     bail!("live profile must use Bitget live websocket URLs");
                 }
@@ -283,6 +281,29 @@ mod tests {
             ..ExecutorConfig::live_for_tests()
         };
         enabled.validate_for_runtime().unwrap();
+    }
+
+    #[test]
+    fn live_runtime_validation_rejects_spoofed_ws_host() {
+        let cfg = ExecutorConfig {
+            public_ws_url: "wss://ws.bitget.com.evil/v2/ws/public".to_string(),
+            live_safety: LiveSafety {
+                enabled: true,
+                confirm_phrase: Some(LIVE_CONFIRM_PHRASE.to_string()),
+            },
+            secrets: BitgetSecrets {
+                api_key: "live-key".to_string(),
+                api_secret: "live-secret".to_string(),
+                passphrase: "live-pass".to_string(),
+            },
+            ..ExecutorConfig::live_for_tests()
+        };
+
+        assert!(cfg
+            .validate_for_runtime()
+            .unwrap_err()
+            .to_string()
+            .contains("live websocket"));
     }
 
     #[test]
