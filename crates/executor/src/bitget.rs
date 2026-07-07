@@ -840,7 +840,10 @@ mod tests {
         let demo = ExecutorConfig::demo_for_tests();
         let demo_headers =
             signed_headers(&demo, "1", "GET", "/api/v2/mix/account/account", "").unwrap();
-        assert_eq!(demo_headers.get("PAPTRADING").map(String::as_str), Some("1"));
+        assert_eq!(
+            demo_headers.get("PAPTRADING").map(String::as_str),
+            Some("1")
+        );
 
         let live = ExecutorConfig {
             secrets: crate::config::BitgetSecrets {
@@ -857,7 +860,10 @@ mod tests {
         let live_headers =
             signed_headers(&live, "1", "GET", "/api/v2/mix/account/account", "").unwrap();
         assert!(!live_headers.contains_key("PAPTRADING"));
-        assert_eq!(live_headers.get("ACCESS-KEY").map(String::as_str), Some("live-key"));
+        assert_eq!(
+            live_headers.get("ACCESS-KEY").map(String::as_str),
+            Some("live-key")
+        );
     }
 
     #[test]
