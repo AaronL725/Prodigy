@@ -131,9 +131,12 @@ Validation rules:
   - public/private WS URLs must be `ws.bitget.com`;
   - signed REST headers must not include `PAPTRADING`.
 - live dry validation:
+  - does not require demo credentials;
   - does not require live credentials;
   - must not call live private REST;
   - must not place, cancel, or modify live orders;
+  - must not leave an active executor lock;
+  - must not make Telegram `/status` display a real `MODE LIVE` active executor;
   - can validate public live endpoints, config shape, request construction,
     schema, startup gates, and isolation rules.
 
@@ -163,6 +166,12 @@ The exact confirmation phrase is deliberately long and explicit. If it is
 missing or different, live normal startup fails before any private API call.
 
 Live secrets must be redacted in `Debug`, logs, events, and errors.
+
+Live normal startup gates must run before any private exchange action. Missing
+keys, missing live enable, missing confirm phrase, active-lock conflicts, and
+live DB clean-state failures must be detected before any private REST call,
+`set-leverage`, private WebSocket login, order call, account call, or position
+call.
 
 ## Active Executor Lock
 
@@ -204,6 +213,15 @@ New columns:
 
 SQLite cannot alter a `CHECK` constraint directly, so if the migration also
 needs to preserve command constraints, it must rebuild the table safely.
+
+The implementation must update every typed/query boundary that touches control
+commands:
+
+- database schema and migration;
+- Rust `ControlCommand` struct;
+- pending control command query;
+- Telegram `queue_control_command`;
+- tests for migration, queueing, and executor processing.
 
 Telegram writes control commands by reading:
 
@@ -304,6 +322,8 @@ step 5.
 It should validate:
 
 - live mode parses;
+- live dry validation does not require demo keys;
+- live dry validation does not require live keys;
 - live public WS URL uses `ws.bitget.com`;
 - live REST request construction excludes `PAPTRADING`;
 - live private/order/account operations are not sent;
@@ -311,6 +331,9 @@ It should validate:
 - live normal startup would reject missing enable/confirm;
 - schema migration has run;
 - active lock logic works;
+- dry validation does not leave an active executor lock;
+- dry validation does not make Telegram `/status` report a real `MODE LIVE`
+  active executor;
 - live startup clean-state checks work;
 - Telegram control commands bind to active mode/instance.
 
@@ -338,7 +361,7 @@ It should return success only after all dry validations pass.
    private REST.
 7. `--mode live` with enable but without the exact confirm phrase fails loud
    before private REST.
-8. `--mode live --dry-validate` runs without live keys and without funds.
+8. `--mode live --dry-validate` runs without demo keys, live keys, and funds.
 9. Live dry validation does not call private REST and does not place/cancel
    orders.
 10. Live signed headers do not include `PAPTRADING`.
@@ -346,7 +369,9 @@ It should return success only after all dry validations pass.
 12. Live secrets debug output redacts key, secret, and passphrase.
 13. Live profile does not change executor state machine, risk checks, signal
     rules, or Telegram command semantics.
-14. `control_commands` migration adds `mode` and `instance_id`.
+14. `control_commands` migration adds `mode` and `instance_id`, and updates the
+    schema, `ControlCommand` struct, pending command query, Telegram
+    `queue_control_command`, and related tests.
 15. Existing control command rows migrate safely to `mode='demo'`.
 16. Telegram queues control commands using current `active_mode` and
     `active_instance_id`.
@@ -361,31 +386,35 @@ It should return success only after all dry validations pass.
 22. Stale lock takeover works and writes an audit event.
 23. Clean shutdown releases the active lock.
 24. Heartbeat updates while daemon runs.
-25. Live startup hard-fails if pending/accepted trade intents exist.
-26. Live startup hard-fails if pending/accepted control commands for another
+25. Live normal startup gates and clean-state checks run before private REST,
+    `set-leverage`, private WS login, order, account, or position calls.
+26. Live startup hard-fails if pending/accepted trade intents exist.
+27. Live startup hard-fails if pending/accepted control commands for another
     mode or instance exist.
-27. Live startup hard-fails if working system orders exist.
-28. Live startup hard-fails if system positions exist.
-29. `/status` displays `MODE DEMO`, `MODE LIVE`, or no-active-executor state.
-30. `/stop`, `/resume`, `/cancel_all`, and `/close_all` affect only current
+28. Live startup hard-fails if working system orders exist.
+29. Live startup hard-fails if system positions exist.
+30. Live dry validation leaves no active executor lock and does not make
+    `/status` report a real `MODE LIVE` active executor.
+31. `/status` displays `MODE DEMO`, `MODE LIVE`, or no-active-executor state.
+32. `/stop`, `/resume`, `/cancel_all`, and `/close_all` affect only current
     active mode/instance.
-31. `/close_all` confirmation binds to mode and instance.
-32. Telegram audit events include user id, command, mode, instance id, status or
+33. `/close_all` confirmation binds to mode and instance.
+34. Telegram audit events include user id, command, mode, instance id, status or
     error.
-33. Scope scan shows no remote open, remote parameter edit, model debug, or
+35. Scope scan shows no remote open, remote parameter edit, model debug, or
     remote shell.
-34. Scope scan shows live path exists only behind explicit live enable and
+36. Scope scan shows live path exists only behind explicit live enable and
     confirm gates.
-35. No live key is printed, logged, committed, or exposed through `Debug`.
-36. Existing full suite passes:
+37. No live key is printed, logged, committed, or exposed through `Debug`.
+38. Existing full suite passes:
     - Python pytest;
     - Rust fmt;
     - Rust clippy with `-D warnings`;
     - Rust tests;
     - `git diff --check`.
-37. Demo Bitget integration tests still pass or fail honestly under existing
+39. Demo Bitget integration tests still pass or fail honestly under existing
     demo liquidity constraints.
-38. Documentation includes the exact demo-to-live switch procedure.
+40. Documentation includes the exact demo-to-live switch procedure.
 
 ## Final State
 
