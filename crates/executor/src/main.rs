@@ -1,6 +1,6 @@
 use anyhow::{bail, Result};
 use prodigy_executor::config::{
-    load_env_file, parse_allowed_user_ids, DemoSecrets, ExecutorConfig,
+    load_env_file, parse_allowed_user_ids, BitgetSecrets, ExecutorConfig, LiveSafety, TradingMode,
 };
 use prodigy_executor::executor;
 use std::env;
@@ -17,22 +17,28 @@ struct ParsedExecutorArgs {
     cfg: ExecutorConfig,
     run_mode: RunMode,
     max_runtime_ms: Option<u64>,
+    dry_validate: bool,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let parsed = parse_args_and_config()?;
-    parsed.cfg.validate_demo_only()?;
-    match parsed.run_mode {
-        RunMode::Once => executor::run_once_or_loop(parsed.cfg).await,
-        RunMode::Daemon => {
-            prodigy_executor::daemon::run_daemon(
-                parsed.cfg,
-                prodigy_executor::daemon::DaemonOptions {
-                    max_runtime: parsed.max_runtime_ms.map(std::time::Duration::from_millis),
-                },
-            )
-            .await
+    if parsed.dry_validate {
+        parsed.cfg.validate_for_dry_validate()?;
+        prodigy_executor::daemon::run_live_dry_validate(parsed.cfg).await
+    } else {
+        parsed.cfg.validate_for_runtime()?;
+        match parsed.run_mode {
+            RunMode::Once => executor::run_once_or_loop(parsed.cfg).await,
+            RunMode::Daemon => {
+                prodigy_executor::daemon::run_daemon(
+                    parsed.cfg,
+                    prodigy_executor::daemon::DaemonOptions {
+                        max_runtime: parsed.max_runtime_ms.map(std::time::Duration::from_millis),
+                    },
+                )
+                .await
+            }
         }
     }
 }
@@ -58,6 +64,11 @@ where
         "BITGET_DEMO_SECRET_KEY",
         "BITGET_DEMO_API_PASSPHRASE",
         "BITGET_DEMO_PASSPHRASE",
+        "BITGET_LIVE_API_KEY",
+        "BITGET_LIVE_API_SECRET",
+        "BITGET_LIVE_API_PASSPHRASE",
+        "PRODIGY_LIVE_TRADING_ENABLED",
+        "PRODIGY_LIVE_CONFIRM",
         "TELEGRAM_BOT_TOKEN",
         "TELEGRAM_ALLOWED_USER_IDS",
         "TELEGRAM_CHAT_ID",
@@ -84,6 +95,7 @@ where
 
     let mut run_mode = RunMode::Once;
     let mut max_runtime_ms: Option<u64> = None;
+    let mut dry_validate = false;
     let mut explicit_once = false;
     let mut explicit_daemon = false;
 
@@ -113,11 +125,18 @@ where
                 })?);
             }
             "--test-reset-demo-state" => cfg.test_reset_demo_state = true,
+            "--dry-validate" => dry_validate = true,
             "--mode" => {
                 let value = args.next().unwrap_or_else(|| "demo".to_string());
-                if value != "demo" {
-                    bail!("prodigy executor only supports --mode demo");
-                }
+                let db_path = cfg.db_path.clone();
+                let test_reset_demo_state = cfg.test_reset_demo_state;
+                cfg = match value.as_str() {
+                    "demo" => ExecutorConfig::demo_for_tests(),
+                    "live" => ExecutorConfig::live_for_tests(),
+                    other => bail!("unsupported mode: {other}"),
+                };
+                cfg.db_path = db_path;
+                cfg.test_reset_demo_state = test_reset_demo_state;
             }
             other => bail!("unknown argument: {other}"),
         }
@@ -127,18 +146,35 @@ where
         bail!("cannot use --once and --daemon together");
     }
 
-    cfg.secrets = DemoSecrets {
-        api_key: read_secret(&["BITGET_DEMO_API_KEY"], env_file)?,
-        // ponytail: .env.local ships two naming conventions; accept either so the
-        // demo creds load regardless of which key the operator set.
-        api_secret: read_secret(
-            &["BITGET_DEMO_API_SECRET", "BITGET_DEMO_SECRET_KEY"],
-            env_file,
-        )?,
-        passphrase: read_secret(
-            &["BITGET_DEMO_API_PASSPHRASE", "BITGET_DEMO_PASSPHRASE"],
-            env_file,
-        )?,
+    cfg.secrets = match cfg.mode {
+        TradingMode::Demo => BitgetSecrets {
+            api_key: read_secret(&["BITGET_DEMO_API_KEY"], env_file)?,
+            // ponytail: .env.local ships two naming conventions; accept either so the
+            // demo creds load regardless of which key the operator set.
+            api_secret: read_secret(
+                &["BITGET_DEMO_API_SECRET", "BITGET_DEMO_SECRET_KEY"],
+                env_file,
+            )?,
+            passphrase: read_secret(
+                &["BITGET_DEMO_API_PASSPHRASE", "BITGET_DEMO_PASSPHRASE"],
+                env_file,
+            )?,
+        },
+        TradingMode::Live if dry_validate => BitgetSecrets {
+            api_key: read_optional(&["BITGET_LIVE_API_KEY"], env_file).unwrap_or_default(),
+            api_secret: read_optional(&["BITGET_LIVE_API_SECRET"], env_file).unwrap_or_default(),
+            passphrase: read_optional(&["BITGET_LIVE_API_PASSPHRASE"], env_file)
+                .unwrap_or_default(),
+        },
+        TradingMode::Live => BitgetSecrets {
+            api_key: read_secret(&["BITGET_LIVE_API_KEY"], env_file)?,
+            api_secret: read_secret(&["BITGET_LIVE_API_SECRET"], env_file)?,
+            passphrase: read_secret(&["BITGET_LIVE_API_PASSPHRASE"], env_file)?,
+        },
+    };
+    cfg.live_safety = LiveSafety {
+        enabled: read_optional(&["PRODIGY_LIVE_TRADING_ENABLED"], env_file).as_deref() == Some("1"),
+        confirm_phrase: read_optional(&["PRODIGY_LIVE_CONFIRM"], env_file),
     };
     cfg.telegram_bot_token = read_optional(&["TELEGRAM_BOT_TOKEN"], env_file);
     cfg.telegram_allowed_user_ids = read_optional(&["TELEGRAM_ALLOWED_USER_IDS"], env_file)
@@ -149,6 +185,7 @@ where
         cfg,
         run_mode,
         max_runtime_ms,
+        dry_validate,
     })
 }
 
@@ -263,6 +300,40 @@ mod tests {
     }
 
     #[test]
+    fn parses_live_mode_with_live_credentials_and_enable_flags() {
+        let mut env = fake_env();
+        env.insert("BITGET_LIVE_API_KEY".into(), "live-key".into());
+        env.insert("BITGET_LIVE_API_SECRET".into(), "live-secret".into());
+        env.insert("BITGET_LIVE_API_PASSPHRASE".into(), "live-pass".into());
+        env.insert("PRODIGY_LIVE_TRADING_ENABLED".into(), "1".into());
+        env.insert(
+            "PRODIGY_LIVE_CONFIRM".into(),
+            "I_UNDERSTAND_THIS_CAN_TRADE_REAL_MONEY".into(),
+        );
+
+        let parsed = parse_args_from_env(["prodigy-executor", "--mode", "live"], &env).unwrap();
+
+        assert_eq!(parsed.cfg.mode, TradingMode::Live);
+        assert_eq!(parsed.cfg.secrets.api_key, "live-key");
+        assert!(parsed.cfg.live_safety.enabled);
+    }
+
+    #[test]
+    fn live_dry_validate_parses_without_any_bitget_credentials() {
+        let env = std::collections::HashMap::new();
+
+        let parsed = parse_args_from_env(
+            ["prodigy-executor", "--mode", "live", "--dry-validate"],
+            &env,
+        )
+        .unwrap();
+
+        assert_eq!(parsed.cfg.mode, TradingMode::Live);
+        assert!(parsed.dry_validate);
+        assert!(parsed.cfg.secrets.api_key.is_empty());
+    }
+
+    #[test]
     fn rejects_once_and_daemon_together() {
         let err = parse_args_from_env(["prodigy-executor", "--once", "--daemon"], &HashMap::new())
             .unwrap_err();
@@ -285,10 +356,10 @@ mod tests {
     }
 
     #[test]
-    fn rejects_live_mode_before_execution() {
-        let err = parse_args_from_env(["prodigy-executor", "--mode", "live"], &HashMap::new())
+    fn rejects_unsupported_mode_before_execution() {
+        let err = parse_args_from_env(["prodigy-executor", "--mode", "paper"], &HashMap::new())
             .unwrap_err();
 
-        assert!(err.to_string().contains("only supports --mode demo"));
+        assert!(err.to_string().contains("unsupported mode: paper"));
     }
 }

@@ -20,6 +20,11 @@ pub struct ReconcileSignal {
     pending: Arc<AtomicBool>,
 }
 
+pub async fn run_live_dry_validate(cfg: ExecutorConfig) -> Result<()> {
+    cfg.validate_for_dry_validate()?;
+    Ok(())
+}
+
 impl ReconcileSignal {
     pub fn new() -> Self {
         Self::default()
