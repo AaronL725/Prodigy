@@ -610,6 +610,11 @@ pub fn write_event(
     Ok(())
 }
 
+pub const ACTIVE_MODE_KEY: &str = "active_mode";
+pub const ACTIVE_INSTANCE_ID_KEY: &str = "active_instance_id";
+pub const ACTIVE_STARTED_AT_KEY: &str = "active_started_at";
+pub const ACTIVE_HEARTBEAT_AT_KEY: &str = "active_heartbeat_at";
+
 pub fn set_executor_state(conn: &Connection, key: &str, value: &str) -> Result<()> {
     conn.execute(
         "insert into executor_state (key, value, updated_at)
@@ -630,6 +635,79 @@ pub fn get_executor_state(conn: &Connection, key: &str) -> Result<Option<String>
     )
     .optional()
     .map_err(Into::into)
+}
+
+pub fn acquire_active_executor_lock(
+    conn: &Connection,
+    mode: &str,
+    instance_id: &str,
+    now_ms: i64,
+    stale_timeout_ms: i64,
+) -> Result<()> {
+    let active_mode = get_executor_state(conn, ACTIVE_MODE_KEY)?;
+    let active_instance = get_executor_state(conn, ACTIVE_INSTANCE_ID_KEY)?;
+    let heartbeat = get_executor_state(conn, ACTIVE_HEARTBEAT_AT_KEY)?;
+    if let (Some(old_mode), Some(old_instance), Some(old_heartbeat)) =
+        (active_mode, active_instance, heartbeat)
+    {
+        let old_heartbeat_ms = old_heartbeat.parse::<i64>().unwrap_or(0);
+        let age_ms = now_ms.saturating_sub(old_heartbeat_ms);
+        if age_ms <= stale_timeout_ms {
+            anyhow::bail!("active executor lock held by {old_mode}/{old_instance}");
+        }
+        write_event(
+            conn,
+            "warning",
+            "daemon",
+            "active executor lock takeover",
+            &serde_json::json!({
+                "old_mode": old_mode,
+                "old_instance_id": old_instance,
+                "new_mode": mode,
+                "new_instance_id": instance_id,
+            })
+            .to_string(),
+        )?;
+    }
+    set_executor_state(conn, ACTIVE_MODE_KEY, mode)?;
+    set_executor_state(conn, ACTIVE_INSTANCE_ID_KEY, instance_id)?;
+    set_executor_state(conn, ACTIVE_STARTED_AT_KEY, &now_ms.to_string())?;
+    set_executor_state(conn, ACTIVE_HEARTBEAT_AT_KEY, &now_ms.to_string())?;
+    Ok(())
+}
+
+pub fn heartbeat_active_executor_lock(
+    conn: &Connection,
+    mode: &str,
+    instance_id: &str,
+    now_ms: i64,
+) -> Result<()> {
+    if get_executor_state(conn, ACTIVE_MODE_KEY)?.as_deref() == Some(mode)
+        && get_executor_state(conn, ACTIVE_INSTANCE_ID_KEY)?.as_deref() == Some(instance_id)
+    {
+        set_executor_state(conn, ACTIVE_HEARTBEAT_AT_KEY, &now_ms.to_string())?;
+    }
+    Ok(())
+}
+
+pub fn release_active_executor_lock(
+    conn: &Connection,
+    mode: &str,
+    instance_id: &str,
+) -> Result<()> {
+    if get_executor_state(conn, ACTIVE_MODE_KEY)?.as_deref() == Some(mode)
+        && get_executor_state(conn, ACTIVE_INSTANCE_ID_KEY)?.as_deref() == Some(instance_id)
+    {
+        for key in [
+            ACTIVE_MODE_KEY,
+            ACTIVE_INSTANCE_ID_KEY,
+            ACTIVE_STARTED_AT_KEY,
+            ACTIVE_HEARTBEAT_AT_KEY,
+        ] {
+            conn.execute("delete from executor_state where key = ?", params![key])?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -831,6 +909,59 @@ mod tests {
         assert_eq!(
             get_executor_state(&conn, "manual_override:ETH/USDT:USDT").unwrap(),
             Some("cleared".to_string())
+        );
+    }
+
+    #[test]
+    fn active_executor_lock_blocks_non_stale_second_instance() {
+        let conn = memory_db();
+
+        acquire_active_executor_lock(&conn, "demo", "inst-a", 1_000, 60_000).unwrap();
+
+        let err =
+            acquire_active_executor_lock(&conn, "live", "inst-b", 31_000, 60_000).unwrap_err();
+
+        assert!(err.to_string().contains("active executor"));
+    }
+
+    #[test]
+    fn stale_active_executor_lock_can_be_taken_over_and_audited() {
+        let conn = memory_db();
+        acquire_active_executor_lock(&conn, "demo", "inst-a", 1_000, 60_000).unwrap();
+
+        acquire_active_executor_lock(&conn, "live", "inst-b", 122_000, 60_000).unwrap();
+
+        assert_eq!(
+            get_executor_state(&conn, "active_mode").unwrap().as_deref(),
+            Some("live")
+        );
+        let takeover_events: i64 = conn
+            .query_row(
+                "select count(*) from events where component = 'daemon' and message = 'active executor lock takeover'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(takeover_events, 1);
+    }
+
+    #[test]
+    fn release_active_executor_lock_only_releases_matching_instance() {
+        let conn = memory_db();
+        acquire_active_executor_lock(&conn, "demo", "inst-a", 1_000, 60_000).unwrap();
+
+        release_active_executor_lock(&conn, "demo", "other").unwrap();
+        assert_eq!(
+            get_executor_state(&conn, "active_instance_id")
+                .unwrap()
+                .as_deref(),
+            Some("inst-a")
+        );
+
+        release_active_executor_lock(&conn, "demo", "inst-a").unwrap();
+        assert_eq!(
+            get_executor_state(&conn, "active_instance_id").unwrap(),
+            None
         );
     }
 
