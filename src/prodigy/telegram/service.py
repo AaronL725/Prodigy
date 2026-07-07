@@ -30,13 +30,22 @@ class TelegramCommandService:
     def _write_command(self, user_id: str | int, now: str, command: str) -> str:
         if str(user_id) not in self.allowed_user_ids:
             return "unauthorized"
+        target = self.conn.execute(
+            """
+            select
+              (select value from executor_state where key = 'active_mode'),
+              (select value from executor_state where key = 'active_instance_id')
+            """
+        ).fetchone()
+        if not target[0] or not target[1]:
+            return "no active executor"
         self.conn.execute(
             """
             insert into control_commands (
-              command_id, created_at, command, status, requested_by
-            ) values (?, ?, ?, 'pending', ?)
+              command_id, created_at, command, status, requested_by, mode, instance_id
+            ) values (?, ?, ?, 'pending', ?, ?, ?)
             """,
-            (str(uuid.uuid4()), now, command, user_id),
+            (str(uuid.uuid4()), now, command, user_id, target[0], target[1]),
         )
         self.conn.commit()
         return f"{command} command queued"

@@ -103,7 +103,8 @@ pub fn live_startup_clean_state(conn: &Connection, mode: &str, instance_id: &str
 
     let working_orders: i64 = conn.query_row(
         "select count(*) from orders
-         where intent_id is not null and status in ('submitted', 'live')",
+         where intent_id is not null
+           and status in ('submitting', 'submitted', 'live', 'needs_reconcile')",
         [],
         |r| r.get(0),
     )?;
@@ -809,6 +810,27 @@ mod tests {
         conn
     }
 
+    fn insert_system_order(conn: &Connection, status: &str) {
+        conn.execute(
+            "insert into trade_intents (
+              intent_id, created_at, symbol, side, action, target_notional,
+              max_order_notional, status, source
+            ) values ('i1', '2026-07-07T00:00:00Z', 'ETH/USDT:USDT', 'long',
+              'open', 1, 1, 'executed', 'test')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "insert into orders (
+              order_id, client_oid, intent_id, symbol, side, action, order_type,
+              status, created_at, updated_at
+            ) values ('o1', 'c1', 'i1', 'ETH/USDT:USDT', 'buy', 'open', 'limit',
+              ?, '2026-07-07T00:00:00Z', '2026-07-07T00:00:00Z')",
+            [status],
+        )
+        .unwrap();
+    }
+
     #[test]
     fn live_clean_state_rejects_pending_intents_working_orders_and_positions() {
         let conn = memory_db();
@@ -826,6 +848,28 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("pending trade intents"));
+    }
+
+    #[test]
+    fn live_clean_state_rejects_submitting_system_orders() {
+        let conn = memory_db();
+        insert_system_order(&conn, "submitting");
+
+        assert!(live_startup_clean_state(&conn, "live", "inst-live")
+            .unwrap_err()
+            .to_string()
+            .contains("working system orders"));
+    }
+
+    #[test]
+    fn live_clean_state_rejects_needs_reconcile_system_orders() {
+        let conn = memory_db();
+        insert_system_order(&conn, "needs_reconcile");
+
+        assert!(live_startup_clean_state(&conn, "live", "inst-live")
+            .unwrap_err()
+            .to_string()
+            .contains("working system orders"));
     }
 
     #[test]
