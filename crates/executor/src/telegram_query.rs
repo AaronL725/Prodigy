@@ -446,11 +446,19 @@ fn active_executor_target(conn: &Connection) -> Result<Option<ActiveExecutorTarg
         ],
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
     )?;
-    let (Some(mode), Some(instance_id), Some(_started_at), Some(heartbeat_at)) =
+    let (Some(mode), Some(instance_id), Some(started_at), Some(heartbeat_at)) =
         (mode, instance_id, started_at, heartbeat_at)
     else {
         return Ok(None);
     };
+    let mode = mode.trim().to_string();
+    let instance_id = instance_id.trim().to_string();
+    if mode.is_empty() || instance_id.is_empty() {
+        return Ok(None);
+    }
+    if started_at.parse::<i64>().is_err() {
+        return Ok(None);
+    }
     let Ok(heartbeat_ms) = heartbeat_at.parse::<i64>() else {
         return Ok(None);
     };
@@ -1392,6 +1400,42 @@ mod tests {
             telegram_event_count(&conn, "telegram control command rejected"),
             3
         );
+    }
+
+    #[test]
+    fn status_with_corrupt_active_started_at_reports_no_active_executor() {
+        let conn = test_conn();
+        let now_ms = crate::bitget::now_ms();
+        crate::db::set_executor_state(&conn, crate::db::ACTIVE_MODE_KEY, "live").unwrap();
+        crate::db::set_executor_state(&conn, crate::db::ACTIVE_INSTANCE_ID_KEY, "inst-live")
+            .unwrap();
+        crate::db::set_executor_state(&conn, crate::db::ACTIVE_STARTED_AT_KEY, "not-ms").unwrap();
+        crate::db::set_executor_state(&conn, crate::db::ACTIVE_HEARTBEAT_AT_KEY, &now_ms).unwrap();
+
+        let reply = query_reply(&conn, "/status").unwrap().unwrap();
+
+        assert!(reply.text.contains("NO ACTIVE EXECUTOR"));
+        assert!(!reply.text.contains("LIVE"));
+    }
+
+    #[test]
+    fn blank_active_instance_rejects_control_without_queueing() {
+        let conn = test_conn();
+        let now_ms = crate::bitget::now_ms();
+        crate::db::set_executor_state(&conn, crate::db::ACTIVE_MODE_KEY, "live").unwrap();
+        crate::db::set_executor_state(&conn, crate::db::ACTIVE_INSTANCE_ID_KEY, "  ").unwrap();
+        crate::db::set_executor_state(&conn, crate::db::ACTIVE_STARTED_AT_KEY, &now_ms).unwrap();
+        crate::db::set_executor_state(&conn, crate::db::ACTIVE_HEARTBEAT_AT_KEY, &now_ms).unwrap();
+
+        let reply = operator_reply(&conn, "/stop", "123", &["123".to_string()], 1_000)
+            .unwrap()
+            .unwrap();
+
+        assert!(reply.text.contains("no active executor"));
+        let queued: i64 = conn
+            .query_row("select count(*) from control_commands", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(queued, 0);
     }
 
     #[test]

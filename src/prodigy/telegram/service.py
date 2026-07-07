@@ -83,6 +83,7 @@ class TelegramCommandService:
         if not mode or not instance_id or not started_at or not heartbeat_at:
             return None
         try:
+            int(started_at)
             heartbeat_ms = int(heartbeat_at)
         except ValueError:
             return None
