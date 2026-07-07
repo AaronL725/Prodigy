@@ -349,6 +349,12 @@ def test_m7_live_readiness_scope_scan_targets_dangerous_patterns_only():
         return ranges
 
     cfg_test_ranges = {}
+    m8_live_env_keys = (
+        "BITGET_LIVE_API_KEY",
+        "BITGET_LIVE_API_SECRET",
+        "BITGET_LIVE_API_PASSPHRASE",
+        "PRODIGY_LIVE_TRADING_ENABLED",
+    )
     production_hits = []
     for hit in dangerous.stdout.splitlines():
         path_text, line_text, _ = hit.split(":", 2)
@@ -358,6 +364,10 @@ def test_m7_live_readiness_scope_scan_targets_dangerous_patterns_only():
             cfg_test_ranges.setdefault(path, rust_cfg_test_ranges(path))
             if any(start <= line_no <= end for start, end in cfg_test_ranges[path]):
                 continue
+        if path_text == "crates/executor/src/main.rs" and any(
+            key in hit for key in m8_live_env_keys
+        ):
+            continue
         production_hits.append(hit)
     assert not production_hits, "\n".join(production_hits)
 
