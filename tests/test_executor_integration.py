@@ -27,6 +27,49 @@ def _cargo_env_without_exchange_keys():
     return {key: os.environ[key] for key in keep if key in os.environ}
 
 
+def _rust_cfg_test_ranges(path):
+    lines = path.read_text().splitlines()
+    ranges = []
+    line_index = 0
+    while line_index < len(lines):
+        if "#[cfg(test)]" not in lines[line_index]:
+            line_index += 1
+            continue
+
+        start = line_index + 1
+        item_index = line_index + 1
+        while item_index < len(lines) and (
+            not lines[item_index].strip()
+            or lines[item_index].lstrip().startswith("#[")
+        ):
+            item_index += 1
+
+        if item_index == len(lines):
+            ranges.append((start, len(lines)))
+            break
+
+        depth = 0
+        opened = False
+        end = item_index + 1
+        for end_index in range(item_index, len(lines)):
+            line = lines[end_index]
+            depth += line.count("{") - line.count("}")
+            opened = opened or "{" in line
+            if opened and depth <= 0:
+                end = end_index + 1
+                break
+            if not opened and line.rstrip().endswith(";"):
+                end = end_index + 1
+                break
+        else:
+            end = len(lines)
+
+        ranges.append((start, end))
+        line_index = end
+
+    return ranges
+
+
 def test_rust_demo_executor_processes_pending_intent(tmp_path):
     db_path = tmp_path / "prodigy.sqlite"
 
@@ -440,48 +483,6 @@ def test_m7_live_readiness_scope_scan_targets_dangerous_patterns_only():
     )
     assert dangerous.returncode in (0, 1), dangerous.stdout + dangerous.stderr
 
-    def rust_cfg_test_ranges(path):
-        lines = path.read_text().splitlines()
-        ranges = []
-        line_index = 0
-        while line_index < len(lines):
-            if "#[cfg(test)]" not in lines[line_index]:
-                line_index += 1
-                continue
-
-            start = line_index + 1
-            item_index = line_index + 1
-            while item_index < len(lines) and (
-                not lines[item_index].strip()
-                or lines[item_index].lstrip().startswith("#[")
-            ):
-                item_index += 1
-
-            if item_index == len(lines):
-                ranges.append((start, len(lines)))
-                break
-
-            depth = 0
-            opened = False
-            end = item_index + 1
-            for end_index in range(item_index, len(lines)):
-                line = lines[end_index]
-                depth += line.count("{") - line.count("}")
-                opened = opened or "{" in line
-                if opened and depth <= 0:
-                    end = end_index + 1
-                    break
-                if not opened and line.rstrip().endswith(";"):
-                    end = end_index + 1
-                    break
-            else:
-                end = len(lines)
-
-            ranges.append((start, end))
-            line_index = end
-
-        return ranges
-
     cfg_test_ranges = {}
     m8_live_env_keys = (
         "BITGET_LIVE_API_KEY",
@@ -495,7 +496,7 @@ def test_m7_live_readiness_scope_scan_targets_dangerous_patterns_only():
         path = repo_root / path_text
         line_no = int(line_text)
         if path.suffix == ".rs":
-            cfg_test_ranges.setdefault(path, rust_cfg_test_ranges(path))
+            cfg_test_ranges.setdefault(path, _rust_cfg_test_ranges(path))
             if any(start <= line_no <= end for start, end in cfg_test_ranges[path]):
                 continue
         if path_text == "crates/executor/src/main.rs" and any(
@@ -545,8 +546,44 @@ def test_m7_live_readiness_scope_scan_targets_dangerous_patterns_only():
         path = repo_root / path_text
         line_no = int(line_text)
         if path.suffix == ".rs":
-            cfg_test_ranges.setdefault(path, rust_cfg_test_ranges(path))
+            cfg_test_ranges.setdefault(path, _rust_cfg_test_ranges(path))
             if any(start <= line_no <= end for start, end in cfg_test_ranges[path]):
                 continue
         m75_production_hits.append(hit)
     assert not m75_production_hits, "\n".join(m75_production_hits)
+
+
+def test_m8_scope_scan_has_no_remote_open_or_live_bypass():
+    repo_root = Path(__file__).resolve().parents[1]
+    dangerous = subprocess.run(
+        [
+            "rg",
+            "-n",
+            "remote_open|open_from_telegram|TELEGRAM_PARAM|remote_param|"
+            "set_param_from_telegram|remote_shell|shell_from_telegram|"
+            "model_debug_from_telegram|remote_model_debug|"
+            "LIVE_TRADING_ENABLED\\s*=\\s*true|allow_live_without_confirm",
+            "src",
+            "crates",
+        ],
+        check=False,
+        text=True,
+        capture_output=True,
+        cwd=repo_root,
+    )
+    assert dangerous.returncode in (0, 1), dangerous.stdout + dangerous.stderr
+
+    cfg_test_ranges = {}
+    production_hits = []
+    for hit in dangerous.stdout.splitlines():
+        path_text, line_text, _ = hit.split(":", 2)
+        path = repo_root / path_text
+        line_no = int(line_text)
+        if "/tests/" in path_text:
+            continue
+        if path.suffix == ".rs":
+            cfg_test_ranges.setdefault(path, _rust_cfg_test_ranges(path))
+            if any(start <= line_no <= end for start, end in cfg_test_ranges[path]):
+                continue
+        production_hits.append(hit)
+    assert not production_hits, "\n".join(production_hits)
