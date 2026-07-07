@@ -427,11 +427,17 @@ struct ActiveExecutorTarget {
 }
 
 fn active_executor_target(conn: &Connection) -> Result<Option<ActiveExecutorTarget>> {
-    let Some(mode) = crate::db::get_executor_state(conn, crate::db::ACTIVE_MODE_KEY)? else {
-        return Ok(None);
-    };
-    let Some(instance_id) = crate::db::get_executor_state(conn, crate::db::ACTIVE_INSTANCE_ID_KEY)?
-    else {
+    let (mode, instance_id): (Option<String>, Option<String>) = conn.query_row(
+        "select
+           (select value from executor_state where key = ?1),
+           (select value from executor_state where key = ?2)",
+        rusqlite::params![
+            crate::db::ACTIVE_MODE_KEY,
+            crate::db::ACTIVE_INSTANCE_ID_KEY
+        ],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let (Some(mode), Some(instance_id)) = (mode, instance_id) else {
         return Ok(None);
     };
     Ok(Some(ActiveExecutorTarget { mode, instance_id }))
@@ -1276,6 +1282,23 @@ mod tests {
     }
 
     #[test]
+    fn active_executor_target_reads_mode_and_instance_in_one_sql_statement() {
+        let source = include_str!("telegram_query.rs");
+        let body = source
+            .split("fn active_executor_target(conn: &Connection)")
+            .nth(1)
+            .unwrap()
+            .split("fn status_reply")
+            .next()
+            .unwrap();
+
+        assert_eq!(body.matches("query_row(").count(), 1);
+        assert!(!body.contains("get_executor_state("));
+        assert!(body.contains("ACTIVE_MODE_KEY"));
+        assert!(body.contains("ACTIVE_INSTANCE_ID_KEY"));
+    }
+
+    #[test]
     fn telegram_control_requires_active_executor_and_writes_mode_instance() {
         let conn = test_conn();
         let reply = operator_reply(&conn, "/stop", "123", &["123".to_string()], 1_000)
@@ -1323,7 +1346,7 @@ mod tests {
             .trim_start_matches("tgux:confirm_close_all:")
             .to_string();
         let rejected = confirm_close_all(&conn, &code, "123", 2_000).unwrap();
-        assert!(rejected.contains("stale") || rejected.contains("expired"));
+        assert!(rejected.contains("stale"));
         let queued: i64 = conn
             .query_row(
                 "select count(*) from control_commands where command = 'close_all'",
