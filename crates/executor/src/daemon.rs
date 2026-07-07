@@ -169,11 +169,21 @@ fn validate_live_dry_no_private_api_boundaries() -> Result<()> {
     {
         anyhow::bail!("live dry validation Telegram fresh target binding failed");
     }
-    if !crate::db::pending_control_commands(&conn, "demo", "other")
-        .context("live dry validation read foreign Telegram controls")?
-        .is_empty()
-    {
-        anyhow::bail!("live dry validation Telegram control leaked to foreign target");
+    for (mode, instance_id) in [
+        ("live", "other"),
+        ("demo", "dry-validate"),
+        ("demo", "other"),
+    ] {
+        if !crate::db::pending_control_commands(&conn, mode, instance_id)
+            .with_context(|| {
+                format!("live dry validation read foreign Telegram controls {mode}/{instance_id}")
+            })?
+            .is_empty()
+        {
+            anyhow::bail!(
+                "live dry validation Telegram control leaked to foreign target {mode}/{instance_id}"
+            );
+        }
     }
     crate::db::release_active_executor_lock(&conn, "live", "dry-validate")
         .context("live dry validation release fresh Telegram target")?;
@@ -1522,6 +1532,19 @@ mod tests {
     #[test]
     fn live_dry_validate_no_private_api_boundary_self_check_passes() {
         validate_live_dry_no_private_api_boundaries().unwrap();
+    }
+
+    #[test]
+    fn live_dry_validate_checks_control_mode_and_instance_filters_independently() {
+        let source = include_str!("daemon.rs");
+        let start = source
+            .find("fn validate_live_dry_no_private_api_boundaries")
+            .unwrap();
+        let end = source.find("fn column_exists").unwrap();
+        let helper = &source[start..end];
+
+        assert!(helper.contains("(\"live\", \"other\")"));
+        assert!(helper.contains("(\"demo\", \"dry-validate\")"));
     }
 
     #[tokio::test]
