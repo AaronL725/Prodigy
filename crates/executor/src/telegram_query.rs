@@ -456,6 +456,9 @@ fn active_executor_target(conn: &Connection) -> Result<Option<ActiveExecutorTarg
     if mode.is_empty() || instance_id.is_empty() {
         return Ok(None);
     }
+    if mode != "demo" && mode != "live" {
+        return Ok(None);
+    }
     if started_at.parse::<i64>().is_err() {
         return Ok(None);
     }
@@ -1359,6 +1362,33 @@ mod tests {
             )
             .unwrap();
         assert_eq!(row, ("live".to_string(), Some("inst-live".to_string())));
+    }
+
+    #[test]
+    fn status_with_unknown_active_mode_reports_no_active_executor() {
+        let conn = test_conn();
+        set_active_executor_target(&conn, "paper", "inst-paper");
+
+        let reply = query_reply(&conn, "/status").unwrap().unwrap();
+
+        assert!(reply.text.contains("NO ACTIVE EXECUTOR"));
+        assert!(!reply.text.contains("PAPER"));
+    }
+
+    #[test]
+    fn unknown_active_mode_rejects_control_without_queueing() {
+        let conn = test_conn();
+        set_active_executor_target(&conn, "paper", "inst-paper");
+
+        let reply = operator_reply(&conn, "/stop", "123", &["123".to_string()], 1_000)
+            .unwrap()
+            .unwrap();
+
+        assert!(reply.text.contains("no active executor"));
+        let queued: i64 = conn
+            .query_row("select count(*) from control_commands", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(queued, 0);
     }
 
     #[test]

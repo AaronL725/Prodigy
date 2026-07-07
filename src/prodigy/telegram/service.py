@@ -84,6 +84,8 @@ class TelegramCommandService:
         instance_id = str(instance_id).strip() if instance_id is not None else ""
         if not mode or not instance_id or not started_at or not heartbeat_at:
             return None
+        if mode not in {"demo", "live"}:
+            return None
         try:
             int(started_at)
             heartbeat_ms = int(heartbeat_at)
