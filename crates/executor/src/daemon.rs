@@ -139,27 +139,19 @@ fn validate_live_dry_no_private_api_boundaries() -> Result<()> {
         anyhow::bail!("live dry validation Telegram stale target inserted {queued} controls");
     }
 
-    let fresh_now_ms = crate::bitget::now_ms();
+    let dry_fresh_ms = i64::MAX.to_string();
     for (key, value) in [
         (crate::db::ACTIVE_MODE_KEY, "live"),
         (crate::db::ACTIVE_INSTANCE_ID_KEY, "dry-validate"),
-        (crate::db::ACTIVE_STARTED_AT_KEY, fresh_now_ms.as_str()),
-        (crate::db::ACTIVE_HEARTBEAT_AT_KEY, fresh_now_ms.as_str()),
+        (crate::db::ACTIVE_STARTED_AT_KEY, dry_fresh_ms.as_str()),
+        (crate::db::ACTIVE_HEARTBEAT_AT_KEY, dry_fresh_ms.as_str()),
     ] {
         crate::db::set_executor_state(&conn, key, value)
             .with_context(|| format!("live dry validation set fresh active key {key}"))?;
     }
-    crate::telegram_query::operator_reply(
-        &conn,
-        "/stop",
-        "123",
-        &allowed,
-        fresh_now_ms
-            .parse()
-            .context("live dry validation parse fresh now_ms")?,
-    )
-    .context("live dry validation Telegram fresh stop")?
-    .context("live dry validation Telegram fresh stop returned no reply")?;
+    crate::telegram_query::operator_reply(&conn, "/stop", "123", &allowed, 1_000)
+        .context("live dry validation Telegram fresh stop")?
+        .context("live dry validation Telegram fresh stop returned no reply")?;
     let pending = crate::db::pending_control_commands(&conn, "live", "dry-validate")
         .context("live dry validation read bound Telegram control")?;
     if pending.len() != 1
@@ -1532,6 +1524,19 @@ mod tests {
     #[test]
     fn live_dry_validate_no_private_api_boundary_self_check_passes() {
         validate_live_dry_no_private_api_boundaries().unwrap();
+    }
+
+    #[test]
+    fn live_dry_validate_fresh_self_check_avoids_wall_clock_race() {
+        let source = include_str!("daemon.rs");
+        let start = source
+            .find("fn validate_live_dry_no_private_api_boundaries")
+            .unwrap();
+        let end = source.find("fn column_exists").unwrap();
+        let helper = &source[start..end];
+
+        assert!(!helper.contains("crate::bitget::now_ms()"));
+        assert!(helper.contains("i64::MAX"));
     }
 
     #[test]
