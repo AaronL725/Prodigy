@@ -6,10 +6,10 @@
 [![Status: experimental](https://img.shields.io/badge/status-experimental-D97706)](#project-status)
 [![Venue: Bitget](https://img.shields.io/badge/venue-Bitget-00C4B3)](https://www.bitget.com/api-doc/contract/intro)
 
-Prodigy is a demo-first quantitative crypto trading stack for Bitget USDT-M futures. Python owns market-data ingestion, factor research, backtesting, model experiments, and closed-bar signal generation. A long-running Rust executor owns exchange connectivity, order state, reconciliation, risk checks, and operator controls. SQLite is the durable boundary between them.
+Prodigy is a quantitative crypto trading stack for Bitget USDT-M futures with compatible live and Demo execution profiles. Live trading is the primary deployment target; Demo mode is reserved for integration, safety, and order-flow testing. Python owns market-data ingestion, factor research, backtesting, model experiments, and closed-bar signal generation. A long-running Rust executor owns exchange connectivity, order state, reconciliation, risk checks, and operator controls. SQLite is the durable boundary between them.
 
 > [!WARNING]
-> This project can submit real futures orders when live mode is explicitly enabled. It is experimental software, not financial advice, and does not provide or imply a profitable strategy. Use Bitget Demo first, inspect the source and resulting orders, and never risk funds you cannot afford to lose.
+> This project can submit real futures orders when live mode is explicitly enabled. It is experimental software, not financial advice, and does not provide or imply a profitable strategy. Validate exchange behavior in Demo mode, inspect the source and resulting orders before live deployment, and never risk funds you cannot afford to lose.
 
 ## At a glance
 
@@ -20,7 +20,7 @@ Prodigy is a demo-first quantitative crypto trading stack for Bitget USDT-M futu
 | Research | Python, pandas, Parquet, example factors, bar simulation, LightGBM smoke training |
 | Execution | Rust, Tokio, REST actions, public/private WebSocket caches, REST reconciliation |
 | Coordination | SQLite WAL tables for intents, controls, orders, fills, positions, equity, events, and runtime state |
-| Runtime modes | Bitget Demo by default; gated live profile; non-trading live dry validation |
+| Runtime modes | Shared live and Demo execution; live for deployment, Demo for testing; non-trading live dry validation |
 | Operator interface | Telegram queries and audited `stop`, `resume`, `cancel_all`, and confirmed `close_all` controls |
 
 ## Capabilities
@@ -32,7 +32,7 @@ Prodigy is a demo-first quantitative crypto trading stack for Bitget USDT-M futu
 - **Exchange executor:** maintains public and private WebSocket state, executes through signed Bitget REST requests, tracks partial fills, and reconciles local state back to exchange truth.
 - **Operational safety:** blocks new exposure on stale market data, unavailable private state, manual override, operator stop, notional or margin gates, and a 24-hour equity-loss suspension.
 - **Mode isolation:** binds controls to the active executor mode and instance, prevents concurrent executors on one database, and requires a clean database before normal live startup.
-- **Observability:** persists events independently of Telegram delivery and can produce a bounded 30-120 minute demo smoke report.
+- **Observability:** persists events independently of Telegram delivery and can produce a bounded 30-120 minute execution-integration report.
 
 ## Architecture
 
@@ -70,6 +70,17 @@ The ownership boundary is deliberate:
 - WebSocket state is a low-latency cache; REST reconciliation remains authoritative.
 - Telegram never calls Bitget directly. It reads SQLite and queues mode- and instance-bound control commands.
 
+## Runtime profiles
+
+Live and Demo use the same signal daemon, SQLite queues, Rust execution state machine, risk checks, reconciliation rules, and Telegram controls. The profile changes only credentials, WebSocket hosts, and the Demo trading header.
+
+| Profile | Purpose | Credentials | WebSocket host | REST trading header |
+| --- | --- | --- | --- | --- |
+| Live | Primary deployment profile for real Bitget futures execution | `BITGET_LIVE_*` | `ws.bitget.com` | No `PAPTRADING` header |
+| Demo | Integration, smoke, and order-flow testing | `BITGET_DEMO_*` | `wspap.bitget.com` | `PAPTRADING: 1` |
+
+The executor CLI defaults to `demo` as a fail-safe when no mode is supplied; this is a startup safety default, not a limitation of the architecture or the intended deployment model. The current owner environment has not been configured with live API credentials, so live private connectivity and order placement have not been exercised from this machine. The live profile, credential isolation, startup gates, request construction, execution path, reconciliation, and mode-bound controls are implemented in the codebase.
+
 ## Safety model
 
 Prodigy treats risk-reducing actions differently from new exposure:
@@ -89,7 +100,7 @@ Live mode adds three independent startup gates: live credentials, `PRODIGY_LIVE_
 - A current stable Rust toolchain with Cargo
 - Git
 - Network access to Bitget public APIs
-- Bitget Demo API credentials for demo execution
+- Bitget Live API credentials for live deployment, or Bitget Demo credentials for execution testing
 - Jupyter only if you want to execute the research notebooks
 
 The Rust SQLite dependency is bundled, so a separate system SQLite development package is normally unnecessary.
@@ -131,9 +142,9 @@ prodigy-ml train --horizon 1h --model-version example-1h
 
 The model artifact is written below `models/example_lgbm/`; its metadata and artifact hash are recorded in SQLite.
 
-### 4. Configure Bitget Demo
+### 4. Configure the Demo test profile
 
-Create an ignored `.env.local` at the repository root:
+Use the Demo profile to verify exchange integration and order behavior before deploying the same runtime against live APIs. Create an ignored `.env.local` at the repository root:
 
 ```dotenv
 BITGET_DEMO_API_KEY=your_demo_api_key
@@ -148,7 +159,7 @@ TELEGRAM_CHAT_ID=123456789
 
 The executor also accepts `BITGET_DEMO_SECRET_KEY` and `BITGET_DEMO_PASSPHRASE` as compatibility aliases. Never commit `.env.local`; it is already ignored.
 
-### 5. Start the demo loop
+### 5. Start an execution test loop in Demo
 
 Run the executor first so it can reconcile exchange truth and publish fresh account state:
 
@@ -168,6 +179,8 @@ prodigy-signal --daemon --db var/prodigy.sqlite
 
 The default `example-factors` source is intentionally a pipeline demonstration. It should not be interpreted as validated alpha.
 
+For real operation, continue to [Live deployment](#live-deployment) after completing the integration checks. The Python signal daemon is shared by both profiles; live selection and its safety gates are enforced by the Rust executor.
+
 ## Common workflows
 
 Run one signal cycle:
@@ -176,7 +189,7 @@ Run one signal cycle:
 prodigy-signal --once --db var/prodigy.sqlite
 ```
 
-Run a bounded demo smoke session and write a Markdown report:
+Run a bounded Demo integration smoke session and write a Markdown report:
 
 ```bash
 prodigy-smoke --duration-minutes 60
@@ -205,12 +218,12 @@ When `TELEGRAM_BOT_TOKEN` and `TELEGRAM_ALLOWED_USER_IDS` are set, the Rust daem
 
 `/cancel_all` targets system-owned working orders only. `/close_all` requires a same-user, mode-bound, instance-bound confirmation and targets system-owned positions only. Manual or imported positions are skipped and audited.
 
-## Live mode
+## Live deployment
 
 > [!CAUTION]
-> The repository contains a real live execution path. Passing tests and dry validation do not constitute an operational or security audit. Complete an extended Demo run, inspect all residual state, and review every risk parameter before considering live use.
+> Live is the intended deployment profile and can place real futures orders. Passing tests and dry validation do not constitute an operational or security audit. Complete Demo integration testing, inspect all residual state, and review every risk parameter before enabling live execution.
 
-Normal live startup additionally requires:
+The current owner environment does not contain live API credentials. To deploy the implemented live profile, normal live startup requires:
 
 ```dotenv
 BITGET_LIVE_API_KEY=your_live_api_key
@@ -222,6 +235,15 @@ PRODIGY_LIVE_CONFIRM=I_UNDERSTAND_THIS_CAN_TRADE_REAL_MONEY
 
 Follow the [demo-to-live switch checklist](docs/superpowers/checklists/2026-07-07-m8-demo-to-live-switch.md) exactly. Live startup hard-fails before private API calls if the database contains unresolved intents, mismatched controls, working system orders, system positions, or a non-stale active executor lock.
 
+After the checklist and credential gates are satisfied, start the live executor with:
+
+```bash
+cargo run -p prodigy-executor -- \
+  --mode live \
+  --daemon \
+  --db var/prodigy.sqlite
+```
+
 ## Configuration
 
 Python research and signal settings are loaded from [`configs/default.toml`](configs/default.toml). The Rust executor currently uses compiled execution defaults plus CLI mode/database flags and environment-based credentials.
@@ -230,7 +252,7 @@ Important defaults include:
 
 | Setting | Default |
 | --- | --- |
-| Trading mode | `demo` |
+| Trading profiles | Live and Demo; CLI defaults to `demo` as a fail-safe |
 | Enabled symbol | `ETH/USDT:USDT` / `ETHUSDT` |
 | Signal timeframe | `15m` |
 | Exchange leverage | `5x` |
@@ -258,7 +280,7 @@ Prodigy/
 |-- data/                    Ignored local Parquet datasets
 |-- docs/superpowers/        Milestone designs, implementation plans, and operator checklists
 |-- models/                  Ignored local LightGBM artifacts
-|-- reports/                 Demo smoke reports
+|-- reports/                 Execution integration smoke reports
 |-- research/notebooks/      Executable factor and feature-building notebooks
 |-- schema/                  SQLite schema and execution migration
 |-- src/prodigy/             Python data, research, ML, signal, smoke, and DB modules
@@ -300,7 +322,7 @@ Run that suite only against a dedicated Demo account. The tests serialize accoun
 
 ## Project status
 
-Prodigy is a personal, experimental `0.1.0` codebase with substantial safety and failure-path coverage, but it is not a released or externally audited production trading platform.
+Prodigy is a personal, experimental `0.1.0` codebase with compatible live and Demo execution paths and substantial safety and failure-path coverage. Live is the primary deployment target, but the project is not an externally audited trading platform.
 
 Known boundaries:
 
@@ -308,7 +330,8 @@ Known boundaries:
 - The three bundled factors and LightGBM trainer are examples for exercising the pipeline; no return or robustness claim is made.
 - The signal daemon currently scores example factors directly and does not load the generated LightGBM artifact for trading.
 - Realized PnL is not considered reliable throughout the operator surface; the Telegram and smoke views report `n/a` instead of manufacturing a total.
-- Bitget Demo is the intended first operating environment. Demo liquidity can be discontinuous or untradeable.
+- Live execution is implemented behind explicit credential, enablement, confirmation, clean-state, and active-instance gates. The current owner environment has no live keys, so current runtime evidence comes from live dry validation and Demo integration tests rather than private live API execution.
+- Demo mode is a test environment only; its liquidity can be discontinuous or untradeable and should not be treated as representative live-market execution quality.
 - Multi-exchange execution, remote opening, remote parameter editing, model debugging, and remote shell access are deliberately out of scope.
 
 ## Contributing
