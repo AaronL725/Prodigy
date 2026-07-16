@@ -2,6 +2,7 @@
 
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](pyproject.toml)
 [![Rust 2021](https://img.shields.io/badge/Rust-2021-000000?logo=rust&logoColor=white)](crates/executor/Cargo.toml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Status: experimental](https://img.shields.io/badge/status-experimental-D97706)](#project-status)
 [![Venue: Bitget](https://img.shields.io/badge/venue-Bitget-00C4B3)](https://www.bitget.com/api-doc/contract/intro)
 
@@ -316,4 +317,4 @@ Issues and focused pull requests are welcome. Before proposing a large execution
 
 ## License
 
-No license file has been published for this repository. The source is publicly visible, but no reuse, modification, or redistribution rights are granted unless the repository owner adds an explicit license.
+Prodigy is released under the [MIT License](LICENSE).
